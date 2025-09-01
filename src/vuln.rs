@@ -45,6 +45,7 @@ pub fn match_vuln(component: &str, version: &str) {
 
     if let Some(items) = json["vulnerabilities"].as_array() {
         for item in items {
+            let id = item["cve"]["id"].as_str().unwrap_or("unknown");
             let descs = item["cve"]["descriptions"]
                 .as_array()
                 .unwrap_or(&Vec::new());
