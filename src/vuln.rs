@@ -45,14 +45,14 @@ pub fn match_vuln(component: &str, version: &str) {
 
     if let Some(items) = json["vulnerabilities"].as_array() {
         for item in items {
-            let id = item["cve"]["id"].as_str().unwrap_or("unknown");
-            let description = item["cve"]["descriptions"]
+            let descs = item["cve"]["descriptions"]
                 .as_array()
-                .unwrap_or(&vec![])
-                .iter()
+                .unwrap_or(&Vec::new());
+
+            let description = descs.iter()
                 .find(|d| d["lang"] == "en")
                 .and_then(|d| d["value"].as_str())
-                .unwrap_or("");
+                .unwrap_or("No description found");
 
             if seen.insert(id.to_string()) {
                 println!("🔹 {}: {}", id, description);
