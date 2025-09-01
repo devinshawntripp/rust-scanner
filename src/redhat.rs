@@ -1,31 +1,44 @@
-use xmltree::Element;
+use xmltree::{Element, XMLNode};
 use std::fs::File;
 use std::io::BufReader;
 
-/// Extract text content of an XML node
+/// Helper function to extract text from an element node
 fn get_text(element: &Element) -> String {
     for child in &element.children {
-        if let xmltree::XMLNode::Text(txt) = child {
-            return txt.clone();
+        if let XMLNode::Text(text) = child {
+            return text.trim().to_string();
         }
     }
     String::new()
 }
 
-/// Parse RedHat OVAL XML and check for a CVE fix
+/// Check if a CVE exists in a Red Hat OVAL XML file
 pub fn check_redhat_cve(cve: &str, oval_path: &str) {
-    let file = File::open(oval_path).expect("Cannot open OVAL file");
+    let file = match File::open(oval_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Could not open OVAL file: {}", e);
+            return;
+        }
+    };
+
     let reader = BufReader::new(file);
-    let root = Element::parse(reader).expect("Invalid XML");
+    let root = match Element::parse(reader) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to parse XML: {}", e);
+            return;
+        }
+    };
 
     if let Some(defs) = root.get_child("definitions") {
-        for def in &defs.children {
-            if let xmltree::XMLNode::Element(def_el) = def {
+        for child in &defs.children {
+            if let XMLNode::Element(def_el) = child {
                 if let Some(metadata) = def_el.get_child("metadata") {
-                    if let Some(title_el) = metadata.get_child("title") {
-                        let title = get_text(title_el);
-                        if title.contains(cve) {
-                            println!("✅ {} is mentioned in Red Hat OVAL: {}", cve, title);
+                    if let Some(title) = metadata.get_child("title") {
+                        let title_text = get_text(title);
+                        if title_text.contains(cve) {
+                            println!("✅ Found in Red Hat OVAL: {}", title_text);
                             return;
                         }
                     }
@@ -34,5 +47,5 @@ pub fn check_redhat_cve(cve: &str, oval_path: &str) {
         }
     }
 
-    println!("❌ {} not found in Red Hat OVAL DB", cve);
+    println!("❌ {} not found in Red Hat OVAL definitions.", cve);
 }
