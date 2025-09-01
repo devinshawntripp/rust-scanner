@@ -16,6 +16,7 @@ pub fn match_vuln(component: &str, version: &str) {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .no_proxy("")  // allow proxying everything
         .build()
         .unwrap();
 
