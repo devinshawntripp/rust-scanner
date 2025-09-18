@@ -1,10 +1,13 @@
+# ---- build stage ----
 FROM rust:1.81-slim AS builder
+WORKDIR /app
 
-# Set up proxy for builds (optional)
-ENV http_proxy=http://10.10.10.2:3128
-ENV https_proxy=http://10.10.10.2:3128
+# (optional) proxies passed at build time
+ARG http_proxy
+ARG https_proxy
+ENV http_proxy=${http_proxy}
+ENV https_proxy=${https_proxy}
 
-# deps for reqwest default-tls; add build-essential for native crates
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates build-essential curl && \
     rm -rf /var/lib/apt/lists/*
@@ -14,11 +17,11 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release && rm -rf target/release/deps/scanner*
 
-# real source
+# real source & build
 COPY . .
 RUN cargo build --release
 
-# ---- Runtime stage ----
+# ---- runtime stage ----
 FROM debian:bookworm-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
