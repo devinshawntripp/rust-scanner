@@ -4,10 +4,26 @@ FROM rust:1.75-slim
 ENV http_proxy=http://10.10.10.2:3128
 ENV https_proxy=http://10.10.10.2:3128
 
-WORKDIR /app
-COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev ca-certificates build-essential curl && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN apt update && apt install -y pkg-config libssl-dev curl
+# Better layer caching: copy manifests first
+COPY Cargo.toml Cargo.lock ./
+# create a dummy src to cache deps
+RUN mkdir -p src && echo "fn main(){}" > src/main.rs
+RUN cargo build --release && rm -rf target/release/deps/scanner*
+
+# now copy real sources and build
+COPY . .
 RUN cargo build --release
 
-ENTRYPOINT ["./target/release/scanner"]
+# ---- Runtime stage ----
+FROM debian:bookworm-slim
+WORKDIR /app
+# needed at runtime for reqwest default-tls
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/target/release/scanner /app/scanner
+ENTRYPOINT ["/app/scanner"]
