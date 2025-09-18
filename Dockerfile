@@ -1,4 +1,4 @@
-FROM rust:1.75-slim AS builder
+FROM rust:1.81-slim AS builder
 
 # Set up proxy for builds (optional)
 ENV http_proxy=http://10.10.10.2:3128
