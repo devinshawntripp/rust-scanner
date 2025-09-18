@@ -1,8 +1,8 @@
 # ---- build stage ----
-FROM rust:1.81-slim AS builder
+FROM rust:1.83-slim AS builder
 WORKDIR /app
 
-# (optional) proxies passed at build time
+# (optional) proxies
 ARG http_proxy
 ARG https_proxy
 ENV http_proxy=${http_proxy}
