@@ -4,24 +4,23 @@ FROM rust:1.75-slim
 ENV http_proxy=http://10.10.10.2:3128
 ENV https_proxy=http://10.10.10.2:3128
 
+# deps for reqwest default-tls; add build-essential for native crates
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates build-essential curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Better layer caching: copy manifests first
+# cache deps
 COPY Cargo.toml Cargo.lock ./
-# create a dummy src to cache deps
 RUN mkdir -p src && echo "fn main(){}" > src/main.rs
 RUN cargo build --release && rm -rf target/release/deps/scanner*
 
-# now copy real sources and build
+# real source
 COPY . .
 RUN cargo build --release
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim
 WORKDIR /app
-# needed at runtime for reqwest default-tls
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/*
