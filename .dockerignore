@@ -1,0 +1,12 @@
+.git
+node_modules
+.next
+target
+var/uploads
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.tar.bz2
+**/*.iso
+*.log
+/target/**
