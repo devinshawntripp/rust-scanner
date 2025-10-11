@@ -206,7 +206,11 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                 let aliases: Vec<String> = v["aliases"].as_array()
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                let cve_alias = aliases.iter().find(|a| a.starts_with("CVE-")).cloned();
+                // Try to extract CVE from aliases even if prefixed (e.g., DEBIAN-CVE-YYYY-NNNN)
+                let re_cve = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
+                let cve_alias = aliases.iter().find_map(|a| {
+                    if let Some(re) = &re_cve { re.find(a).map(|m| m.as_str().to_string()) } else { None }
+                });
                 // If no CVE alias, try extract from references URLs
                 let cve_from_refs = if cve_alias.is_none() {
                     if let Some(refs) = v["references"].as_array() {
@@ -218,7 +222,16 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                         } else { None }
                     } else { None }
                 } else { None };
-                let mut primary_id = cve_alias.or(cve_from_refs).unwrap_or_else(|| v["id"].as_str().unwrap_or("unknown").to_string());
+                // If still no CVE, try extract from OSV id itself (e.g., "DEBIAN-CVE-2019-20795")
+                let cve_from_osv_id = if cve_alias.is_none() && cve_from_refs.is_none() {
+                    if let Some(osv_id_str) = v["id"].as_str() {
+                        if let Some(re) = &re_cve { re.find(osv_id_str).map(|m| m.as_str().to_string()) } else { None }
+                    } else { None }
+                } else { None };
+                let mut primary_id = cve_alias
+                    .or(cve_from_refs)
+                    .or(cve_from_osv_id)
+                    .unwrap_or_else(|| v["id"].as_str().unwrap_or("unknown").to_string());
                 // Normalize spaces
                 primary_id = primary_id.trim().to_string();
                 let description = v["summary"].as_str().map(|s| s.to_string())
