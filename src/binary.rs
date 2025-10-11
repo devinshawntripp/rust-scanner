@@ -164,6 +164,7 @@ pub fn build_binary_report(path: &str, mode: ScanMode, yara_rules: Option<String
                                 id: format!("YARA:{}", m.identifier),
                                 source_ids: Vec::new(),
                                 package: None,
+                                fixed: None,
                                 severity: None,
                                 cvss: None,
                                 description: None,

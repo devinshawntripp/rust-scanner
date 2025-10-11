@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::utils::progress;
 
 #[derive(Parser)]
-#[command(name = "scanner")]
+#[command(name = "scanner", version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "A Rust-powered security scanner", long_about = None)]
 struct Cli {
     #[command(subcommand)]

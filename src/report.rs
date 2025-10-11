@@ -53,6 +53,7 @@ pub struct Finding {
     pub id: String,
     pub source_ids: Vec<String>,
     pub package: Option<PackageInfo>,
+    pub fixed: Option<bool>,
     pub severity: Option<String>,
     pub cvss: Option<CvssInfo>,
     pub description: Option<String>,

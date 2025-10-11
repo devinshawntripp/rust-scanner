@@ -202,38 +202,37 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
         let res = &osv_results[idx];
         if let Some(vulns) = res["vulns"].as_array() {
             for v in vulns {
-                // Prefer CVE alias as primary ID so NVD enrichment works; fallback to OSV id
+                // Collect CVE ids from aliases, references, OSV id and text
                 let aliases: Vec<String> = v["aliases"].as_array()
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                     .unwrap_or_default();
-                // Try to extract CVE from aliases even if prefixed (e.g., DEBIAN-CVE-YYYY-NNNN)
                 let re_cve = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
-                let cve_alias = aliases.iter().find_map(|a| {
-                    if let Some(re) = &re_cve { re.find(a).map(|m| m.as_str().to_string()) } else { None }
-                });
-                // If no CVE alias, try extract from references URLs
-                let cve_from_refs = if cve_alias.is_none() {
+                let mut cve_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if let Some(re) = &re_cve {
+                    for a in &aliases {
+                        if let Some(m) = re.find(a) { cve_ids.insert(m.as_str().to_string()); }
+                    }
+                }
+                if cve_ids.is_empty() {
                     if let Some(refs) = v["references"].as_array() {
-                        let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
-                        if let Some(re) = re {
-                            refs.iter()
-                                .filter_map(|r| r["url"].as_str())
-                                .find_map(|u| re.find(u).map(|m| m.as_str().to_string()))
-                        } else { None }
-                    } else { None }
-                } else { None };
-                // If still no CVE, try extract from OSV id itself (e.g., "DEBIAN-CVE-2019-20795")
-                let cve_from_osv_id = if cve_alias.is_none() && cve_from_refs.is_none() {
+                        if let Some(re) = &re_cve {
+                            for u in refs.iter().filter_map(|r| r["url"].as_str()) {
+                                if let Some(m) = re.find(u) { cve_ids.insert(m.as_str().to_string()); }
+                            }
+                        }
+                    }
+                }
+                if cve_ids.is_empty() {
                     if let Some(osv_id_str) = v["id"].as_str() {
-                        if let Some(re) = &re_cve { re.find(osv_id_str).map(|m| m.as_str().to_string()) } else { None }
-                    } else { None }
-                } else { None };
-                let mut primary_id = cve_alias
-                    .or(cve_from_refs)
-                    .or(cve_from_osv_id)
-                    .unwrap_or_else(|| v["id"].as_str().unwrap_or("unknown").to_string());
-                // Normalize spaces
-                primary_id = primary_id.trim().to_string();
+                        if let Some(re) = &re_cve { if let Some(m) = re.find(osv_id_str) { cve_ids.insert(m.as_str().to_string()); } }
+                    }
+                }
+                if cve_ids.is_empty() {
+                    let mut text = String::new();
+                    if let Some(s) = v["summary"].as_str() { text.push_str(s); text.push(' '); }
+                    if let Some(d) = v["details"].as_str() { text.push_str(d); }
+                    if let Some(re) = &re_cve { if let Some(m) = re.find(&text) { cve_ids.insert(m.as_str().to_string()); } }
+                }
                 let description = v["summary"].as_str().map(|s| s.to_string())
                     .or_else(|| v["details"].as_str().map(|s| s.to_string()));
                 let mut cvss: Option<CvssInfo> = None;
@@ -274,18 +273,65 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
 
                 let mut source_ids = aliases;
                 let osv_id = v["id"].as_str().unwrap_or("").to_string();
-                if !osv_id.is_empty() && osv_id != primary_id { source_ids.push(osv_id); }
-                out.push(Finding {
-                    id: primary_id,
-                    source_ids,
-                    package,
-                    severity: severity_str,
-                    cvss,
-                    description,
-                    evidence,
-                    references,
-                    confidence: Some("HIGH".into()),
-                });
+                if !osv_id.is_empty() { source_ids.push(osv_id.clone()); }
+                // Determine fixed status using OSV affected ranges when possible
+                let mut fixed: Option<bool> = None;
+                if let Some(aff) = v["affected"].as_array() {
+                    // OSV affected entries may include ranges with introduced/fixed
+                    for a in aff {
+                        if let Some(p) = a["package"].get("ecosystem").and_then(|e| e.as_str()) {
+                            let eco = p.to_string();
+                            let name_match = a["package"].get("name").and_then(|n| n.as_str()).map(|s| s == pkg.name).unwrap_or(false);
+                            if !name_match { continue; }
+                            if let Some(ranges) = a["ranges"].as_array() {
+                                for r in ranges {
+                                    if r["type"].as_str() == Some("ECOSYSTEM") {
+                                        if let Some(events) = r["events"].as_array() {
+                                            // Simplified: if a fixed version exists and pkg.version >= fixed, mark fixed=true
+                                            if let Some(fixed_ver) = events.iter().find_map(|e| e.get("fixed").and_then(|s| s.as_str())) {
+                                                // Use Debian-style compare for deb/apk when available
+                                                // Fallback: naive numeric compare of dotted versions
+                                                let is_fixed = cmp_versions(&pkg.version, fixed_ver) != std::cmp::Ordering::Less;
+                                                fixed = Some(is_fixed);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !cve_ids.is_empty() {
+                    for cid in cve_ids {
+                        out.push(Finding {
+                            id: cid.trim().to_string(),
+                            source_ids: source_ids.clone(),
+                            package: package.clone(),
+                            fixed,
+                            severity: severity_str.clone(),
+                            cvss: cvss.clone(),
+                            description: description.clone(),
+                            evidence: evidence.clone(),
+                            references: references.clone(),
+                            confidence: Some("HIGH".into()),
+                        });
+                    }
+                } else {
+                    // Advisory-only if no CVE mapping found yet
+                    out.push(Finding {
+                        id: osv_id,
+                        source_ids,
+                        package,
+                        fixed,
+                        severity: severity_str,
+                        cvss,
+                        description,
+                        evidence,
+                        references,
+                        confidence: Some("LOW".into()),
+                    });
+                }
             }
         }
     }
@@ -403,14 +449,118 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
                 }
             }
         }
-        // Apply to all findings matching this id
-        for f in findings.iter_mut().filter(|f| f.id == id) {
+        // Apply to all findings matching this id; upgrade advisory to one-or-many CVEs if available
+        let mut to_append: Vec<Finding> = Vec::new();
+        for i in 0..findings.len() {
+            if findings[i].id != id { continue; }
+            let f = &mut findings[i];
             if f.description.is_none() { f.description = description.clone(); }
             if f.cvss.is_none() { f.cvss = cvss.clone(); }
             if f.severity.is_none() { f.severity = severity_str.clone(); }
             if f.references.is_empty() && !refs.is_empty() { f.references = refs.clone(); }
+            if !f.id.starts_with("CVE-") {
+                // Collect all CVEs from aliases/refs/text
+                let mut text = String::new();
+                if let Some(s) = json["summary"].as_str() { text.push_str(s); text.push(' '); }
+                if let Some(d) = json["details"].as_str() { text.push_str(d); }
+                let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
+                let mut cves: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if let Some(arr) = json["aliases"].as_array() {
+                    for a in arr.iter().filter_map(|x| x.as_str()) { if a.starts_with("CVE-") { cves.insert(a.to_string()); } }
+                }
+                if let Some(arr) = json["references"].as_array() { if let Some(re2) = &re { for r in arr { if let Some(u) = r["url"].as_str() { if let Some(m) = re2.find(u) { cves.insert(m.as_str().to_string()); } } } } }
+                if let Some(re2) = &re { if let Some(m) = re2.find(&text) { cves.insert(m.as_str().to_string()); } }
+                if !cves.is_empty() {
+                    // Upgrade current to first CVE, append others
+                    let mut cves_iter = cves.into_iter();
+                    if let Some(primary) = cves_iter.next() {
+                        if !f.source_ids.contains(&f.id) { f.source_ids.push(f.id.clone()); }
+                        f.id = primary;
+                    }
+                    for extra in cves_iter {
+                        let mut nf = findings[i].clone();
+                        nf.id = extra;
+                        to_append.push(nf);
+                    }
+                }
+            }
+        }
+        findings.extend(to_append);
+        // Deduplicate by id after upgrades
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        findings.retain(|f| seen_ids.insert(f.id.clone()));
+        // Log upgrade count by counting CVEs that reference this advisory in source_ids
+        let upgraded_cve_count = findings.iter()
+            .filter(|f| f.id.starts_with("CVE-") && f.source_ids.iter().any(|s| s == &id))
+            .count();
+        if upgraded_cve_count > 0 {
+            progress("osv.upgrade.cve", &format!("{} -> {} CVEs", id, upgraded_cve_count));
+        }
+        // Drop any remaining advisory-only finding with this id (keep advisory id only in source_ids)
+        if !id.starts_with("CVE-") && upgraded_cve_count > 0 {
+            let before_len = findings.len();
+            findings.retain(|f| f.id != id);
+            if findings.len() != before_len {
+                progress("osv.advisory.drop", &id);
+            }
+        }
+
+        // If still advisory-only (DLA/DSA) for this id, fallback to Debian tracker mapping
+        if (id.starts_with("DLA-") || id.starts_with("DSA-"))
+            && findings.iter().any(|f| f.id == id)
+        {
+            if let Some(mut mapped) = map_debian_advisory_to_cves(&id) {
+                mapped.sort(); mapped.dedup();
+                if !mapped.is_empty() {
+                    let mut to_append2: Vec<Finding> = Vec::new();
+                    for f in findings.iter_mut().filter(|f| f.id == id) {
+                        if let Some(first) = mapped.first().cloned() {
+                            if !f.source_ids.contains(&f.id) { f.source_ids.push(f.id.clone()); }
+                            f.id = first;
+                        }
+                        for extra in mapped.iter().skip(1) {
+                            let mut nf = f.clone();
+                            nf.id = extra.clone();
+                            to_append2.push(nf);
+                        }
+                    }
+                    findings.extend(to_append2);
+                    let mut seen_ids2: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    findings.retain(|f| seen_ids2.insert(f.id.clone()));
+                    progress("osv.debian.map.ok", &format!("{} -> {} CVEs", id, mapped.len()));
+                    // Also drop any remaining advisory-only record now that CVEs were added
+                    if !id.starts_with("CVE-") && !mapped.is_empty() {
+                        let before_len2 = findings.len();
+                        findings.retain(|f| f.id != id);
+                        if findings.len() != before_len2 {
+                            progress("osv.advisory.drop", &id);
+                        }
+                    }
+                } else {
+                    progress("osv.debian.map.empty", &id);
+                }
+            } else {
+                progress("osv.debian.map.skip", &id);
+            }
         }
     }
+
+    // Deduplicate by id after any upgrades from advisory -> CVE
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    findings.retain(|f| seen_ids.insert(f.id.clone()));
+}
+
+fn map_debian_advisory_to_cves(advisory_id: &str) -> Option<Vec<String>> {
+    // Fetch Debian tracker page and extract CVE IDs
+    let url = format!("https://security-tracker.debian.org/tracker/{}", advisory_id);
+    let client = Client::builder().timeout(Duration::from_secs(10)).build().ok()?;
+    let resp = client.get(&url).send().ok()?;
+    if !resp.status().is_success() { return None; }
+    let body = resp.text().ok()?;
+    let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok()?;
+    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in re.find_iter(&body) { set.insert(m.as_str().to_string()); }
+    Some(set.into_iter().collect())
 }
 
 pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&str>, pg: &mut Option<PgClient>) {
@@ -614,8 +764,9 @@ pub fn nvd_keyword_findings(component: &str, version: &str, api_key: Option<&str
 
             out.push(Finding {
                 id,
-                source_ids: Vec::new(),
-                package: None,
+                source_ids: vec![format!("heuristic:keyword:{} {}", component, version)],
+                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                fixed: None,
                 severity,
                 cvss,
                 description,
@@ -678,8 +829,9 @@ pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, e
 
             out.push(Finding {
                 id,
-                source_ids: Vec::new(),
-                package: None,
+                source_ids: vec![format!("heuristic:cpe:{} {}", component, version)],
+                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                fixed: None,
                 severity,
                 cvss,
                 description,
@@ -739,8 +891,9 @@ pub fn nvd_keyword_findings_name(component: &str, api_key: Option<&str>, evidenc
 
             out.push(Finding {
                 id,
-                source_ids: Vec::new(),
-                package: None,
+                source_ids: vec![format!("heuristic:keyword:{}", component)],
+                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: "unknown".into() }),
+                fixed: None,
                 severity,
                 cvss,
                 description,
@@ -846,7 +999,18 @@ pub fn nvd_findings_by_product_version(vendor: &str, product: &str, version: &st
                                     if let Some(refs) = cve["references"]["referenceData"].as_array() {
                                         for r in refs { if let Some(url) = r["url"].as_str() { references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.to_string() }); } }
                                     }
-                                    out.push(Finding { id, source_ids: Vec::new(), package: None, severity, cvss, description, evidence, references, confidence: Some("MEDIUM".into()) });
+                                    out.push(Finding {
+                                        id,
+                                        source_ids: vec![format!("heuristic:product:{} {} {}", vendor, product, version)],
+                                        package: Some(PackageInfo { name: product.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                                        fixed: None,
+                                        severity,
+                                        cvss,
+                                        description,
+                                        evidence,
+                                        references,
+                                        confidence: Some("MEDIUM".into())
+                                    });
                                     continue 'outer;
                                 }
                             }
