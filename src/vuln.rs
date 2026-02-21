@@ -1,20 +1,74 @@
 use std::collections::HashSet;
-use std::time::Duration;
+use std::net::{IpAddr, Ipv4Addr};
 use std::thread::sleep;
+use std::time::Duration;
 
+use crate::cache::{cache_get, cache_key, cache_put};
+use crate::container::PackageCoordinate;
+use crate::redhat::{compare_evr, is_rpm_ecosystem};
+use crate::report::{
+    severity_from_score, CvssInfo, EvidenceItem, Finding, PackageInfo, ReferenceInfo,
+};
+use crate::utils::progress;
+use rand::Rng;
+use rayon::prelude::*;
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
-use crate::container::PackageCoordinate;
-use crate::cache::{cache_get, cache_put, cache_key};
 use std::path::PathBuf;
-use crate::report::{Finding, PackageInfo, ReferenceInfo, EvidenceItem, CvssInfo, severity_from_score};
-use crate::utils::progress;
-use rand::{thread_rng, Rng};
-use rayon::prelude::*;
 
 // --- Postgres cache ---
+use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
 use postgres::{Client as PgClient, NoTls};
-use chrono::{DateTime, Utc, NaiveDateTime, Duration as ChronoDuration};
+
+fn scanner_force_ipv4() -> bool {
+    std::env::var("SCANNER_FORCE_IPV4")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
+fn parse_cvss_score(score_raw: &str) -> Option<(f32, String)> {
+    let s = score_raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // 1) Plain numeric score (e.g. "7.5")
+    if let Ok(n) = s.parse::<f32>() {
+        return Some((n, s.to_string()));
+    }
+
+    // 2) Legacy "X.Y/..." format
+    let head = s.split('/').next().unwrap_or(s);
+    if let Ok(n) = head.parse::<f32>() {
+        return Some((n, s.to_string()));
+    }
+
+    // 3) CVSS vector format (e.g. "CVSS:3.1/AV:L/...")
+    if s.starts_with("CVSS:") {
+        if let Ok(v) = s.parse::<cvss::Cvss>() {
+            return Some((v.score() as f32, s.to_string()));
+        }
+    }
+
+    None
+}
+
+fn build_http_client(timeout_secs: u64) -> Client {
+    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    if scanner_force_ipv4() {
+        // Worker pods on many homelab clusters have no usable IPv6 egress.
+        // Pin outbound sockets to IPv4 to avoid long OSV/NVD timeouts.
+        builder = builder.local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+    builder.build().unwrap()
+}
 
 /// Queries the NVD API for a given component + version
 pub fn match_vuln(component: &str, version: &str) {
@@ -26,10 +80,7 @@ pub fn match_vuln(component: &str, version: &str) {
 
     println!("Querying NVD: {}", url);
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap();
+    let client = build_http_client(10);
 
     let resp = match client.get(&url).send() {
         Ok(res) => res,
@@ -66,11 +117,11 @@ pub fn match_vuln(component: &str, version: &str) {
                 }
             };
 
-            let description = descs.iter()
+            let description = descs
+                .iter()
                 .find(|d| d["lang"] == "en")
                 .and_then(|d| d["value"].as_str())
                 .unwrap_or("No English description found");
-
 
             if seen.insert(id.to_string()) {
                 println!("🔹 {}: {}", id, description);
@@ -86,71 +137,193 @@ pub fn match_vuln(component: &str, version: &str) {
 
 /// Batch query OSV with package coordinates. Returns a JSON value (array of results)
 pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
-    if packages.is_empty() { return serde_json::json!([]); }
+    if packages.is_empty() {
+        return serde_json::json!([]);
+    }
 
     // Build per-package queries and remember original indices
+    let mut ecosystem_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let indexed: Vec<(usize, Value)> = packages.iter().enumerate().map(|(i, p)| {
         let (ecosystem, name, version) = map_ecosystem_name_version(p);
+        *ecosystem_counts.entry(ecosystem.clone()).or_insert(0) += 1;
         let q = serde_json::json!({ "package": {"ecosystem": ecosystem, "name": name}, "version": version });
         (i, q)
     }).collect();
+    let mut eco_summary: Vec<String> = ecosystem_counts.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    eco_summary.sort();
+    progress("osv.query.ecosystems", &eco_summary.join(" "));
 
     // Output buffer aligned to packages (each entry: {"vulns": [...]})
     let mut results: Vec<Value> = vec![serde_json::json!({"vulns": []}); packages.len()];
 
-    let chunk_size: usize = std::env::var("SCANNER_OSV_BATCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
-    let retries: usize = std::env::var("SCANNER_OSV_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let backoff_ms_base: u64 = std::env::var("SCANNER_OSV_BACKOFF_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+    let chunk_size: usize = std::env::var("SCANNER_OSV_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+    let retries: usize = std::env::var("SCANNER_OSV_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let backoff_ms_base: u64 = std::env::var("SCANNER_OSV_BACKOFF_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
 
-    let client = Client::builder().timeout(Duration::from_secs(45)).build().unwrap();
+    let osv_timeout_secs: u64 = std::env::var("SCANNER_OSV_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let client = build_http_client(osv_timeout_secs);
 
     for chunk in indexed.chunks(chunk_size) {
         // Prepare body for this chunk
-        let body = serde_json::json!({ "queries": chunk.iter().map(|(_, q)| q).collect::<Vec<&Value>>() });
-        let cache_tag = cache_key(&["osv_batch", &format!("{}:{}", chunk.first().map(|(i,_)| i).unwrap_or(&0), chunk.len())]);
-        progress("osv.query.chunk.start", &format!("offset={} size={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), chunk.len()));
+        let body =
+            serde_json::json!({ "queries": chunk.iter().map(|(_, q)| q).collect::<Vec<&Value>>() });
+        let body_bytes = body.to_string();
+        let body_digest = {
+            use sha2::{Digest as _, Sha256};
+            let hash = Sha256::digest(body_bytes.as_bytes());
+            format!("{:x}", hash)
+        };
+        let cache_tag = cache_key(&["osv_batch", &body_digest]);
+        progress(
+            "osv.query.chunk.start",
+            &format!(
+                "offset={} size={}",
+                chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                chunk.len()
+            ),
+        );
 
         let mut attempt = 0;
         let mut done = false;
         while attempt < retries && !done {
             attempt += 1;
             // Try cache for this chunk first
-            if let Some(bytes) = cache_get(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &cache_tag) {
+            if let Some(bytes) = cache_get(
+                std::env::var_os("SCANNER_CACHE")
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .as_deref(),
+                &cache_tag,
+            ) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     if let Some(arr) = v["results"].as_array() {
                         for (idx_in_chunk, item) in arr.iter().enumerate() {
                             let orig_idx = chunk[idx_in_chunk].0;
                             results[orig_idx] = item.clone();
                         }
-                        progress("osv.query.chunk.cache", &format!("offset={} size={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), chunk.len()));
-                        done = true; break;
+                        progress(
+                            "osv.query.chunk.cache",
+                            &format!(
+                                "offset={} size={}",
+                                chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                                chunk.len()
+                            ),
+                        );
+                        done = true;
+                        break;
                     }
                 }
             }
 
             // Network request
-            let resp = client.post("https://api.osv.dev/v1/querybatch").json(&body).send();
+            let resp = client
+                .post("https://api.osv.dev/v1/querybatch")
+                .json(&body)
+                .send();
             match resp {
-                Ok(r) => match r.json::<Value>() {
-                    Ok(v) => {
-                        if let Some(arr) = v["results"].as_array() {
-                            for (idx_in_chunk, item) in arr.iter().enumerate() {
-                                let orig_idx = chunk[idx_in_chunk].0;
-                                results[orig_idx] = item.clone();
+                Ok(r) => {
+                    let status = r.status();
+                    let offset = chunk.first().map(|(i, _)| i).unwrap_or(&0);
+                    if !status.is_success() {
+                        let body_preview = r.text().unwrap_or_default();
+                        let preview = body_preview.chars().take(120).collect::<String>();
+                        progress(
+                            "osv.query.error",
+                            &format!(
+                                "chunk_http_err offset={} attempt={} status={} body={}",
+                                offset, attempt, status, preview
+                            ),
+                        );
+                    } else {
+                        // Capture raw body first so we can log it on failure
+                        match r.text() {
+                            Ok(text) => {
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(v) => {
+                                        if let Some(arr) = v["results"].as_array() {
+                                            for (idx_in_chunk, item) in arr.iter().enumerate() {
+                                                let orig_idx = chunk[idx_in_chunk].0;
+                                                results[orig_idx] = item.clone();
+                                            }
+                                            cache_put(
+                                                std::env::var_os("SCANNER_CACHE")
+                                                    .as_deref()
+                                                    .map(PathBuf::from)
+                                                    .as_deref(),
+                                                &cache_tag,
+                                                v.to_string().as_bytes(),
+                                            );
+                                            progress(
+                                                "osv.query.chunk.done",
+                                                &format!(
+                                                    "offset={} size={} attempts={}",
+                                                    offset,
+                                                    chunk.len(),
+                                                    attempt
+                                                ),
+                                            );
+                                            done = true;
+                                            break;
+                                        } else {
+                                            let keys = v.as_object()
+                                                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                                                .unwrap_or_default();
+                                            let preview = text.chars().take(200).collect::<String>();
+                                            progress(
+                                                "osv.query.error",
+                                                &format!(
+                                                    "chunk_parse offset={} attempt={} keys={:?} body={}",
+                                                    offset, attempt, keys, preview
+                                                ),
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let preview = text.chars().take(200).collect::<String>();
+                                        progress(
+                                            "osv.query.error",
+                                            &format!(
+                                                "chunk_json offset={} attempt={} err={} body={}",
+                                                offset, attempt, e, preview
+                                            ),
+                                        );
+                                    }
+                                }
                             }
-                            cache_put(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &cache_tag, v.to_string().as_bytes());
-                            progress("osv.query.chunk.done", &format!("offset={} size={} attempts={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), chunk.len(), attempt));
-                            done = true; break;
-                        } else {
-                            progress("osv.query.error", &format!("chunk_parse offset={} attempt={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), attempt));
+                            Err(e) => {
+                                progress(
+                                    "osv.query.error",
+                                    &format!(
+                                        "chunk_text offset={} attempt={} err={}",
+                                        offset, attempt, e
+                                    ),
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        progress("osv.query.error", &format!("chunk_json offset={} attempt={} err={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), attempt, e));
-                    }
-                },
+                }
                 Err(e) => {
-                    progress("osv.query.error", &format!("chunk_http offset={} attempt={} err={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), attempt, e));
+                    progress(
+                        "osv.query.error",
+                        &format!(
+                            "chunk_http offset={} attempt={} err={}",
+                            chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                            attempt,
+                            e
+                        ),
+                    );
                 }
             }
             std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt as u64));
@@ -163,23 +336,69 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                 let single_cache = cache_key(&["osv_one", &q.to_string()]);
                 loop {
                     attempt_p += 1;
-                    if let Some(bytes) = cache_get(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &single_cache) {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) { results[*orig_idx] = v; break; }
+                    if let Some(bytes) = cache_get(
+                        std::env::var_os("SCANNER_CACHE")
+                            .as_deref()
+                            .map(PathBuf::from)
+                            .as_deref(),
+                        &single_cache,
+                    ) {
+                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                            results[*orig_idx] = v;
+                            break;
+                        }
                     }
-                    progress("osv.query.pkg.start", &format!("idx={} attempt={}", orig_idx, attempt_p));
+                    progress(
+                        "osv.query.pkg.start",
+                        &format!("idx={} attempt={}", orig_idx, attempt_p),
+                    );
                     let resp = client.post("https://api.osv.dev/v1/query").json(&q).send();
                     match resp {
                         Ok(r) => match r.json::<Value>() {
-                            Ok(v) => { cache_put(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &single_cache, v.to_string().as_bytes()); results[*orig_idx] = v; progress("osv.query.pkg.ok", &format!("idx={} attempts={}", orig_idx, attempt_p)); break; }
-                            Err(e) => { progress("osv.query.pkg.error", &format!("idx={} json err={}", orig_idx, e)); }
+                            Ok(v) => {
+                                cache_put(
+                                    std::env::var_os("SCANNER_CACHE")
+                                        .as_deref()
+                                        .map(PathBuf::from)
+                                        .as_deref(),
+                                    &single_cache,
+                                    v.to_string().as_bytes(),
+                                );
+                                results[*orig_idx] = v;
+                                progress(
+                                    "osv.query.pkg.ok",
+                                    &format!("idx={} attempts={}", orig_idx, attempt_p),
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                progress(
+                                    "osv.query.pkg.error",
+                                    &format!("idx={} json err={}", orig_idx, e),
+                                );
+                            }
                         },
-                        Err(e) => { progress("osv.query.pkg.error", &format!("idx={} http err={}", orig_idx, e)); }
+                        Err(e) => {
+                            progress(
+                                "osv.query.pkg.error",
+                                &format!("idx={} http err={}", orig_idx, e),
+                            );
+                        }
                     }
-                    if attempt_p >= retries { break; }
+                    if attempt_p >= retries {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt_p as u64));
                 }
             }
-            progress("osv.query.chunk.fallback", &format!("offset={} size={}", chunk.first().map(|(i,_)| i).unwrap_or(&0), chunk.len()));
+            progress(
+                "osv.query.chunk.fallback",
+                &format!(
+                    "offset={} size={}",
+                    chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                    chunk.len()
+                ),
+            );
         }
     }
 
@@ -190,65 +409,102 @@ fn map_ecosystem_name_version(p: &PackageCoordinate) -> (String, String, String)
     // Map OS package ecosystems to OSV conventions
     match p.ecosystem.as_str() {
         "deb" => ("Debian".into(), p.name.clone(), p.version.clone()),
-        "apk" => ("Alpine".into(), p.name.clone(), p.version.clone()),
+        "apk" => ("Alpine Linux".into(), p.name.clone(), p.version.clone()),
+        "redhat" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
+        "rocky" => ("Rocky Linux".into(), p.name.clone(), p.version.clone()),
+        "almalinux" => ("AlmaLinux".into(), p.name.clone(), p.version.clone()),
+        "suse" => ("SUSE".into(), p.name.clone(), p.version.clone()),
+        "opensuse" => ("openSUSE".into(), p.name.clone(), p.version.clone()),
+        "fedora" => ("Fedora".into(), p.name.clone(), p.version.clone()),
+        "centos" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
+        // Legacy fallback from older detector output.
+        "rpm" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
         // Fallback: pass through
         other => (other.to_string(), p.name.clone(), p.version.clone()),
     }
 }
 
-pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_results: &serde_json::Value) -> Vec<Finding> {
+pub fn map_osv_results_to_findings(
+    packages: &Vec<PackageCoordinate>,
+    osv_results: &serde_json::Value,
+) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for (idx, pkg) in packages.iter().enumerate() {
         let res = &osv_results[idx];
         if let Some(vulns) = res["vulns"].as_array() {
             for v in vulns {
                 // Collect CVE ids from aliases, references, OSV id and text
-                let aliases: Vec<String> = v["aliases"].as_array()
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                let aliases: Vec<String> = v["aliases"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 let re_cve = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
-                let mut cve_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut cve_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 if let Some(re) = &re_cve {
                     for a in &aliases {
-                        if let Some(m) = re.find(a) { cve_ids.insert(m.as_str().to_string()); }
+                        if let Some(m) = re.find(a) {
+                            cve_ids.insert(m.as_str().to_string());
+                        }
                     }
                 }
                 if cve_ids.is_empty() {
                     if let Some(refs) = v["references"].as_array() {
                         if let Some(re) = &re_cve {
                             for u in refs.iter().filter_map(|r| r["url"].as_str()) {
-                                if let Some(m) = re.find(u) { cve_ids.insert(m.as_str().to_string()); }
+                                if let Some(m) = re.find(u) {
+                                    cve_ids.insert(m.as_str().to_string());
+                                }
                             }
                         }
                     }
                 }
                 if cve_ids.is_empty() {
                     if let Some(osv_id_str) = v["id"].as_str() {
-                        if let Some(re) = &re_cve { if let Some(m) = re.find(osv_id_str) { cve_ids.insert(m.as_str().to_string()); } }
+                        if let Some(re) = &re_cve {
+                            if let Some(m) = re.find(osv_id_str) {
+                                cve_ids.insert(m.as_str().to_string());
+                            }
+                        }
                     }
                 }
                 if cve_ids.is_empty() {
                     let mut text = String::new();
-                    if let Some(s) = v["summary"].as_str() { text.push_str(s); text.push(' '); }
-                    if let Some(d) = v["details"].as_str() { text.push_str(d); }
-                    if let Some(re) = &re_cve { if let Some(m) = re.find(&text) { cve_ids.insert(m.as_str().to_string()); } }
+                    if let Some(s) = v["summary"].as_str() {
+                        text.push_str(s);
+                        text.push(' ');
+                    }
+                    if let Some(d) = v["details"].as_str() {
+                        text.push_str(d);
+                    }
+                    if let Some(re) = &re_cve {
+                        if let Some(m) = re.find(&text) {
+                            cve_ids.insert(m.as_str().to_string());
+                        }
+                    }
                 }
-                let description = v["summary"].as_str().map(|s| s.to_string())
+                let description = v["summary"]
+                    .as_str()
+                    .map(|s| s.to_string())
                     .or_else(|| v["details"].as_str().map(|s| s.to_string()));
                 let mut cvss: Option<CvssInfo> = None;
                 let mut severity_str: Option<String> = None;
                 if let Some(severities) = v["severity"].as_array() {
                     for sev in severities {
-                        if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" {
-                            if let Some(score) = sev["score"].as_str().and_then(|s| {
-                                // score may be just number or "X.Y/AV:..."
-                                let t = s.split('/').next().unwrap_or(s);
-                                t.parse::<f32>().ok()
-                            }) {
-                                let vector = sev["score"].as_str().unwrap_or("").to_string();
-                                cvss = Some(CvssInfo { base: score, vector: vector.clone() });
-                                severity_str = Some(severity_from_score(score).to_string());
-                                break;
+                        if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" || sev["type"] == "CVSS_V4" {
+                            if let Some(score_str) = sev["score"].as_str() {
+                                if let Some((score, vector)) = parse_cvss_score(score_str) {
+                                    cvss = Some(CvssInfo {
+                                        base: score,
+                                        vector,
+                                    });
+                                    severity_str = Some(severity_from_score(score).to_string());
+                                    break;
+                                }
                             }
                         }
                     }
@@ -260,20 +516,36 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                     }
                 }
 
-                let package = Some(PackageInfo { name: pkg.name.clone(), ecosystem: pkg.ecosystem.clone(), version: pkg.version.clone() });
-                let evidence = vec![EvidenceItem { evidence_type: "file".into(), path: None, detail: Some("package db record".into()) }];
+                let package = Some(PackageInfo {
+                    name: pkg.name.clone(),
+                    ecosystem: pkg.ecosystem.clone(),
+                    version: pkg.version.clone(),
+                });
+                let evidence = vec![EvidenceItem {
+                    evidence_type: "file".into(),
+                    path: None,
+                    detail: Some("package db record".into()),
+                }];
                 let mut references: Vec<ReferenceInfo> = Vec::new();
                 if let Some(refs) = v["references"].as_array() {
                     for r in refs {
                         if let Some(url) = r["url"].as_str() {
-                            references.push(ReferenceInfo { reference_type: r["type"].as_str().unwrap_or("reference").to_string(), url: url.to_string() });
+                            references.push(ReferenceInfo {
+                                reference_type: r["type"]
+                                    .as_str()
+                                    .unwrap_or("reference")
+                                    .to_string(),
+                                url: url.to_string(),
+                            });
                         }
                     }
                 }
 
                 let mut source_ids = aliases;
                 let osv_id = v["id"].as_str().unwrap_or("").to_string();
-                if !osv_id.is_empty() { source_ids.push(osv_id.clone()); }
+                if !osv_id.is_empty() {
+                    source_ids.push(osv_id.clone());
+                }
                 // Determine fixed status using OSV affected ranges when possible
                 let mut fixed: Option<bool> = None;
                 if let Some(aff) = v["affected"].as_array() {
@@ -281,17 +553,33 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                     for a in aff {
                         if let Some(p) = a["package"].get("ecosystem").and_then(|e| e.as_str()) {
                             let eco = p.to_string();
-                            let name_match = a["package"].get("name").and_then(|n| n.as_str()).map(|s| s == pkg.name).unwrap_or(false);
-                            if !name_match { continue; }
+                            let name_match = a["package"]
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .map(|s| s == pkg.name)
+                                .unwrap_or(false);
+                            if !name_match {
+                                continue;
+                            }
                             if let Some(ranges) = a["ranges"].as_array() {
                                 for r in ranges {
-                                    if r["type"].as_str() == Some("ECOSYSTEM") {
+                                    let range_type = r["type"].as_str().unwrap_or("");
+                                    if range_type == "GIT" {
+                                        // GIT ranges cannot be compared to installed versions
+                                        // without git history; leave fixed as None
+                                        continue;
+                                    }
+                                    if range_type == "ECOSYSTEM" || range_type == "SEMVER" {
                                         if let Some(events) = r["events"].as_array() {
                                             // Simplified: if a fixed version exists and pkg.version >= fixed, mark fixed=true
-                                            if let Some(fixed_ver) = events.iter().find_map(|e| e.get("fixed").and_then(|s| s.as_str())) {
+                                            if let Some(fixed_ver) = events.iter().find_map(|e| {
+                                                e.get("fixed").and_then(|s| s.as_str())
+                                            }) {
                                                 // Use Debian-style compare for deb/apk when available
                                                 // Fallback: naive numeric compare of dotted versions
-                                                let is_fixed = cmp_versions(&pkg.version, fixed_ver) != std::cmp::Ordering::Less;
+                                                let is_fixed =
+                                                    cmp_versions(&pkg.version, fixed_ver)
+                                                        != std::cmp::Ordering::Less;
                                                 fixed = Some(is_fixed);
                                             }
                                         }
@@ -309,6 +597,8 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                             source_ids: source_ids.clone(),
                             package: package.clone(),
                             fixed,
+                            fixed_in: None,
+                            recommendation: None,
                             severity: severity_str.clone(),
                             cvss: cvss.clone(),
                             description: description.clone(),
@@ -324,6 +614,8 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
                         source_ids,
                         package,
                         fixed,
+                        fixed_in: None,
+                        recommendation: None,
                         severity: severity_str,
                         cvss,
                         description,
@@ -338,252 +630,1191 @@ pub fn map_osv_results_to_findings(packages: &Vec<PackageCoordinate>, osv_result
     out
 }
 
-/// Enrich findings with details from OSV /v1/vulns/{id} (fills description, severity, references)
-pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
-    if findings.is_empty() { return; }
-    // Deduplicate IDs to query
-    let mut unique_ids_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for f in findings.iter() { unique_ids_set.insert(f.id.clone()); }
-    let mut unique_ids: Vec<String> = unique_ids_set.into_iter().collect();
-    unique_ids.sort();
-    let client = Client::builder().timeout(Duration::from_secs(15)).build().unwrap();
-    let sleep_ms: u64 = std::env::var("SCANNER_OSV_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
-    let total = unique_ids.len();
+/// Apply a single OSV JSON payload to all matching findings in `findings`.
+///
+/// Extracts description/cvss/severity/references from `json` and writes them onto
+/// every finding whose `id` equals `id`.  Then performs the advisory-to-CVE upgrade
+/// (mutates finding IDs, appends extra CVE findings, deduplicates) and, as a final
+/// fallback for Debian DLA-/DSA- advisories, calls `map_debian_advisory_to_cves`.
+///
+/// This function must be called sequentially because it mutates the shared `findings`
+/// vec; it is intentionally separated from the HTTP-fetch path so that the fetch can
+/// be parallelised independently.
+fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Finding>) {
+    // Extract description
+    let description = json["summary"]
+        .as_str()
+        .or_else(|| json["details"].as_str())
+        .map(|s| s.to_string());
 
-    if let Some(c) = pg.as_mut() { pg_init_schema(c); }
-
-    for (idx, id) in unique_ids.into_iter().enumerate() {
-        progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
-        // PG first
-        if let Some(client_pg) = pg.as_mut() {
-            if let Some((payload, last_checked, last_mod)) = pg_get_osv(client_pg, &id) {
-                let ttl_days = compute_dynamic_ttl_days(last_mod, 14);
-                if Utc::now() - last_checked < ChronoDuration::days(ttl_days) {
-                    // Apply cached OSV payload to matching findings (id may be OSV id; we still enrich fields from OSV payload)
-                    let description = payload["summary"].as_str().or_else(|| payload["details"].as_str()).map(|s| s.to_string());
-                    let mut cvss: Option<CvssInfo> = None;
-                    let mut severity_str: Option<String> = None;
-                    if let Some(severities) = payload["severity"].as_array() {
-                        for sev in severities {
-                            if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" {
-                                if let Some(score_num) = sev["score"].as_str().and_then(|s| { let t = s.split('/').next().unwrap_or(s); t.parse::<f32>().ok() }) {
-                                    let vector = sev["score"].as_str().unwrap_or("").to_string();
-                                    cvss = Some(CvssInfo { base: score_num, vector: vector.clone() });
-                                    severity_str = Some(severity_from_score(score_num).to_string());
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    let mut refs: Vec<ReferenceInfo> = Vec::new();
-                    if let Some(references) = payload["references"].as_array() {
-                        for r in references {
-                            if let Some(url) = r["url"].as_str() {
-                                refs.push(ReferenceInfo { reference_type: r["type"].as_str().unwrap_or("reference").to_string(), url: url.to_string() });
-                            }
-                        }
-                    }
-                    for f in findings.iter_mut().filter(|f| f.id == id) {
-                        if f.description.is_none() { f.description = description.clone(); }
-                        if f.cvss.is_none() { f.cvss = cvss.clone(); }
-                        if f.severity.is_none() { f.severity = severity_str.clone(); }
-                        if f.references.is_empty() && !refs.is_empty() { f.references = refs.clone(); }
-                    }
-                    progress("osv.cache.pg.hit", &id);
-                    continue;
-                }
-            }
-        }
-
-        // file cache next
-        let cache_tag = cache_key(&["osv_vuln", &id]);
-        let mut json: Option<Value> = None;
-        if let Some(bytes) = cache_get(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &cache_tag) {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) { json = Some(v); }
-        }
-        if json.is_none() {
-            if sleep_ms > 0 { sleep(Duration::from_millis(sleep_ms)); }
-            let url = format!("https://api.osv.dev/v1/vulns/{}", id);
-            match client.get(&url).send() {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<Value>() {
-                        Ok(v) => {
-                            cache_put(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &cache_tag, v.to_string().as_bytes());
-                            json = Some(v);
-                        },
-                        Err(_) => {}
-                    }
-                }
-                _ => {}
-            }
-        }
-        if json.is_none() { progress("osv.fetch.err", &id); continue; }
-        let json = json.unwrap();
-        // store to PG once (reuse the single connection)
-        if let Some(client_pg) = pg.as_mut() { let lm = parse_osv_last_modified(&json); pg_put_osv(client_pg, &id, &json, lm); }
-        progress("osv.fetch.ok", &id);
-        // Extract useful fields
-        let description = json["summary"].as_str().or_else(|| json["details"].as_str()).map(|s| s.to_string());
-        let mut cvss: Option<CvssInfo> = None;
-        let mut severity_str: Option<String> = None;
-        if let Some(severities) = json["severity"].as_array() {
-            for sev in severities {
-                if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" {
-                    if let Some(score_num) = sev["score"].as_str().and_then(|s| {
-                        let t = s.split('/').next().unwrap_or(s);
-                        t.parse::<f32>().ok()
-                    }) {
-                        let vector = sev["score"].as_str().unwrap_or("").to_string();
-                        cvss = Some(CvssInfo { base: score_num, vector: vector.clone() });
+    // Extract CVSS / severity
+    let mut cvss: Option<CvssInfo> = None;
+    let mut severity_str: Option<String> = None;
+    if let Some(severities) = json["severity"].as_array() {
+        for sev in severities {
+            if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" || sev["type"] == "CVSS_V4" {
+                if let Some(score_str) = sev["score"].as_str() {
+                    if let Some((score_num, vector)) = parse_cvss_score(score_str) {
+                        cvss = Some(CvssInfo {
+                            base: score_num,
+                            vector,
+                        });
                         severity_str = Some(severity_from_score(score_num).to_string());
                         break;
                     }
                 }
             }
         }
-        let mut refs: Vec<ReferenceInfo> = Vec::new();
-        if let Some(references) = json["references"].as_array() {
-            for r in references {
-                if let Some(url) = r["url"].as_str() {
-                    refs.push(ReferenceInfo { reference_type: r["type"].as_str().unwrap_or("reference").to_string(), url: url.to_string() });
-                }
-            }
-        }
-        // Apply to all findings matching this id; upgrade advisory to one-or-many CVEs if available
-        let mut to_append: Vec<Finding> = Vec::new();
-        for i in 0..findings.len() {
-            if findings[i].id != id { continue; }
-            let f = &mut findings[i];
-            if f.description.is_none() { f.description = description.clone(); }
-            if f.cvss.is_none() { f.cvss = cvss.clone(); }
-            if f.severity.is_none() { f.severity = severity_str.clone(); }
-            if f.references.is_empty() && !refs.is_empty() { f.references = refs.clone(); }
-            if !f.id.starts_with("CVE-") {
-                // Collect all CVEs from aliases/refs/text
-                let mut text = String::new();
-                if let Some(s) = json["summary"].as_str() { text.push_str(s); text.push(' '); }
-                if let Some(d) = json["details"].as_str() { text.push_str(d); }
-                let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
-                let mut cves: std::collections::HashSet<String> = std::collections::HashSet::new();
-                if let Some(arr) = json["aliases"].as_array() {
-                    for a in arr.iter().filter_map(|x| x.as_str()) { if a.starts_with("CVE-") { cves.insert(a.to_string()); } }
-                }
-                if let Some(arr) = json["references"].as_array() { if let Some(re2) = &re { for r in arr { if let Some(u) = r["url"].as_str() { if let Some(m) = re2.find(u) { cves.insert(m.as_str().to_string()); } } } } }
-                if let Some(re2) = &re { if let Some(m) = re2.find(&text) { cves.insert(m.as_str().to_string()); } }
-                if !cves.is_empty() {
-                    // Upgrade current to first CVE, append others
-                    let mut cves_iter = cves.into_iter();
-                    if let Some(primary) = cves_iter.next() {
-                        if !f.source_ids.contains(&f.id) { f.source_ids.push(f.id.clone()); }
-                        f.id = primary;
-                    }
-                    for extra in cves_iter {
-                        let mut nf = findings[i].clone();
-                        nf.id = extra;
-                        to_append.push(nf);
-                    }
-                }
-            }
-        }
-        findings.extend(to_append);
-        // Deduplicate by id after upgrades
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        findings.retain(|f| seen_ids.insert(f.id.clone()));
-        // Log upgrade count by counting CVEs that reference this advisory in source_ids
-        let upgraded_cve_count = findings.iter()
-            .filter(|f| f.id.starts_with("CVE-") && f.source_ids.iter().any(|s| s == &id))
-            .count();
-        if upgraded_cve_count > 0 {
-            progress("osv.upgrade.cve", &format!("{} -> {} CVEs", id, upgraded_cve_count));
-        }
-        // Drop any remaining advisory-only finding with this id (keep advisory id only in source_ids)
-        if !id.starts_with("CVE-") && upgraded_cve_count > 0 {
-            let before_len = findings.len();
-            findings.retain(|f| f.id != id);
-            if findings.len() != before_len {
-                progress("osv.advisory.drop", &id);
-            }
-        }
+    }
 
-        // If still advisory-only (DLA/DSA) for this id, fallback to Debian tracker mapping
-        if (id.starts_with("DLA-") || id.starts_with("DSA-"))
-            && findings.iter().any(|f| f.id == id)
-        {
-            if let Some(mut mapped) = map_debian_advisory_to_cves(&id) {
-                mapped.sort(); mapped.dedup();
-                if !mapped.is_empty() {
-                    let mut to_append2: Vec<Finding> = Vec::new();
-                    for f in findings.iter_mut().filter(|f| f.id == id) {
-                        if let Some(first) = mapped.first().cloned() {
-                            if !f.source_ids.contains(&f.id) { f.source_ids.push(f.id.clone()); }
-                            f.id = first;
-                        }
-                        for extra in mapped.iter().skip(1) {
-                            let mut nf = f.clone();
-                            nf.id = extra.clone();
-                            to_append2.push(nf);
-                        }
-                    }
-                    findings.extend(to_append2);
-                    let mut seen_ids2: std::collections::HashSet<String> = std::collections::HashSet::new();
-                    findings.retain(|f| seen_ids2.insert(f.id.clone()));
-                    progress("osv.debian.map.ok", &format!("{} -> {} CVEs", id, mapped.len()));
-                    // Also drop any remaining advisory-only record now that CVEs were added
-                    if !id.starts_with("CVE-") && !mapped.is_empty() {
-                        let before_len2 = findings.len();
-                        findings.retain(|f| f.id != id);
-                        if findings.len() != before_len2 {
-                            progress("osv.advisory.drop", &id);
-                        }
-                    }
-                } else {
-                    progress("osv.debian.map.empty", &id);
-                }
-            } else {
-                progress("osv.debian.map.skip", &id);
+    // Extract references
+    let mut refs: Vec<ReferenceInfo> = Vec::new();
+    if let Some(references) = json["references"].as_array() {
+        for r in references {
+            if let Some(url) = r["url"].as_str() {
+                refs.push(ReferenceInfo {
+                    reference_type: r["type"].as_str().unwrap_or("reference").to_string(),
+                    url: url.to_string(),
+                });
             }
         }
     }
 
+    // Apply enrichment fields to matching findings
+    for f in findings.iter_mut().filter(|f| f.id == id) {
+        if f.description.is_none() {
+            f.description = description.clone();
+        }
+        if f.cvss.is_none() {
+            f.cvss = cvss.clone();
+        }
+        if f.severity.is_none() {
+            f.severity = severity_str.clone();
+        }
+        if f.references.is_empty() && !refs.is_empty() {
+            f.references = refs.clone();
+        }
+    }
+
+    // Advisory -> CVE upgrade
+    let mut to_append: Vec<Finding> = Vec::new();
+    for i in 0..findings.len() {
+        if findings[i].id != id {
+            continue;
+        }
+        if findings[i].id.starts_with("CVE-") {
+            continue;
+        }
+        // Build text corpus to scan for CVE patterns
+        let mut text = String::new();
+        if let Some(s) = json["summary"].as_str() {
+            text.push_str(s);
+            text.push(' ');
+        }
+        if let Some(d) = json["details"].as_str() {
+            text.push_str(d);
+        }
+        let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok();
+        let mut cves: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(arr) = json["aliases"].as_array() {
+            for a in arr.iter().filter_map(|x| x.as_str()) {
+                if a.starts_with("CVE-") {
+                    cves.insert(a.to_string());
+                }
+            }
+        }
+        if let Some(arr) = json["references"].as_array() {
+            if let Some(re2) = &re {
+                for r in arr {
+                    if let Some(u) = r["url"].as_str() {
+                        if let Some(m) = re2.find(u) {
+                            cves.insert(m.as_str().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(re2) = &re {
+            if let Some(m) = re2.find(&text) {
+                cves.insert(m.as_str().to_string());
+            }
+        }
+        if !cves.is_empty() {
+            // Clone the base finding BEFORE mutating id so secondary CVE records
+            // carry the original advisory ID in source_ids.
+            let base_clone = findings[i].clone();
+            let mut cves_iter = cves.into_iter();
+            if let Some(primary) = cves_iter.next() {
+                let f = &mut findings[i];
+                if !f.source_ids.contains(&f.id) {
+                    f.source_ids.push(f.id.clone());
+                }
+                f.id = primary;
+            }
+            for extra in cves_iter {
+                let mut nf = base_clone.clone();
+                if !nf.source_ids.contains(&nf.id) {
+                    nf.source_ids.push(nf.id.clone());
+                }
+                nf.id = extra;
+                to_append.push(nf);
+            }
+        }
+    }
+    findings.extend(to_append);
+
+    // Deduplicate by id after upgrades
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    findings.retain(|f| seen_ids.insert(f.id.clone()));
+
+    // Log upgrade count by counting CVEs that reference this advisory in source_ids
+    let upgraded_cve_count = findings
+        .iter()
+        .filter(|f| f.id.starts_with("CVE-") && f.source_ids.iter().any(|s| s == id))
+        .count();
+    if upgraded_cve_count > 0 {
+        progress(
+            "osv.upgrade.cve",
+            &format!("{} -> {} CVEs", id, upgraded_cve_count),
+        );
+    }
+
+    // Drop any remaining advisory-only finding with this id
+    if !id.starts_with("CVE-") && upgraded_cve_count > 0 {
+        let before_len = findings.len();
+        findings.retain(|f| f.id != id);
+        if findings.len() != before_len {
+            progress("osv.advisory.drop", id);
+        }
+    }
+
+    // Debian DLA-/DSA- fallback: if still advisory-only, map via the Debian tracker
+    if (id.starts_with("DLA-") || id.starts_with("DSA-")) && findings.iter().any(|f| f.id == id) {
+        if let Some(mut mapped) = map_debian_advisory_to_cves(id) {
+            mapped.sort();
+            mapped.dedup();
+            if !mapped.is_empty() {
+                let mut to_append2: Vec<Finding> = Vec::new();
+                for f in findings.iter_mut().filter(|f| f.id == id) {
+                    if let Some(first) = mapped.first().cloned() {
+                        if !f.source_ids.contains(&f.id) {
+                            f.source_ids.push(f.id.clone());
+                        }
+                        f.id = first;
+                    }
+                    for extra in mapped.iter().skip(1) {
+                        let mut nf = f.clone();
+                        nf.id = extra.clone();
+                        to_append2.push(nf);
+                    }
+                }
+                findings.extend(to_append2);
+                let mut seen_ids2: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                findings.retain(|f| seen_ids2.insert(f.id.clone()));
+                progress(
+                    "osv.debian.map.ok",
+                    &format!("{} -> {} CVEs", id, mapped.len()),
+                );
+                let before_len2 = findings.len();
+                findings.retain(|f| f.id != id);
+                if findings.len() != before_len2 {
+                    progress("osv.advisory.drop", id);
+                }
+            } else {
+                progress("osv.debian.map.empty", id);
+            }
+        } else {
+            progress("osv.debian.map.skip", id);
+        }
+    }
+}
+
+/// Fetch OSV `/v1/vulns/{id}` payloads in parallel (max 5 concurrent).
+///
+/// For each id in `ids`:
+///   1. Check the file cache first.
+///   2. If not cached, acquire a slot from the semaphore (capacity 5), perform
+///      the HTTP GET, release the slot, and store the result to the file cache.
+///
+/// Returns a map of id -> parsed JSON for every id that could be resolved.
+/// PG-cache lookups are deliberately excluded here because `PgClient` is not `Send`;
+/// callers must handle PG separately before and after this function.
+fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::HashMap<String, Value> {
+    if ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+
+    let cache_dir = std::env::var_os("SCANNER_CACHE").map(PathBuf::from);
+
+    // Semaphore: Arc<(Mutex<count>, Condvar)>, initialised to 5 permits.
+    let sem = std::sync::Arc::new((std::sync::Mutex::new(5usize), std::sync::Condvar::new()));
+
+    let results: std::collections::HashMap<String, Value> = ids
+        .par_iter()
+        .filter_map(|id| {
+            // File-cache hit fast path — no semaphore needed.
+            let cache_tag = cache_key(&["osv_vuln", id]);
+            if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    return Some((id.clone(), v));
+                }
+            }
+
+            // Acquire a semaphore permit.
+            {
+                let (lock, cvar) = &*sem;
+                let mut count = lock.lock().unwrap();
+                while *count == 0 {
+                    count = cvar.wait(count).unwrap();
+                }
+                *count -= 1;
+            }
+
+            let url = format!("https://api.osv.dev/v1/vulns/{}", id);
+            let result = match client.get(&url).send() {
+                Ok(r) if r.status().is_success() => match r.json::<Value>() {
+                    Ok(v) => {
+                        cache_put(cache_dir.as_deref(), &cache_tag, v.to_string().as_bytes());
+                        Some((id.clone(), v))
+                    }
+                    Err(_) => None,
+                },
+                _ => None,
+            };
+
+            // Release the semaphore permit.
+            {
+                let (lock, cvar) = &*sem;
+                let mut count = lock.lock().unwrap();
+                *count += 1;
+                cvar.notify_one();
+            }
+
+            result
+        })
+        .collect();
+
+    results
+}
+
+/// Enrich findings with details from OSV /v1/vulns/{id} (fills description, severity, references)
+pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+    if !env_bool("SCANNER_OSV_ENRICH", true) {
+        progress("osv.fetch.skip", "disabled by SCANNER_OSV_ENRICH");
+        return;
+    }
+    if findings.is_empty() {
+        return;
+    }
+    // Deduplicate IDs to query
+    let mut unique_ids_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for f in findings.iter() {
+        unique_ids_set.insert(f.id.clone());
+    }
+    let mut unique_ids: Vec<String> = unique_ids_set.into_iter().collect();
+    unique_ids.sort();
+    let client = build_http_client(15);
+    let total = unique_ids.len();
+
+    if let Some(c) = pg.as_mut() {
+        pg_init_schema(c);
+    }
+
+    // Phase 1: PG cache lookup (sequential — PgClient is not Send)
+    let mut pg_cache_hits: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    let mut needs_fetch: Vec<String> = Vec::new();
+    for id in &unique_ids {
+        let mut pg_hit = false;
+        if let Some(client_pg) = pg.as_mut() {
+            if let Some((payload, last_checked, last_mod)) = pg_get_osv(client_pg, id) {
+                let ttl_days = compute_dynamic_ttl_days(last_mod, 14);
+                if Utc::now() - last_checked < ChronoDuration::days(ttl_days) {
+                    pg_cache_hits.insert(id.clone(), payload);
+                    pg_hit = true;
+                }
+            }
+        }
+        if !pg_hit {
+            needs_fetch.push(id.clone());
+        }
+    }
+
+    // Phase 2: Parallel fetch for PG-cache misses (max 5 concurrent)
+    let fetched = osv_fetch_parallel(&needs_fetch, &client);
+    progress(
+        "osv.fetch.parallel.done",
+        &format!(
+            "fetched={} missed={}",
+            fetched.len(),
+            needs_fetch.len().saturating_sub(fetched.len())
+        ),
+    );
+
+    // Phase 3: Store newly fetched payloads to PG (sequential)
+    for (id, json) in &fetched {
+        if let Some(c) = pg.as_mut() {
+            let lm = parse_osv_last_modified(json);
+            pg_put_osv(c, id, json, lm);
+        }
+    }
+
+    // Phase 4: Build combined payloads map (PG hits + freshly fetched)
+    let all_payloads: std::collections::HashMap<String, Value> =
+        pg_cache_hits.into_iter().chain(fetched).collect();
+
+    // Phase 5: Apply payloads to findings sequentially
+    // (advisory->CVE upgrades require sequential mutation of the shared findings vec)
+    for (idx, id) in unique_ids.into_iter().enumerate() {
+        progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
+        if let Some(json) = all_payloads.get(&id) {
+            osv_apply_payload_to_findings(&id, json, findings);
+            progress("osv.fetch.ok", &id);
+        } else {
+            progress("osv.fetch.err", &id);
+        }
+    }
+
+    // Advisory-level enrichment for Red Hat errata IDs (RHSA/RHBA/RHEA).
+    // This fills severity/cvss/description/references so they don't stay as empty "Other" rows.
+    redhat_enrich_findings(findings, pg);
+    // CVE-level Red Hat enrichment computes package applicability and fixed package versions.
+    redhat_enrich_cve_findings(findings, pg);
+
     // Deduplicate by id after any upgrades from advisory -> CVE
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     findings.retain(|f| seen_ids.insert(f.id.clone()));
+
+    // Final pass: drop any remaining Debian advisories (DLA/DSA) to drive non-CVE count to zero
+    let before_len_final = findings.len();
+    findings.retain(|f| !(f.id.starts_with("DLA-") || f.id.starts_with("DSA-")));
+    let dropped = before_len_final.saturating_sub(findings.len());
+    if dropped > 0 {
+        progress("osv.advisory.drop.final", &format!("count={}", dropped));
+    }
 }
 
 fn map_debian_advisory_to_cves(advisory_id: &str) -> Option<Vec<String>> {
     // Fetch Debian tracker page and extract CVE IDs
-    let url = format!("https://security-tracker.debian.org/tracker/{}", advisory_id);
-    let client = Client::builder().timeout(Duration::from_secs(10)).build().ok()?;
+    let url = format!(
+        "https://security-tracker.debian.org/tracker/{}",
+        advisory_id
+    );
+    let client = build_http_client(10);
     let resp = client.get(&url).send().ok()?;
-    if !resp.status().is_success() { return None; }
+    if !resp.status().is_success() {
+        return None;
+    }
     let body = resp.text().ok()?;
     let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok()?;
     let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in re.find_iter(&body) { set.insert(m.as_str().to_string()); }
+    for m in re.find_iter(&body) {
+        set.insert(m.as_str().to_string());
+    }
     Some(set.into_iter().collect())
 }
 
-pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&str>, pg: &mut Option<PgClient>) {
-    if findings.is_empty() { return; }
-    // Deduplicate CVE IDs
-    let mut unique_ids_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for f in findings.iter() { unique_ids_set.insert(f.id.clone()); }
-    let mut unique_ids: Vec<String> = unique_ids_set.into_iter().filter(|id| id.starts_with("CVE-")).collect();
+fn normalize_redhat_errata_id(id: &str) -> String {
+    id.trim()
+        .to_ascii_uppercase()
+        .replace("%3A", ":")
+        .replace("%3a", ":")
+}
+
+fn normalize_reference_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    urlencoding::decode(trimmed)
+        .map(|v| v.into_owned())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn append_unique_references(dest: &mut Vec<ReferenceInfo>, refs: Vec<ReferenceInfo>) {
+    for r in refs {
+        let exists = dest.iter().any(|cur| {
+            cur.reference_type.eq_ignore_ascii_case(&r.reference_type)
+                && cur.url.eq_ignore_ascii_case(&r.url)
+        });
+        if !exists {
+            dest.push(r);
+        }
+    }
+}
+
+fn is_redhat_errata_id(id: &str) -> bool {
+    let up = normalize_redhat_errata_id(id);
+    let mut parts = up.splitn(2, '-');
+    let kind = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("");
+    if kind != "RHSA" && kind != "RHBA" && kind != "RHEA" {
+        return false;
+    }
+    let mut rhs = rest.splitn(2, ':');
+    let year = rhs.next().unwrap_or("");
+    let seq = rhs.next().unwrap_or("");
+    year.len() == 4
+        && year.chars().all(|c| c.is_ascii_digit())
+        && !seq.is_empty()
+        && seq.chars().all(|c| c.is_ascii_digit())
+}
+
+fn normalize_redhat_severity(raw: &str) -> Option<String> {
+    let up = raw.trim().to_ascii_uppercase();
+    if up.is_empty() {
+        return None;
+    }
+    let mapped = match up.as_str() {
+        "IMPORTANT" => "HIGH",
+        "MODERATE" => "MEDIUM",
+        "LOW" => "LOW",
+        "MEDIUM" => "MEDIUM",
+        "HIGH" => "HIGH",
+        "CRITICAL" => "CRITICAL",
+        _ => up.as_str(),
+    };
+    Some(mapped.to_string())
+}
+
+fn redhat_cvss_from_vuln(vuln: &Value) -> Option<CvssInfo> {
+    let scores = vuln.get("scores").and_then(|s| s.as_array())?;
+    for score in scores {
+        if let Some(cvss3) = score.get("cvss_v3") {
+            if let Some(base) = cvss3.get("baseScore").and_then(|b| b.as_f64()) {
+                let vector = cvss3
+                    .get("vectorString")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(CvssInfo {
+                    base: base as f32,
+                    vector,
+                });
+            }
+        }
+        if let Some(cvss2) = score.get("cvss_v2") {
+            if let Some(base) = cvss2.get("baseScore").and_then(|b| b.as_f64()) {
+                let vector = cvss2
+                    .get("vectorString")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Some(CvssInfo {
+                    base: base as f32,
+                    vector,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn redhat_note_text(document: &Value) -> Option<String> {
+    let notes = document.get("notes").and_then(|n| n.as_array())?;
+
+    // Prefer summary/topic style notes first.
+    let preferred = notes
+        .iter()
+        .find(|n| {
+            n.get("category")
+                .and_then(|c| c.as_str())
+                .map(|c| c.eq_ignore_ascii_case("summary"))
+                .unwrap_or(false)
+                || n.get("title")
+                    .and_then(|t| t.as_str())
+                    .map(|t| t.eq_ignore_ascii_case("topic"))
+                    .unwrap_or(false)
+        })
+        .and_then(|n| n.get("text").and_then(|t| t.as_str()))
+        .map(|s| s.to_string());
+    if preferred.is_some() {
+        return preferred;
+    }
+
+    // Fallback to any first note text.
+    notes.iter().find_map(|n| {
+        n.get("text")
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+    })
+}
+
+#[derive(Debug, Clone)]
+struct RedHatFixedRelease {
+    advisory: Option<String>,
+    package_name: String,
+    fixed_evr: String,
+}
+
+fn parse_redhat_release_package(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Red Hat uses "name-epoch:version-release" in affected_release.package.
+    let mut parts = trimmed.rsplitn(3, '-');
+    let release = parts.next()?;
+    let version = parts.next()?;
+    let name = parts.next()?;
+    if name.is_empty() || version.is_empty() || release.is_empty() {
+        return None;
+    }
+    let has_digit = version.chars().any(|c| c.is_ascii_digit());
+    if !has_digit {
+        return None;
+    }
+    Some((name.to_string(), format!("{}-{}", version, release)))
+}
+
+fn parse_redhat_cve_cvss(json: &Value) -> Option<CvssInfo> {
+    let cvss3 = json.get("cvss3")?;
+    let base = cvss3
+        .get("cvss3_base_score")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<f32>().ok())?;
+    let vector = cvss3
+        .get("cvss3_scoring_vector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(CvssInfo { base, vector })
+}
+
+fn redhat_cve_references(json: &Value) -> Vec<ReferenceInfo> {
+    let mut refs: Vec<ReferenceInfo> = Vec::new();
+    if let Some(arr) = json.get("references").and_then(|r| r.as_array()) {
+        for raw in arr.iter().filter_map(|v| v.as_str()) {
+            for line in raw.lines() {
+                let url = normalize_reference_url(line);
+                if !url.is_empty() {
+                    refs.push(ReferenceInfo {
+                        reference_type: "redhat".into(),
+                        url,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(arr) = json.get("affected_release").and_then(|v| v.as_array()) {
+        for advisory in arr
+            .iter()
+            .filter_map(|x| x.get("advisory").and_then(|v| v.as_str()))
+        {
+            let aid = normalize_redhat_errata_id(advisory);
+            if is_redhat_errata_id(&aid) {
+                refs.push(ReferenceInfo {
+                    reference_type: "redhat".into(),
+                    url: format!("https://access.redhat.com/errata/{}", aid),
+                });
+            }
+        }
+    }
+    refs
+}
+
+fn rpm_epoch(evr: &str) -> i64 {
+    evr.split_once(':')
+        .and_then(|(lhs, _)| lhs.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn extract_el_tag(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b'e' && bytes[i + 1] == b'l' && bytes[i + 2].is_ascii_digit() {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            return Some(lower[i..j].to_string());
+        }
+    }
+    None
+}
+
+fn strip_rpm_arch_suffix(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let suffixes = [
+        ".x86_64", ".aarch64", ".ppc64le", ".s390x", ".i686", ".i386", ".armv7hl", ".noarch",
+        ".src",
+    ];
+    for suffix in suffixes {
+        if lower.ends_with(suffix) {
+            return lower[..lower.len() - suffix.len()].to_string();
+        }
+    }
+    lower
+}
+
+fn package_name_matches(installed: &str, candidate: &str) -> bool {
+    strip_rpm_arch_suffix(installed) == strip_rpm_arch_suffix(candidate)
+}
+
+fn parse_redhat_fixed_releases(json: &Value) -> Vec<RedHatFixedRelease> {
+    let mut releases = Vec::new();
+    if let Some(arr) = json.get("affected_release").and_then(|v| v.as_array()) {
+        for item in arr {
+            let package_raw = item.get("package").and_then(|v| v.as_str()).unwrap_or("");
+            let Some((package_name, fixed_evr)) = parse_redhat_release_package(package_raw) else {
+                continue;
+            };
+            let advisory = item
+                .get("advisory")
+                .and_then(|v| v.as_str())
+                .map(normalize_redhat_errata_id)
+                .filter(|id| is_redhat_errata_id(id));
+            releases.push(RedHatFixedRelease {
+                advisory,
+                package_name,
+                fixed_evr,
+            });
+        }
+    }
+    releases
+}
+
+fn best_redhat_fixed_release(pkg: &PackageInfo, all: &[RedHatFixedRelease]) -> Option<RedHatFixedRelease> {
+    let mut candidates: Vec<RedHatFixedRelease> = all
+        .iter()
+        .filter(|r| package_name_matches(&pkg.name, &r.package_name))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(installed_tag) = extract_el_tag(&pkg.version) {
+        let tagged: Vec<RedHatFixedRelease> = candidates
+            .iter()
+            .filter(|r| extract_el_tag(&r.fixed_evr).as_deref() == Some(installed_tag.as_str()))
+            .cloned()
+            .collect();
+        if !tagged.is_empty() {
+            candidates = tagged;
+        }
+    }
+
+    let installed_epoch = rpm_epoch(&pkg.version);
+    let epoch_match: Vec<RedHatFixedRelease> = candidates
+        .iter()
+        .filter(|r| rpm_epoch(&r.fixed_evr) == installed_epoch)
+        .cloned()
+        .collect();
+    if !epoch_match.is_empty() {
+        candidates = epoch_match;
+    }
+
+    candidates.sort_by(|a, b| compare_evr(&a.fixed_evr, &b.fixed_evr));
+    candidates.into_iter().next()
+}
+
+fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+    if !env_bool("SCANNER_REDHAT_ENRICH", true) {
+        progress("redhat.cve.fetch.skip", "disabled by SCANNER_REDHAT_ENRICH");
+        return;
+    }
+    if findings.is_empty() {
+        return;
+    }
+
+    let mut ids: Vec<String> = findings
+        .iter()
+        .filter_map(|f| {
+            if !f.id.starts_with("CVE-") {
+                return None;
+            }
+            let pkg = f.package.as_ref()?;
+            if !is_rpm_ecosystem(&pkg.ecosystem) {
+                return None;
+            }
+            Some(f.id.to_ascii_uppercase())
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() {
+        progress("redhat.cve.fetch.skip", "no rpm-ecosystem CVE findings to enrich");
+        return;
+    }
+    ids.sort();
+    progress("redhat.cve.fetch.start", &format!("cves={}", ids.len()));
+
+    let timeout_secs: u64 = std::env::var("SCANNER_REDHAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let sleep_ms: u64 = std::env::var("SCANNER_REDHAT_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let client = build_http_client(timeout_secs);
+    let total = ids.len();
+    if let Some(c) = pg.as_mut() {
+        pg_init_schema(c);
+    }
+
+    let mut enriched_count = 0usize;
+    let mut fixed_count = 0usize;
+    let mut vulnerable_count = 0usize;
+
+    for (idx, cve_id) in ids.into_iter().enumerate() {
+        progress(
+            "redhat.cve.lookup",
+            &format!("{}/{} {}", idx + 1, total, cve_id),
+        );
+
+        let cache_tag = cache_key(&["redhat_cve", &cve_id]);
+        let mut json: Option<Value> = None;
+
+        if let Some(client_pg) = pg.as_mut() {
+            if let Some((payload, last_checked, last_mod)) = pg_get_redhat_cve(client_pg, &cve_id)
+            {
+                let ttl_dyn_days = compute_dynamic_ttl_days(last_mod, ttl_days);
+                if Utc::now() - last_checked < ChronoDuration::days(ttl_dyn_days) {
+                    json = Some(payload);
+                    progress("redhat.cve.cache.pg.hit", &cve_id);
+                }
+            }
+        }
+
+        if json.is_none() {
+            if let Some(bytes) = cache_get(
+                std::env::var_os("SCANNER_CACHE")
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .as_deref(),
+                &cache_tag,
+            ) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    json = Some(v);
+                    progress("redhat.cve.cache.hit", &cve_id);
+                }
+            }
+        }
+
+        if json.is_none() {
+            if sleep_ms > 0 {
+                sleep(Duration::from_millis(sleep_ms));
+            }
+            let url = format!(
+                "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
+                cve_id
+            );
+            match client.get(&url).send() {
+                Ok(r) if r.status().is_success() => match r.json::<Value>() {
+                    Ok(v) => {
+                        cache_put(
+                            std::env::var_os("SCANNER_CACHE")
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .as_deref(),
+                            &cache_tag,
+                            v.to_string().as_bytes(),
+                        );
+                        json = Some(v);
+                    }
+                    Err(e) => progress("redhat.cve.fetch.err", &format!("{} json {}", cve_id, e)),
+                },
+                Ok(r) => {
+                    progress(
+                        "redhat.cve.fetch.err",
+                        &format!("{} status={}", cve_id, r.status()),
+                    );
+                }
+                Err(e) => progress("redhat.cve.fetch.err", &format!("{} {}", cve_id, e)),
+            }
+        }
+
+        let Some(cve_json) = json else {
+            continue;
+        };
+        if let Some(client_pg) = pg.as_mut() {
+            let lm = parse_redhat_cve_last_modified(&cve_json);
+            pg_put_redhat_cve(client_pg, &cve_id, &cve_json, lm);
+        }
+        progress("redhat.cve.fetch.ok", &cve_id);
+
+        let severity = cve_json
+            .get("threat_severity")
+            .and_then(|s| s.as_str())
+            .and_then(normalize_redhat_severity);
+        let description = cve_json
+            .get("details")
+            .and_then(|d| d.as_array())
+            .and_then(|arr| arr.iter().find_map(|v| v.as_str()))
+            .map(|s| s.to_string());
+        let cvss = parse_redhat_cve_cvss(&cve_json);
+        let refs = redhat_cve_references(&cve_json);
+        let fixed_releases = parse_redhat_fixed_releases(&cve_json);
+
+        let mut applied = false;
+        for f in findings
+            .iter_mut()
+            .filter(|f| f.id.eq_ignore_ascii_case(&cve_id))
+        {
+            let pkg = match f.package.clone() {
+                Some(p) if is_rpm_ecosystem(&p.ecosystem) => p,
+                _ => continue,
+            };
+
+            if f.severity.is_none() {
+                f.severity = severity.clone();
+            }
+            if f.cvss.is_none() {
+                f.cvss = cvss.clone();
+            }
+            if f.description.is_none() {
+                f.description = description.clone();
+            }
+            append_unique_references(&mut f.references, refs.clone());
+            applied = true;
+
+            if let Some(best) = best_redhat_fixed_release(&pkg, &fixed_releases) {
+                if f.fixed_in.is_none() {
+                    f.fixed_in = Some(best.fixed_evr.clone());
+                }
+                if let Some(advisory) = best.advisory.as_ref() {
+                    if !f.source_ids.iter().any(|s| s.eq_ignore_ascii_case(advisory)) {
+                        f.source_ids.push(advisory.clone());
+                    }
+                    append_unique_references(
+                        &mut f.references,
+                        vec![ReferenceInfo {
+                            reference_type: "redhat".into(),
+                            url: format!("https://access.redhat.com/errata/{}", advisory),
+                        }],
+                    );
+                }
+                let ord = compare_evr(&pkg.version, &best.fixed_evr);
+                if ord == std::cmp::Ordering::Less {
+                    f.fixed = Some(false);
+                    vulnerable_count += 1;
+                    progress(
+                        "redhat.cve.vulnerable",
+                        &format!("{} pkg={} installed={} fixed_in={}", cve_id, pkg.name, pkg.version, best.fixed_evr),
+                    );
+                    f.recommendation = Some(format!(
+                        "Upgrade {} to {} or later{}.",
+                        pkg.name,
+                        best.fixed_evr,
+                        best.advisory
+                            .as_ref()
+                            .map(|a| format!(" ({})", a))
+                            .unwrap_or_default()
+                    ));
+                } else {
+                    f.fixed = Some(true);
+                    fixed_count += 1;
+                    progress(
+                        "redhat.cve.fixed",
+                        &format!("{} pkg={} installed={} fixed_in={}", cve_id, pkg.name, pkg.version, best.fixed_evr),
+                    );
+                    if f.recommendation.is_none() {
+                        f.recommendation = Some(format!(
+                            "Installed {} {} is at or above Red Hat fixed build {}.",
+                            pkg.name, pkg.version, best.fixed_evr
+                        ));
+                    }
+                }
+            }
+        }
+        if applied {
+            enriched_count += 1;
+        }
+    }
+    progress(
+        "redhat.cve.enrich.done",
+        &format!("cves_enriched={} vulnerable={} fixed={}", enriched_count, vulnerable_count, fixed_count),
+    );
+}
+
+fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+    if !env_bool("SCANNER_REDHAT_ENRICH", true) {
+        progress("redhat.fetch.skip", "disabled by SCANNER_REDHAT_ENRICH");
+        return;
+    }
+    if findings.is_empty() {
+        return;
+    }
+
+    for f in findings.iter_mut() {
+        let norm = normalize_redhat_errata_id(&f.id);
+        if norm != f.id && is_redhat_errata_id(&norm) {
+            f.id = norm;
+        }
+    }
+
+    let mut ids: Vec<String> = findings
+        .iter()
+        .map(|f| normalize_redhat_errata_id(&f.id))
+        .filter(|id| is_redhat_errata_id(id))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort();
+
+    let max_ids = std::env::var("SCANNER_REDHAT_ENRICH_MAX_IDS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0);
+    if let Some(max_ids) = max_ids {
+        if ids.len() > max_ids {
+            progress(
+                "redhat.fetch.limit",
+                &format!("processing {} of {} errata", max_ids, ids.len()),
+            );
+            ids.truncate(max_ids);
+        }
+    }
+
+    let timeout_secs: u64 = std::env::var("SCANNER_REDHAT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    let sleep_ms: u64 = std::env::var("SCANNER_REDHAT_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let client = build_http_client(timeout_secs);
+    let total = ids.len();
+    if let Some(c) = pg.as_mut() {
+        pg_init_schema(c);
+    }
+
+    for (idx, id) in ids.into_iter().enumerate() {
+        progress(
+            "redhat.fetch.start",
+            &format!("{}/{} {}", idx + 1, total, id),
+        );
+
+        let cache_tag = cache_key(&["redhat_csaf", &id]);
+        let mut json: Option<Value> = None;
+
+        if let Some(client_pg) = pg.as_mut() {
+            if let Some((payload, last_checked, last_mod)) = pg_get_redhat(client_pg, &id) {
+                let ttl_dyn_days = compute_dynamic_ttl_days(last_mod, ttl_days);
+                if Utc::now() - last_checked < ChronoDuration::days(ttl_dyn_days) {
+                    json = Some(payload);
+                    progress("redhat.cache.pg.hit", &id);
+                }
+            }
+        }
+
+        if json.is_none() {
+            if let Some(bytes) = cache_get(
+                std::env::var_os("SCANNER_CACHE")
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .as_deref(),
+                &cache_tag,
+            ) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    json = Some(v);
+                    progress("redhat.cache.hit", &id);
+                }
+            }
+        }
+
+        if json.is_none() {
+            if sleep_ms > 0 {
+                sleep(Duration::from_millis(sleep_ms));
+            }
+            let url = format!(
+                "https://access.redhat.com/hydra/rest/securitydata/csaf/{}.json?isCompressed=false",
+                id
+            );
+            match client.get(&url).send() {
+                Ok(r) if r.status().is_success() => match r.json::<Value>() {
+                    Ok(v) => {
+                        cache_put(
+                            std::env::var_os("SCANNER_CACHE")
+                                .as_deref()
+                                .map(PathBuf::from)
+                                .as_deref(),
+                            &cache_tag,
+                            v.to_string().as_bytes(),
+                        );
+                        json = Some(v);
+                    }
+                    Err(e) => {
+                        progress("redhat.fetch.err", &format!("{} json {}", id, e));
+                    }
+                },
+                Ok(r) => {
+                    progress("redhat.fetch.err", &format!("{} status={}", id, r.status()));
+                }
+                Err(e) => {
+                    progress("redhat.fetch.err", &format!("{} {}", id, e));
+                }
+            }
+        }
+
+        let Some(doc_json) = json else {
+            continue;
+        };
+        if let Some(client_pg) = pg.as_mut() {
+            let last_mod = parse_redhat_last_modified(&doc_json);
+            pg_put_redhat(client_pg, &id, &doc_json, last_mod);
+        }
+        progress("redhat.fetch.ok", &id);
+
+        let document = &doc_json["document"];
+        let description = redhat_note_text(document).or_else(|| {
+            document
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        });
+        let severity = document
+            .get("aggregate_severity")
+            .and_then(|s| s.get("text"))
+            .and_then(|s| s.as_str())
+            .and_then(normalize_redhat_severity);
+
+        let mut references: Vec<ReferenceInfo> = Vec::new();
+        if let Some(refs) = document.get("references").and_then(|r| r.as_array()) {
+            for r in refs {
+                if let Some(url) = r.get("url").and_then(|u| u.as_str()) {
+                    let normalized = normalize_reference_url(url);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    references.push(ReferenceInfo {
+                        reference_type: "redhat".into(),
+                        url: normalized,
+                    });
+                }
+            }
+        }
+        if references.is_empty() {
+            references.push(ReferenceInfo {
+                reference_type: "redhat".into(),
+                url: format!("https://access.redhat.com/errata/{}", id),
+            });
+        }
+
+        let mut best_cvss: Option<CvssInfo> = None;
+        if let Some(vulns) = doc_json.get("vulnerabilities").and_then(|v| v.as_array()) {
+            for v in vulns {
+                if let Some(cvss) = redhat_cvss_from_vuln(v) {
+                    let replace = best_cvss
+                        .as_ref()
+                        .map(|existing| cvss.base > existing.base)
+                        .unwrap_or(true);
+                    if replace {
+                        best_cvss = Some(cvss);
+                    }
+                }
+            }
+        }
+
+        for f in findings
+            .iter_mut()
+            .filter(|f| f.id.eq_ignore_ascii_case(&id))
+        {
+            if f.description.is_none() {
+                f.description = description.clone();
+            }
+            if f.severity.is_none() {
+                f.severity = severity.clone();
+            }
+            if f.cvss.is_none() {
+                f.cvss = best_cvss.clone();
+            }
+            if f.references.is_empty() && !references.is_empty() {
+                f.references = references.clone();
+            }
+            if f.confidence.is_none() {
+                f.confidence = Some("MEDIUM".into());
+            }
+        }
+    }
+}
+
+pub fn enrich_findings_with_nvd(
+    findings: &mut Vec<Finding>,
+    api_key: Option<&str>,
+    pg: &mut Option<PgClient>,
+) {
+    if !env_bool("SCANNER_NVD_ENRICH", true) {
+        progress("nvd.fetch.skip", "disabled by SCANNER_NVD_ENRICH");
+        return;
+    }
+    if findings.is_empty() {
+        return;
+    }
+    // Only fetch CVEs that still need enrichment, unless explicitly disabled.
+    let skip_fully_enriched = env_bool("SCANNER_NVD_SKIP_FULLY_ENRICHED", true);
+    let mut cve_needs_nvd: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for f in findings.iter().filter(|f| f.id.starts_with("CVE-")) {
+        let needs_nvd = !skip_fully_enriched
+            || f.cvss.is_none()
+            || f.severity.is_none()
+            || f.description.is_none()
+            || f.references.is_empty();
+        cve_needs_nvd
+            .entry(f.id.clone())
+            .and_modify(|v| *v = *v || needs_nvd)
+            .or_insert(needs_nvd);
+    }
+    let total_cves = cve_needs_nvd.len();
+    let mut unique_ids: Vec<String> = cve_needs_nvd
+        .into_iter()
+        .filter_map(|(id, needs_nvd)| if needs_nvd { Some(id) } else { None })
+        .collect();
     unique_ids.sort();
+    let skipped = total_cves.saturating_sub(unique_ids.len());
+    if skipped > 0 {
+        progress(
+            "nvd.fetch.skip.enriched",
+            &format!("{} already enriched", skipped),
+        );
+    }
+    if unique_ids.is_empty() {
+        return;
+    }
 
     // Determine polite sleep between requests
-    let default_ms = match api_key { Some(_) => 800u64, None => 6500u64 };
-    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
+    let default_ms = match api_key {
+        Some(_) => 800u64,
+        None => 6500u64,
+    };
+    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
     let jitter_max = (sleep_ms / 4).max(50);
-    let ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
-    let mut rng = thread_rng();
+    let ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
 
     // Fetch details per unique CVE with caching and rate limiting
     let mut id_to_json: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let total = unique_ids.len();
 
     // Optional Postgres cache
-    if let Some(client) = pg.as_mut() { pg_init_schema(client); }
+    if let Some(client) = pg.as_mut() {
+        pg_init_schema(client);
+    }
 
     // Determine which IDs to fetch from network after consulting PG cache
     let mut to_fetch: Vec<(usize, String)> = Vec::new();
@@ -591,7 +1822,8 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
         let mut served_from_cache = false;
         if let Some(client) = pg.as_mut() {
             if let Some((payload, last_checked_at, nvd_last_modified)) = pg_get_cve(client, &id) {
-                let ttl_dyn_days = compute_dynamic_ttl_days(nvd_last_modified, ttl_days as i64) as i64;
+                let ttl_dyn_days =
+                    compute_dynamic_ttl_days(nvd_last_modified, ttl_days as i64) as i64;
                 if Utc::now() - last_checked_at < ChronoDuration::days(ttl_dyn_days) {
                     id_to_json.insert(id.clone(), payload);
                     progress("nvd.cache.pg.hit", &id);
@@ -599,32 +1831,53 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
                 }
             }
         }
-        if !served_from_cache { to_fetch.push((idx, id)); }
+        if !served_from_cache {
+            to_fetch.push((idx, id));
+        }
     }
 
     // Concurrency with politeness via a small threadpool
-    let max_concurrent: usize = std::env::var("SCANNER_NVD_CONC").ok().and_then(|v| v.parse().ok()).unwrap_or(if api_key.is_some() { 5 } else { 1 });
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(max_concurrent).build().ok();
+    let max_concurrent: usize = std::env::var("SCANNER_NVD_CONC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if api_key.is_some() { 5 } else { 1 });
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_concurrent)
+        .build()
+        .ok();
     if let Some(pool) = pool {
         let fetched: Vec<(String, Value, Option<DateTime<Utc>>)> = pool.install(|| {
-            to_fetch.par_iter().filter_map(|(idx, id)| {
-                progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
-                // jittered sleep per task
-                let jitter = rand::thread_rng().gen_range(0..=jitter_max);
-                if sleep_ms + jitter > 0 { sleep(Duration::from_millis(sleep_ms + jitter)); }
-                let url = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}", id);
-                match nvd_get_json(&url, api_key, &format!("cveId:{}", id), 0) {
-                    Some(json) => {
-                        let lm = parse_nvd_last_modified(&json);
-                        Some((id.clone(), json, lm))
+            to_fetch
+                .par_iter()
+                .filter_map(|(idx, id)| {
+                    progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
+                    // jittered sleep per task
+                    let jitter = rand::thread_rng().gen_range(0..=jitter_max);
+                    if sleep_ms + jitter > 0 {
+                        sleep(Duration::from_millis(sleep_ms + jitter));
                     }
-                    None => { progress("nvd.fetch.err", id); None }
-                }
-            }).collect()
+                    let url = format!(
+                        "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
+                        id
+                    );
+                    match nvd_get_json(&url, api_key, &format!("cveId:{}", id), 0) {
+                        Some(json) => {
+                            let lm = parse_nvd_last_modified(&json);
+                            Some((id.clone(), json, lm))
+                        }
+                        None => {
+                            progress("nvd.fetch.err", id);
+                            None
+                        }
+                    }
+                })
+                .collect()
         });
         // Merge results, update PG and memory map sequentially
         if let Some(client) = pg.as_mut() {
-            for (id, json, lm) in &fetched { pg_put_cve(client, id, json, *lm); }
+            for (id, json, lm) in &fetched {
+                pg_put_cve(client, id, json, *lm);
+            }
         }
         for (id, json, _lm) in fetched.into_iter() {
             id_to_json.insert(id.clone(), json);
@@ -635,16 +1888,25 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
         for (idx, id) in to_fetch.into_iter() {
             progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
             let jitter = rand::thread_rng().gen_range(0..=jitter_max);
-            if sleep_ms + jitter > 0 { sleep(Duration::from_millis(sleep_ms + jitter)); }
-            let url = format!("https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}", id);
+            if sleep_ms + jitter > 0 {
+                sleep(Duration::from_millis(sleep_ms + jitter));
+            }
+            let url = format!(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
+                id
+            );
             match nvd_get_json(&url, api_key, &format!("cveId:{}", id), 0) {
                 Some(json) => {
                     let lm = parse_nvd_last_modified(&json);
-                    if let Some(client) = pg.as_mut() { pg_put_cve(client, &id, &json, lm); }
+                    if let Some(client) = pg.as_mut() {
+                        pg_put_cve(client, &id, &json, lm);
+                    }
                     id_to_json.insert(id.clone(), json);
                     progress("nvd.fetch.ok", &id);
                 }
-                None => { progress("nvd.fetch.err", &id); }
+                None => {
+                    progress("nvd.fetch.err", &id);
+                }
             }
         }
     }
@@ -663,30 +1925,58 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
             if let Some(items) = wrapper["vulnerabilities"].as_array() {
                 if let Some(item) = items.first() {
                     let cve = &item["cve"];
-                    if let Some(cvss3) = cve["metrics"]["cvssMetricV31"].as_array().and_then(|a| a.first())
-                        .or_else(|| cve["metrics"]["cvssMetricV30"].as_array().and_then(|a| a.first())) {
+                    if let Some(cvss3) = cve["metrics"]["cvssMetricV31"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .or_else(|| {
+                            cve["metrics"]["cvssMetricV30"]
+                                .as_array()
+                                .and_then(|a| a.first())
+                        })
+                    {
                         // vector/score
                         if f.cvss.is_none() {
-                            if let (Some(base), Some(vector)) = (cvss3["cvssData"]["baseScore"].as_f64(), cvss3["cvssData"]["vectorString"].as_str()) {
+                            if let (Some(base), Some(vector)) = (
+                                cvss3["cvssData"]["baseScore"].as_f64(),
+                                cvss3["cvssData"]["vectorString"].as_str(),
+                            ) {
                                 let base_f = base as f32;
-                                f.cvss = Some(CvssInfo { base: base_f, vector: vector.to_string() });
-                                if f.severity.is_none() { f.severity = Some(severity_from_score(base_f).to_string()); }
+                                f.cvss = Some(CvssInfo {
+                                    base: base_f,
+                                    vector: vector.to_string(),
+                                });
+                                if f.severity.is_none() {
+                                    f.severity = Some(severity_from_score(base_f).to_string());
+                                }
                             }
                         }
                         // explicit severity if provided
                         if f.severity.is_none() {
-                            if let Some(sev) = cvss3["cvssData"]["baseSeverity"].as_str()
-                                .or_else(|| cvss3["baseSeverity"].as_str()) {
+                            if let Some(sev) = cvss3["cvssData"]["baseSeverity"]
+                                .as_str()
+                                .or_else(|| cvss3["baseSeverity"].as_str())
+                            {
                                 f.severity = Some(sev.to_uppercase());
                             }
                         }
-                    } else if let Some(cvss2) = cve["metrics"]["cvssMetricV2"].as_array().and_then(|a| a.first()) {
+                    } else if let Some(cvss2) = cve["metrics"]["cvssMetricV2"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                    {
                         if f.cvss.is_none() {
                             if let Some(base) = cvss2["cvssData"]["baseScore"].as_f64() {
                                 let base_f = base as f32;
-                                let vector = cvss2["cvssData"]["vectorString"].as_str().unwrap_or("").to_string();
-                                f.cvss = Some(CvssInfo { base: base_f, vector });
-                                if f.severity.is_none() { f.severity = Some(severity_from_score(base_f).to_string()); }
+                                let vector = cvss2["cvssData"]["vectorString"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                f.cvss = Some(CvssInfo {
+                                    base: base_f,
+                                    vector,
+                                });
+                                if f.severity.is_none() {
+                                    f.severity = Some(severity_from_score(base_f).to_string());
+                                }
                             }
                         }
                         if f.severity.is_none() {
@@ -696,7 +1986,8 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
                         }
                     }
                     if f.description.is_none() {
-                        let desc = cve["descriptions"].as_array()
+                        let desc = cve["descriptions"]
+                            .as_array()
                             .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
                             .and_then(|d| d["value"].as_str())
                             .map(|s| s.to_string());
@@ -705,7 +1996,10 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
                     if let Some(refs) = cve["references"]["referenceData"].as_array() {
                         for r in refs {
                             if let Some(url) = r["url"].as_str() {
-                                f.references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.into() });
+                                f.references.push(ReferenceInfo {
+                                    reference_type: "nvd".into(),
+                                    url: url.into(),
+                                });
                             }
                         }
                     }
@@ -716,34 +2010,67 @@ pub fn enrich_findings_with_nvd(findings: &mut Vec<Finding>, api_key: Option<&st
 }
 
 /// Query NVD by keyword (component + version) and map to findings. Useful fallback when OSV has no package context.
-pub fn nvd_keyword_findings(component: &str, version: &str, api_key: Option<&str>, evidence_path: Option<&str>) -> Vec<Finding> {
+pub fn nvd_keyword_findings(
+    component: &str,
+    version: &str,
+    api_key: Option<&str>,
+    evidence_path: Option<&str>,
+) -> Vec<Finding> {
     let keyword = format!("{} {}", component, version);
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=50",
         urlencoding::encode(&keyword)
     );
-    let default_ms = match api_key { Some(_) => 800u64, None => 6500u64 };
-    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
-    let json = match nvd_get_json(&url, api_key, &format!("kw:{}", keyword), sleep_ms) { Some(j) => j, None => return Vec::new() };
+    let default_ms = match api_key {
+        Some(_) => 800u64,
+        None => 6500u64,
+    };
+    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
+    let json = match nvd_get_json(&url, api_key, &format!("kw:{}", keyword), sleep_ms) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
 
     let mut out = Vec::new();
     if let Some(items) = json["vulnerabilities"].as_array() {
         for item in items {
             let cve = &item["cve"];
             let id = cve["id"].as_str().unwrap_or("unknown").to_string();
-            let description = cve["descriptions"].as_array()
+            let description = cve["descriptions"]
+                .as_array()
                 .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
-                .and_then(|d| d["value"].as_str()).map(|s| s.to_string());
+                .and_then(|d| d["value"].as_str())
+                .map(|s| s.to_string());
 
             // Prefer CVSS v3.1, then v3.0, then v2
             let mut cvss: Option<CvssInfo> = None;
             let mut severity: Option<String> = None;
-            if let Some(m) = cve["metrics"]["cvssMetricV31"].as_array().and_then(|a| a.first())
-                .or_else(|| cve["metrics"]["cvssMetricV30"].as_array().and_then(|a| a.first()))
-                .or_else(|| cve["metrics"]["cvssMetricV2"].as_array().and_then(|a| a.first())) {
+            if let Some(m) = cve["metrics"]["cvssMetricV31"]
+                .as_array()
+                .and_then(|a| a.first())
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV30"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV2"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+            {
                 let base = m["cvssData"]["baseScore"].as_f64().unwrap_or(0.0) as f32;
-                let vector = m["cvssData"]["vectorString"].as_str().unwrap_or("").to_string();
-                cvss = Some(CvssInfo { base, vector: vector.clone() });
+                let vector = m["cvssData"]["vectorString"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                cvss = Some(CvssInfo {
+                    base,
+                    vector: vector.clone(),
+                });
                 severity = Some(severity_from_score(base).to_string());
             }
 
@@ -757,7 +2084,10 @@ pub fn nvd_keyword_findings(component: &str, version: &str, api_key: Option<&str
             if let Some(refs) = cve["references"]["referenceData"].as_array() {
                 for r in refs {
                     if let Some(url) = r["url"].as_str() {
-                        references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.to_string() });
+                        references.push(ReferenceInfo {
+                            reference_type: "nvd".into(),
+                            url: url.to_string(),
+                        });
                     }
                 }
             }
@@ -765,8 +2095,14 @@ pub fn nvd_keyword_findings(component: &str, version: &str, api_key: Option<&str
             out.push(Finding {
                 id,
                 source_ids: vec![format!("heuristic:keyword:{} {}", component, version)],
-                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                package: Some(PackageInfo {
+                    name: component.to_string(),
+                    ecosystem: "nvd".into(),
+                    version: version.to_string(),
+                }),
                 fixed: None,
+                fixed_in: None,
+                recommendation: None,
                 severity,
                 cvss,
                 description,
@@ -780,7 +2116,12 @@ pub fn nvd_keyword_findings(component: &str, version: &str, api_key: Option<&str
 }
 
 /// Query NVD by CPE name constructed from component/version (best-effort)
-pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, evidence_path: Option<&str>) -> Vec<Finding> {
+pub fn nvd_cpe_findings(
+    component: &str,
+    version: &str,
+    api_key: Option<&str>,
+    evidence_path: Option<&str>,
+) -> Vec<Finding> {
     let vendor = component.to_lowercase();
     let product = component.to_lowercase();
     let cpe = format!("cpe:2.3:a:{}:{}:{}:*:*:*:*:*:*:*", vendor, product, version);
@@ -788,27 +2129,55 @@ pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, e
         "https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName={}",
         urlencoding::encode(&cpe)
     );
-    let default_ms = match api_key { Some(_) => 800u64, None => 6500u64 };
-    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
-    let json = match nvd_get_json(&url, api_key, &format!("cpe:{}", cpe), sleep_ms) { Some(j) => j, None => return Vec::new() };
+    let default_ms = match api_key {
+        Some(_) => 800u64,
+        None => 6500u64,
+    };
+    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
+    let json = match nvd_get_json(&url, api_key, &format!("cpe:{}", cpe), sleep_ms) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
 
     let mut out = Vec::new();
     if let Some(items) = json["vulnerabilities"].as_array() {
         for item in items {
             let cve = &item["cve"];
             let id = cve["id"].as_str().unwrap_or("unknown").to_string();
-            let description = cve["descriptions"].as_array()
+            let description = cve["descriptions"]
+                .as_array()
                 .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
-                .and_then(|d| d["value"].as_str()).map(|s| s.to_string());
+                .and_then(|d| d["value"].as_str())
+                .map(|s| s.to_string());
 
             let mut cvss: Option<CvssInfo> = None;
             let mut severity: Option<String> = None;
-            if let Some(m) = cve["metrics"]["cvssMetricV31"].as_array().and_then(|a| a.first())
-                .or_else(|| cve["metrics"]["cvssMetricV30"].as_array().and_then(|a| a.first()))
-                .or_else(|| cve["metrics"]["cvssMetricV2"].as_array().and_then(|a| a.first())) {
+            if let Some(m) = cve["metrics"]["cvssMetricV31"]
+                .as_array()
+                .and_then(|a| a.first())
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV30"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV2"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+            {
                 let base = m["cvssData"]["baseScore"].as_f64().unwrap_or(0.0) as f32;
-                let vector = m["cvssData"]["vectorString"].as_str().unwrap_or("").to_string();
-                cvss = Some(CvssInfo { base, vector: vector.clone() });
+                let vector = m["cvssData"]["vectorString"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                cvss = Some(CvssInfo {
+                    base,
+                    vector: vector.clone(),
+                });
                 severity = Some(severity_from_score(base).to_string());
             }
 
@@ -822,7 +2191,10 @@ pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, e
             if let Some(refs) = cve["references"]["referenceData"].as_array() {
                 for r in refs {
                     if let Some(url) = r["url"].as_str() {
-                        references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.to_string() });
+                        references.push(ReferenceInfo {
+                            reference_type: "nvd".into(),
+                            url: url.to_string(),
+                        });
                     }
                 }
             }
@@ -830,8 +2202,14 @@ pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, e
             out.push(Finding {
                 id,
                 source_ids: vec![format!("heuristic:cpe:{} {}", component, version)],
-                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                package: Some(PackageInfo {
+                    name: component.to_string(),
+                    ecosystem: "nvd".into(),
+                    version: version.to_string(),
+                }),
                 fixed: None,
+                fixed_in: None,
+                recommendation: None,
                 severity,
                 cvss,
                 description,
@@ -845,32 +2223,64 @@ pub fn nvd_cpe_findings(component: &str, version: &str, api_key: Option<&str>, e
 }
 
 /// NVD keyword search by name only (low confidence). Useful when version unknown or not indexed.
-pub fn nvd_keyword_findings_name(component: &str, api_key: Option<&str>, evidence_path: Option<&str>) -> Vec<Finding> {
+pub fn nvd_keyword_findings_name(
+    component: &str,
+    api_key: Option<&str>,
+    evidence_path: Option<&str>,
+) -> Vec<Finding> {
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=50",
         urlencoding::encode(component)
     );
-    let default_ms = match api_key { Some(_) => 800u64, None => 6500u64 };
-    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
-    let json = match nvd_get_json(&url, api_key, &format!("kw_only:{}", component), sleep_ms) { Some(j) => j, None => return Vec::new() };
+    let default_ms = match api_key {
+        Some(_) => 800u64,
+        None => 6500u64,
+    };
+    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
+    let json = match nvd_get_json(&url, api_key, &format!("kw_only:{}", component), sleep_ms) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
 
     let mut out = Vec::new();
     if let Some(items) = json["vulnerabilities"].as_array() {
         for item in items {
             let cve = &item["cve"];
             let id = cve["id"].as_str().unwrap_or("unknown").to_string();
-            let description = cve["descriptions"].as_array()
+            let description = cve["descriptions"]
+                .as_array()
                 .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
-                .and_then(|d| d["value"].as_str()).map(|s| s.to_string());
+                .and_then(|d| d["value"].as_str())
+                .map(|s| s.to_string());
 
             let mut cvss: Option<CvssInfo> = None;
             let mut severity: Option<String> = None;
-            if let Some(m) = cve["metrics"]["cvssMetricV31"].as_array().and_then(|a| a.first())
-                .or_else(|| cve["metrics"]["cvssMetricV30"].as_array().and_then(|a| a.first()))
-                .or_else(|| cve["metrics"]["cvssMetricV2"].as_array().and_then(|a| a.first())) {
+            if let Some(m) = cve["metrics"]["cvssMetricV31"]
+                .as_array()
+                .and_then(|a| a.first())
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV30"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+                .or_else(|| {
+                    cve["metrics"]["cvssMetricV2"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                })
+            {
                 let base = m["cvssData"]["baseScore"].as_f64().unwrap_or(0.0) as f32;
-                let vector = m["cvssData"]["vectorString"].as_str().unwrap_or("").to_string();
-                cvss = Some(CvssInfo { base, vector: vector.clone() });
+                let vector = m["cvssData"]["vectorString"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                cvss = Some(CvssInfo {
+                    base,
+                    vector: vector.clone(),
+                });
                 severity = Some(severity_from_score(base).to_string());
             }
 
@@ -884,7 +2294,10 @@ pub fn nvd_keyword_findings_name(component: &str, api_key: Option<&str>, evidenc
             if let Some(refs) = cve["references"]["referenceData"].as_array() {
                 for r in refs {
                     if let Some(url) = r["url"].as_str() {
-                        references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.to_string() });
+                        references.push(ReferenceInfo {
+                            reference_type: "nvd".into(),
+                            url: url.to_string(),
+                        });
                     }
                 }
             }
@@ -892,8 +2305,14 @@ pub fn nvd_keyword_findings_name(component: &str, api_key: Option<&str>, evidenc
             out.push(Finding {
                 id,
                 source_ids: vec![format!("heuristic:keyword:{}", component)],
-                package: Some(PackageInfo { name: component.to_string(), ecosystem: "nvd".into(), version: "unknown".into() }),
+                package: Some(PackageInfo {
+                    name: component.to_string(),
+                    ecosystem: "nvd".into(),
+                    version: "unknown".into(),
+                }),
                 fixed: None,
+                fixed_in: None,
+                recommendation: None,
                 severity,
                 cvss,
                 description,
@@ -921,95 +2340,214 @@ fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
     for i in 0..len {
         let va = *ta.get(i).unwrap_or(&0);
         let vb = *tb.get(i).unwrap_or(&0);
-        if va < vb { return Ordering::Less; }
-        if va > vb { return Ordering::Greater; }
+        if va < vb {
+            return Ordering::Less;
+        }
+        if va > vb {
+            return Ordering::Greater;
+        }
     }
     Ordering::Equal
 }
 
-fn is_version_in_range(target: &str, start_inc: Option<&str>, start_exc: Option<&str>, end_inc: Option<&str>, end_exc: Option<&str>) -> bool {
-    if let Some(s) = start_inc { if cmp_versions(target, s) == std::cmp::Ordering::Less { return false; } }
-    if let Some(s) = start_exc { if cmp_versions(target, s) != std::cmp::Ordering::Greater { return false; } }
-    if let Some(e) = end_inc { if cmp_versions(target, e) == std::cmp::Ordering::Greater { return false; } }
-    if let Some(e) = end_exc { if cmp_versions(target, e) != std::cmp::Ordering::Less { return false; } }
+fn is_version_in_range(
+    target: &str,
+    start_inc: Option<&str>,
+    start_exc: Option<&str>,
+    end_inc: Option<&str>,
+    end_exc: Option<&str>,
+) -> bool {
+    if let Some(s) = start_inc {
+        if cmp_versions(target, s) == std::cmp::Ordering::Less {
+            return false;
+        }
+    }
+    if let Some(s) = start_exc {
+        if cmp_versions(target, s) != std::cmp::Ordering::Greater {
+            return false;
+        }
+    }
+    if let Some(e) = end_inc {
+        if cmp_versions(target, e) == std::cmp::Ordering::Greater {
+            return false;
+        }
+    }
+    if let Some(e) = end_exc {
+        if cmp_versions(target, e) != std::cmp::Ordering::Less {
+            return false;
+        }
+    }
     true
 }
 
-fn cpe_parts(criteria: &str) -> Option<(String,String,Option<String>)> {
+fn cpe_parts(criteria: &str) -> Option<(String, String, Option<String>)> {
     // cpe:2.3:a:vendor:product:version:...
     let parts: Vec<&str> = criteria.split(':').collect();
-    if parts.len() >= 5 { Some((parts[3].to_string(), parts[4].to_string(), Some(parts[5].to_string()))) } else { None }
+    if parts.len() >= 5 {
+        Some((
+            parts[3].to_string(),
+            parts[4].to_string(),
+            Some(parts[5].to_string()),
+        ))
+    } else {
+        None
+    }
 }
 
 /// Broader NVD search for vendor/product and filter by version ranges in CPEs
-pub fn nvd_findings_by_product_version(vendor: &str, product: &str, version: &str, api_key: Option<&str>, evidence_path: Option<&str>) -> Vec<Finding> {
+pub fn nvd_findings_by_product_version(
+    vendor: &str,
+    product: &str,
+    version: &str,
+    api_key: Option<&str>,
+    evidence_path: Option<&str>,
+) -> Vec<Finding> {
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=2000",
         urlencoding::encode(product)
     );
-    let default_ms = match api_key { Some(_) => 800u64, None => 6500u64 };
-    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_ms);
-    let json = match nvd_get_json(&url, api_key, &format!("prod:{}", product), sleep_ms) { Some(j) => j, None => return Vec::new() };
+    let default_ms = match api_key {
+        Some(_) => 800u64,
+        None => 6500u64,
+    };
+    let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_ms);
+    let json = match nvd_get_json(&url, api_key, &format!("prod:{}", product), sleep_ms) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
 
     let mut out = Vec::new();
     if let Some(items) = json["vulnerabilities"].as_array() {
         'outer: for item in items {
             let cve = &item["cve"];
             let mut matches_product = false;
-            if let Some(nodes) = cve["configurations"].get("nodes").and_then(|n| n.as_array()) {
+            if let Some(nodes) = cve["configurations"]
+                .get("nodes")
+                .and_then(|n| n.as_array())
+            {
                 for node in nodes {
                     if let Some(cpes) = node.get("cpeMatch").and_then(|m| m.as_array()) {
                         for c in cpes {
                             let criteria = c.get("criteria").and_then(|s| s.as_str()).unwrap_or("");
                             if let Some((ven, prod, ver_opt)) = cpe_parts(criteria) {
-                                if ven.eq_ignore_ascii_case(vendor) && prod.eq_ignore_ascii_case(product) {
+                                if ven.eq_ignore_ascii_case(vendor)
+                                    && prod.eq_ignore_ascii_case(product)
+                                {
                                     matches_product = true;
-                                    let vulnerable = c.get("vulnerable").and_then(|b| b.as_bool()).unwrap_or(false);
-                                    if !vulnerable { continue; }
-                                    let start_inc = c.get("versionStartIncluding").and_then(|s| s.as_str());
-                                    let start_exc = c.get("versionStartExcluding").and_then(|s| s.as_str());
-                                    let end_inc = c.get("versionEndIncluding").and_then(|s| s.as_str());
-                                    let end_exc = c.get("versionEndExcluding").and_then(|s| s.as_str());
+                                    let vulnerable = c
+                                        .get("vulnerable")
+                                        .and_then(|b| b.as_bool())
+                                        .unwrap_or(false);
+                                    if !vulnerable {
+                                        continue;
+                                    }
+                                    let start_inc =
+                                        c.get("versionStartIncluding").and_then(|s| s.as_str());
+                                    let start_exc =
+                                        c.get("versionStartExcluding").and_then(|s| s.as_str());
+                                    let end_inc =
+                                        c.get("versionEndIncluding").and_then(|s| s.as_str());
+                                    let end_exc =
+                                        c.get("versionEndExcluding").and_then(|s| s.as_str());
                                     // If criteria has exact version and no ranges, compare directly
-                                    if start_inc.is_none() && start_exc.is_none() && end_inc.is_none() && end_exc.is_none() {
+                                    if start_inc.is_none()
+                                        && start_exc.is_none()
+                                        && end_inc.is_none()
+                                        && end_exc.is_none()
+                                    {
                                         if let Some(ver) = ver_opt.as_deref() {
-                                            if ver != "*" && cmp_versions(version, ver) != std::cmp::Ordering::Equal { continue; }
+                                            if ver != "*"
+                                                && cmp_versions(version, ver)
+                                                    != std::cmp::Ordering::Equal
+                                            {
+                                                continue;
+                                            }
                                         }
                                     } else {
-                                        if !is_version_in_range(version, start_inc, start_exc, end_inc, end_exc) { continue; }
+                                        if !is_version_in_range(
+                                            version, start_inc, start_exc, end_inc, end_exc,
+                                        ) {
+                                            continue;
+                                        }
                                     }
 
                                     // Build finding
                                     let id = cve["id"].as_str().unwrap_or("unknown").to_string();
-                                    let description = cve["descriptions"].as_array()
+                                    let description = cve["descriptions"]
+                                        .as_array()
                                         .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
-                                        .and_then(|d| d["value"].as_str()).map(|s| s.to_string());
+                                        .and_then(|d| d["value"].as_str())
+                                        .map(|s| s.to_string());
                                     let mut cvss: Option<CvssInfo> = None;
                                     let mut severity: Option<String> = None;
-                                    if let Some(m) = cve["metrics"]["cvssMetricV31"].as_array().and_then(|a| a.first())
-                                        .or_else(|| cve["metrics"]["cvssMetricV30"].as_array().and_then(|a| a.first()))
-                                        .or_else(|| cve["metrics"]["cvssMetricV2"].as_array().and_then(|a| a.first())) {
-                                        let base = m["cvssData"]["baseScore"].as_f64().unwrap_or(0.0) as f32;
-                                        let vector = m["cvssData"]["vectorString"].as_str().unwrap_or("").to_string();
-                                        cvss = Some(CvssInfo { base, vector: vector.clone() });
+                                    if let Some(m) = cve["metrics"]["cvssMetricV31"]
+                                        .as_array()
+                                        .and_then(|a| a.first())
+                                        .or_else(|| {
+                                            cve["metrics"]["cvssMetricV30"]
+                                                .as_array()
+                                                .and_then(|a| a.first())
+                                        })
+                                        .or_else(|| {
+                                            cve["metrics"]["cvssMetricV2"]
+                                                .as_array()
+                                                .and_then(|a| a.first())
+                                        })
+                                    {
+                                        let base =
+                                            m["cvssData"]["baseScore"].as_f64().unwrap_or(0.0)
+                                                as f32;
+                                        let vector = m["cvssData"]["vectorString"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        cvss = Some(CvssInfo {
+                                            base,
+                                            vector: vector.clone(),
+                                        });
                                         severity = Some(severity_from_score(base).to_string());
                                     }
-                                    let evidence = vec![EvidenceItem { evidence_type: "cpe".into(), path: evidence_path.map(|s| s.to_string()), detail: Some(criteria.to_string()) }];
+                                    let evidence = vec![EvidenceItem {
+                                        evidence_type: "cpe".into(),
+                                        path: evidence_path.map(|s| s.to_string()),
+                                        detail: Some(criteria.to_string()),
+                                    }];
                                     let mut references: Vec<ReferenceInfo> = Vec::new();
-                                    if let Some(refs) = cve["references"]["referenceData"].as_array() {
-                                        for r in refs { if let Some(url) = r["url"].as_str() { references.push(ReferenceInfo { reference_type: "nvd".into(), url: url.to_string() }); } }
+                                    if let Some(refs) =
+                                        cve["references"]["referenceData"].as_array()
+                                    {
+                                        for r in refs {
+                                            if let Some(url) = r["url"].as_str() {
+                                                references.push(ReferenceInfo {
+                                                    reference_type: "nvd".into(),
+                                                    url: url.to_string(),
+                                                });
+                                            }
+                                        }
                                     }
                                     out.push(Finding {
                                         id,
-                                        source_ids: vec![format!("heuristic:product:{} {} {}", vendor, product, version)],
-                                        package: Some(PackageInfo { name: product.to_string(), ecosystem: "nvd".into(), version: version.to_string() }),
+                                        source_ids: vec![format!(
+                                            "heuristic:product:{} {} {}",
+                                            vendor, product, version
+                                        )],
+                                        package: Some(PackageInfo {
+                                            name: product.to_string(),
+                                            ecosystem: "nvd".into(),
+                                            version: version.to_string(),
+                                        }),
                                         fixed: None,
+                                        fixed_in: None,
+                                        recommendation: None,
                                         severity,
                                         cvss,
                                         description,
                                         evidence,
                                         references,
-                                        confidence: Some("MEDIUM".into())
+                                        confidence: Some("MEDIUM".into()),
                                     });
                                     continue 'outer;
                                 }
@@ -1027,41 +2565,81 @@ pub fn nvd_findings_by_product_version(vendor: &str, product: &str, version: &st
 fn nvd_get_json(url: &str, api_key: Option<&str>, cache_tag: &str, sleep_ms: u64) -> Option<Value> {
     // Cache by URL
     let key = cache_key(&["nvd", cache_tag, url]);
-    if let Some(bytes) = cache_get(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &key) {
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) { return Some(v); }
+    if let Some(bytes) = cache_get(
+        std::env::var_os("SCANNER_CACHE")
+            .as_deref()
+            .map(PathBuf::from)
+            .as_deref(),
+        &key,
+    ) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            return Some(v);
+        }
     }
     // Rate limiting sleep
-    if sleep_ms > 0 { sleep(Duration::from_millis(sleep_ms)); }
+    if sleep_ms > 0 {
+        sleep(Duration::from_millis(sleep_ms));
+    }
     let client = Client::builder()
         .timeout(Duration::from_secs(20))
         .user_agent("scanner/0.1 (+https://github.com/devintripp/rust_scanner)")
         .build();
     let client = match client {
         Ok(c) => c,
-        Err(e) => { progress("nvd.http.err", &format!("client_build: {}", e)); return None; }
+        Err(e) => {
+            progress("nvd.http.err", &format!("client_build: {}", e));
+            return None;
+        }
     };
     let mut req = client.get(url).header("Accept", "application/json");
     if let Some(k) = api_key {
         req = req.header("apiKey", k).header("X-Api-Key", k);
     }
     let resp = match req.send() {
-       Ok(r) => r,
-       Err(e) => { progress("nvd.http.err", &format!("send: {}", e)); return None; }
+        Ok(r) => r,
+        Err(e) => {
+            progress("nvd.http.err", &format!("send: {}", e));
+            return None;
+        }
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        let rem = resp.headers().get("X-RateLimit-Remaining").and_then(|v| v.to_str().ok()).unwrap_or("");
-        let lim = resp.headers().get("X-RateLimit-Limit").and_then(|v| v.to_str().ok()).unwrap_or("");
-        progress("nvd.http.err", &format!("status={} remaining={} limit={} url={}", status, rem, lim, url));
+        let rem = resp
+            .headers()
+            .get("X-RateLimit-Remaining")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let lim = resp
+            .headers()
+            .get("X-RateLimit-Limit")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        progress(
+            "nvd.http.err",
+            &format!(
+                "status={} remaining={} limit={} url={}",
+                status, rem, lim, url
+            ),
+        );
         return None;
     }
     // Adjust pacing based on headers if provided
     adjust_rate_limits(&resp);
     let v: Value = match resp.json() {
         Ok(j) => j,
-        Err(e) => { progress("nvd.json.err", &format!("{}", e)); return None; }
+        Err(e) => {
+            progress("nvd.json.err", &format!("{}", e));
+            return None;
+        }
     };
-    cache_put(std::env::var_os("SCANNER_CACHE").as_deref().map(PathBuf::from).as_deref(), &key, v.to_string().as_bytes());
+    cache_put(
+        std::env::var_os("SCANNER_CACHE")
+            .as_deref()
+            .map(PathBuf::from)
+            .as_deref(),
+        &key,
+        v.to_string().as_bytes(),
+    );
     Some(v)
 }
 
@@ -1097,15 +2675,21 @@ pub fn pg_connect() -> Option<PgClient> {
             progress("nvd.cache.pg.connect.ok", "");
             Some(client)
         }
-        Err(e) => { progress("nvd.cache.pg.connect.err", &format!("{}", e)); None }
+        Err(e) => {
+            progress("nvd.cache.pg.connect.err", &format!("{}", e));
+            None
+        }
     }
 }
 
 pub fn pg_init_schema(client: &mut PgClient) {
     let res = client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );"
+        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );"
     );
-    match res { Ok(_) => progress("nvd.cache.pg.init.ok", ""), Err(e) => progress("nvd.cache.pg.init.err", &format!("{}", e)) }
+    match res {
+        Ok(_) => progress("nvd.cache.pg.init.ok", ""),
+        Err(e) => progress("nvd.cache.pg.init.err", &format!("{}", e)),
+    }
 }
 
 fn extract_schema_from_url(url: &str) -> Option<String> {
@@ -1114,7 +2698,9 @@ fn extract_schema_from_url(url: &str) -> Option<String> {
         let mut it = pair.splitn(2, '=');
         let k = it.next()?;
         let v = it.next().unwrap_or("");
-        if k == "schema" && !v.is_empty() { return Some(v.to_string()); }
+        if k == "schema" && !v.is_empty() {
+            return Some(v.to_string());
+        }
     }
     None
 }
@@ -1126,34 +2712,46 @@ fn strip_param_from_url(url: &str, key: &str) -> (String, Option<String>) {
         let mut kept: Vec<String> = Vec::new();
         let mut found: Option<String> = None;
         for pair in query.split('&') {
-            if pair.is_empty() { continue; }
+            if pair.is_empty() {
+                continue;
+            }
             let mut it = pair.splitn(2, '=');
             let k = it.next().unwrap_or("");
             let v = it.next().unwrap_or("");
             if k == key {
-                if !v.is_empty() { found = Some(v.to_string()); }
+                if !v.is_empty() {
+                    found = Some(v.to_string());
+                }
                 continue;
             }
             kept.push(format!("{}={}", k, v));
         }
-        if kept.is_empty() { (base.to_string(), found) }
-        else { (format!("{}?{}", base, kept.join("&")), found) }
+        if kept.is_empty() {
+            (base.to_string(), found)
+        } else {
+            (format!("{}?{}", base, kept.join("&")), found)
+        }
     } else {
         (url.to_string(), None)
     }
 }
 
 fn parse_nvd_last_modified(json: &Value) -> Option<DateTime<Utc>> {
-    let s = json["vulnerabilities"].as_array()
+    let s = json["vulnerabilities"]
+        .as_array()
         .and_then(|a| a.first())
         .and_then(|it| it["cve"]["lastModified"].as_str())?;
     // Try RFC3339 first
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) { return Some(dt.with_timezone(&Utc)); }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
     // If missing timezone, try appending Z
     if !s.ends_with('Z') {
         let mut t = String::from(s);
         t.push('Z');
-        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) { return Some(dt.with_timezone(&Utc)); }
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) {
+            return Some(dt.with_timezone(&Utc));
+        }
     }
     // Try naive formats
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
@@ -1167,20 +2765,91 @@ fn parse_nvd_last_modified(json: &Value) -> Option<DateTime<Utc>> {
 
 fn parse_osv_last_modified(json: &Value) -> Option<DateTime<Utc>> {
     let s = json["modified"].as_str()?; // OSV schema top-level
-    if let Ok(dt) = DateTime::parse_from_rfc3339(s) { return Some(dt.with_timezone(&Utc)); }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
     if !s.ends_with('Z') {
         let mut t = String::from(s);
         t.push('Z');
-        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) { return Some(dt.with_timezone(&Utc)); }
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) {
+            return Some(dt.with_timezone(&Utc));
+        }
     }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") { return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc)); }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") { return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc)); }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    None
+}
+
+fn parse_redhat_last_modified(json: &Value) -> Option<DateTime<Utc>> {
+    let tracking = json.get("document").and_then(|d| d.get("tracking"));
+    let ts = tracking
+        .and_then(|t| t.get("current_release_date"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            tracking
+                .and_then(|t| t.get("initial_release_date"))
+                .and_then(|v| v.as_str())
+        })?;
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if !ts.ends_with('Z') {
+        let mut t = String::from(ts);
+        t.push('Z');
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    None
+}
+
+fn parse_redhat_cve_last_modified(json: &Value) -> Option<DateTime<Utc>> {
+    let ts = json
+        .get("public_date")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("affected_release")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().filter_map(|x| x.get("release_date").and_then(|v| v.as_str())).max())
+        })?;
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if !ts.ends_with('Z') {
+        let mut t = String::from(ts);
+        t.push('Z');
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&t) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+    }
     None
 }
 
 fn compute_dynamic_ttl_days(last_mod: Option<DateTime<Utc>>, default_days: i64) -> i64 {
-    let min_days: i64 = std::env::var("SCANNER_TTL_MIN_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
-    let max_days: i64 = std::env::var("SCANNER_TTL_MAX_DAYS").ok().and_then(|v| v.parse().ok()).unwrap_or(180);
+    let min_days: i64 = std::env::var("SCANNER_TTL_MIN_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    let max_days: i64 = std::env::var("SCANNER_TTL_MAX_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
     if let Some(lm) = last_mod {
         let age_days = (Utc::now() - lm).num_days().clamp(1, 3650);
         age_days.clamp(min_days, max_days)
@@ -1189,7 +2858,10 @@ fn compute_dynamic_ttl_days(last_mod: Option<DateTime<Utc>>, default_days: i64) 
     }
 }
 
-fn pg_get_osv(client: &mut PgClient, vuln_id: &str) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
+fn pg_get_osv(
+    client: &mut PgClient,
+    vuln_id: &str,
+) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
     let row = client.query_opt(
         "SELECT payload, last_checked_at, osv_last_modified FROM osv_vuln_cache WHERE vuln_id = $1",
         &[&vuln_id]
@@ -1200,18 +2872,35 @@ fn pg_get_osv(client: &mut PgClient, vuln_id: &str) -> Option<(Value, DateTime<U
     Some((payload, last_checked_at, osv_last_modified))
 }
 
-fn pg_put_osv(client: &mut PgClient, vuln_id: &str, payload: &Value, osv_last_modified: Option<DateTime<Utc>>) {
+fn pg_put_osv(
+    client: &mut PgClient,
+    vuln_id: &str,
+    payload: &Value,
+    osv_last_modified: Option<DateTime<Utc>>,
+) {
     let res = client.execute(
         "INSERT INTO osv_vuln_cache (vuln_id, payload, last_checked_at, osv_last_modified)\n         VALUES ($1, $2, NOW(), $3)\n         ON CONFLICT (vuln_id) DO UPDATE SET payload = EXCLUDED.payload, last_checked_at = NOW(), osv_last_modified = EXCLUDED.osv_last_modified",
         &[&vuln_id, &payload, &osv_last_modified]
     );
     match res {
-        Ok(_) => progress("osv.cache.pg.put", &format!("{} lm={}", vuln_id, osv_last_modified.map(|d| d.to_rfc3339()).unwrap_or_else(|| "null".into()))),
+        Ok(_) => progress(
+            "osv.cache.pg.put",
+            &format!(
+                "{} lm={}",
+                vuln_id,
+                osv_last_modified
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "null".into())
+            ),
+        ),
         Err(e) => progress("osv.cache.pg.put.err", &format!("{} {}", vuln_id, e)),
     }
 }
 
-fn pg_get_cve(client: &mut PgClient, cve_id: &str) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
+fn pg_get_cve(
+    client: &mut PgClient,
+    cve_id: &str,
+) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
     let row = client.query_opt(
         "SELECT payload, last_checked_at, nvd_last_modified FROM nvd_cve_cache WHERE cve_id = $1",
         &[&cve_id]
@@ -1222,13 +2911,153 @@ fn pg_get_cve(client: &mut PgClient, cve_id: &str) -> Option<(Value, DateTime<Ut
     Some((payload, last_checked_at, nvd_last_modified))
 }
 
-fn pg_put_cve(client: &mut PgClient, cve_id: &str, payload: &Value, nvd_last_modified: Option<DateTime<Utc>>) {
+fn pg_get_redhat(
+    client: &mut PgClient,
+    errata_id: &str,
+) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
+    let row = client
+        .query_opt(
+            "SELECT payload, last_checked_at, redhat_last_modified FROM redhat_csaf_cache WHERE errata_id = $1",
+            &[&errata_id],
+        )
+        .ok()??;
+    let payload: serde_json::Value = row.get(0);
+    let last_checked_at: DateTime<Utc> = row.get(1);
+    let redhat_last_modified: Option<DateTime<Utc>> = row.get(2);
+    Some((payload, last_checked_at, redhat_last_modified))
+}
+
+fn pg_get_redhat_cve(
+    client: &mut PgClient,
+    cve_id: &str,
+) -> Option<(Value, DateTime<Utc>, Option<DateTime<Utc>>)> {
+    let row = client
+        .query_opt(
+            "SELECT payload, last_checked_at, redhat_last_modified FROM redhat_cve_cache WHERE cve_id = $1",
+            &[&cve_id],
+        )
+        .ok()??;
+    let payload: serde_json::Value = row.get(0);
+    let last_checked_at: DateTime<Utc> = row.get(1);
+    let redhat_last_modified: Option<DateTime<Utc>> = row.get(2);
+    Some((payload, last_checked_at, redhat_last_modified))
+}
+
+fn pg_put_cve(
+    client: &mut PgClient,
+    cve_id: &str,
+    payload: &Value,
+    nvd_last_modified: Option<DateTime<Utc>>,
+) {
     let res = client.execute(
         "INSERT INTO nvd_cve_cache (cve_id, payload, last_checked_at, nvd_last_modified)\n         VALUES ($1, $2, NOW(), $3)\n         ON CONFLICT (cve_id) DO UPDATE SET payload = EXCLUDED.payload, last_checked_at = NOW(), nvd_last_modified = EXCLUDED.nvd_last_modified",
         &[&cve_id, &payload, &nvd_last_modified]
     );
     match res {
-        Ok(_) => progress("nvd.cache.pg.put", &format!("{} lm={}", cve_id, nvd_last_modified.map(|d| d.to_rfc3339()).unwrap_or_else(|| "null".into()))),
+        Ok(_) => progress(
+            "nvd.cache.pg.put",
+            &format!(
+                "{} lm={}",
+                cve_id,
+                nvd_last_modified
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "null".into())
+            ),
+        ),
         Err(e) => progress("nvd.cache.pg.put.err", &format!("{} {}", cve_id, e)),
+    }
+}
+
+fn pg_put_redhat(
+    client: &mut PgClient,
+    errata_id: &str,
+    payload: &Value,
+    redhat_last_modified: Option<DateTime<Utc>>,
+) {
+    let res = client.execute(
+        "INSERT INTO redhat_csaf_cache (errata_id, payload, last_checked_at, redhat_last_modified)\n         VALUES ($1, $2, NOW(), $3)\n         ON CONFLICT (errata_id) DO UPDATE SET payload = EXCLUDED.payload, last_checked_at = NOW(), redhat_last_modified = EXCLUDED.redhat_last_modified",
+        &[&errata_id, &payload, &redhat_last_modified],
+    );
+    match res {
+        Ok(_) => progress(
+            "redhat.cache.pg.put",
+            &format!(
+                "{} lm={}",
+                errata_id,
+                redhat_last_modified
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "null".into())
+            ),
+        ),
+        Err(e) => progress("redhat.cache.pg.put.err", &format!("{} {}", errata_id, e)),
+    }
+}
+
+fn pg_put_redhat_cve(
+    client: &mut PgClient,
+    cve_id: &str,
+    payload: &Value,
+    redhat_last_modified: Option<DateTime<Utc>>,
+) {
+    let res = client.execute(
+        "INSERT INTO redhat_cve_cache (cve_id, payload, last_checked_at, redhat_last_modified)\n         VALUES ($1, $2, NOW(), $3)\n         ON CONFLICT (cve_id) DO UPDATE SET payload = EXCLUDED.payload, last_checked_at = NOW(), redhat_last_modified = EXCLUDED.redhat_last_modified",
+        &[&cve_id, &payload, &redhat_last_modified],
+    );
+    match res {
+        Ok(_) => progress(
+            "redhat.cve.cache.pg.put",
+            &format!(
+                "{} lm={}",
+                cve_id,
+                redhat_last_modified
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| "null".into())
+            ),
+        ),
+        Err(e) => progress("redhat.cve.cache.pg.put.err", &format!("{} {}", cve_id, e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_redhat_release_package_handles_name_with_dash() {
+        let parsed = parse_redhat_release_package("kernel-rt-4.18.0-193.6.3.rt13.70.el8_2");
+        let (name, evr) = parsed.expect("package should parse");
+        assert_eq!(name, "kernel-rt");
+        assert_eq!(evr, "4.18.0-193.6.3.rt13.70.el8_2");
+    }
+
+    #[test]
+    fn best_redhat_fixed_release_prefers_matching_el_stream() {
+        let pkg = PackageInfo {
+            name: "mariadb".into(),
+            ecosystem: "redhat".into(),
+            version: "3:10.3.25-1.module+el8.10.0+1234".into(),
+        };
+        let all = vec![
+            RedHatFixedRelease {
+                advisory: Some("RHSA-2020:4026".into()),
+                package_name: "mariadb".into(),
+                fixed_evr: "1:5.5.68-1.el7".into(),
+            },
+            RedHatFixedRelease {
+                advisory: Some("RHSA-2020:5654".into()),
+                package_name: "mariadb".into(),
+                fixed_evr: "3:10.3.27-3.module+el8.2.0+9158".into(),
+            },
+        ];
+        let best = best_redhat_fixed_release(&pkg, &all).expect("best release");
+        assert_eq!(best.advisory.as_deref(), Some("RHSA-2020:5654"));
+        assert_eq!(best.fixed_evr, "3:10.3.27-3.module+el8.2.0+9158");
+    }
+
+    #[test]
+    fn extract_el_tag_detects_rhel_tag() {
+        assert_eq!(extract_el_tag("3:10.3.27-3.module+el8.2.0+9158"), Some("el8".into()));
+        assert_eq!(extract_el_tag("1:5.5.68-1.el7"), Some("el7".into()));
+        assert_eq!(extract_el_tag("1.2.3"), None);
     }
 }

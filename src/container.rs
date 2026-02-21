@@ -1,32 +1,39 @@
+use crate::redhat::filter_findings_with_redhat_oval;
+use crate::report::{compute_summary, Report, SbomInfo, ScannerInfo, TargetInfo};
+use crate::utils::parse_name_version_from_filename;
+use crate::utils::{progress, run_syft_generate_sbom, write_output_if_needed};
+use crate::vuln::{
+    enrich_findings_with_nvd, map_osv_results_to_findings, nvd_cpe_findings, nvd_keyword_findings,
+    nvd_keyword_findings_name, osv_batch_query,
+};
+use crate::{OutputFormat, ScanMode};
+use bzip2::read::BzDecoder;
+use flate2::read::GzDecoder;
+use serde::Serialize;
+use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tar::Archive;
-use flate2::read::GzDecoder;
-use bzip2::read::BzDecoder;
 use tempfile::tempdir;
-use serde::Serialize;
-use crate::vuln::{osv_batch_query, map_osv_results_to_findings, enrich_findings_with_nvd, nvd_keyword_findings, nvd_cpe_findings, nvd_keyword_findings_name};
-use crate::utils::parse_name_version_from_filename;
-use crate::redhat::check_redhat_cve;
-use crate::report::{Report, ScannerInfo, TargetInfo, SbomInfo, compute_summary};
-use crate::utils::{run_syft_generate_sbom, write_output_if_needed, progress};
-use crate::{OutputFormat, ScanMode};
 use walkdir::WalkDir;
 #[cfg(feature = "yara")]
 use yara::Compiler;
-use std::collections::HashSet;
 
 /// Extracts a tar archive (optionally gzipped) to ./extracted
 pub fn extract_tar(tar_path: &str, dest: &Path) -> anyhow::Result<()> {
     let file = File::open(tar_path)?;
-    let mut archive: Archive<Box<dyn std::io::Read>> = if tar_path.ends_with(".gz") || tar_path.ends_with(".tgz") {
-        Archive::new(Box::new(GzDecoder::new(file)))
-    } else if tar_path.ends_with(".bz2") || tar_path.ends_with(".tbz") || tar_path.ends_with(".tbz2") {
-        Archive::new(Box::new(BzDecoder::new(file)))
-    } else {
-        Archive::new(Box::new(file))
-    };
+    let mut archive: Archive<Box<dyn std::io::Read>> =
+        if tar_path.ends_with(".gz") || tar_path.ends_with(".tgz") {
+            Archive::new(Box::new(GzDecoder::new(file)))
+        } else if tar_path.ends_with(".bz2")
+            || tar_path.ends_with(".tbz")
+            || tar_path.ends_with(".tbz2")
+        {
+            Archive::new(Box::new(BzDecoder::new(file)))
+        } else {
+            Archive::new(Box::new(file))
+        };
     archive.unpack(dest)?;
     Ok(())
 }
@@ -48,7 +55,17 @@ pub struct ContainerReport {
     pub findings: serde_json::Value,
 }
 
-pub fn scan_container(tar_path: &str, mode: ScanMode, format: OutputFormat, cache_dir: Option<String>, yara_rules: Option<String>, out: Option<String>, sbom: bool, nvd_api_key: Option<String>, oval_redhat: Option<String>) {
+pub fn scan_container(
+    tar_path: &str,
+    mode: ScanMode,
+    format: OutputFormat,
+    cache_dir: Option<String>,
+    yara_rules: Option<String>,
+    out: Option<String>,
+    sbom: bool,
+    nvd_api_key: Option<String>,
+    oval_redhat: Option<String>,
+) {
     let tmp = match tempdir() {
         Ok(td) => td,
         Err(e) => {
@@ -65,77 +82,173 @@ pub fn scan_container(tar_path: &str, mode: ScanMode, format: OutputFormat, cach
     }
     progress("container.extract.done", tar_path);
 
-    // Try to merge layers if it's a docker save; if no manifest.json, treat dest as rootfs
+    // Try to merge layers from supported container layouts.
     let manifest_path = tmp.path().join("manifest.json");
+    let oci_index_path = tmp.path().join("index.json");
     let rootfs = if manifest_path.exists() {
-        progress("container.layers.merge.start", "manifest=present");
-        match merge_layers(tmp.path()) {
+        progress("container.layers.merge.start", "layout=docker-save");
+        match merge_layers_docker_save(tmp.path()) {
             Ok(p) => {
                 progress("container.layers.merge.done", p.to_string_lossy().as_ref());
                 p
             }
             Err(e) => {
-                eprintln!("Failed to merge layers: {}", e);
+                eprintln!("Failed to merge docker-save layers: {}", e);
+                progress("container.layers.merge.error", &format!("{}", e));
+                tmp.path().to_path_buf()
+            }
+        }
+    } else if oci_index_path.exists() {
+        progress("container.layers.merge.start", "layout=oci");
+        match merge_layers_oci_layout(tmp.path()) {
+            Ok(p) => {
+                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                p
+            }
+            Err(e) => {
+                eprintln!("Failed to merge OCI layers: {}", e);
                 progress("container.layers.merge.error", &format!("{}", e));
                 tmp.path().to_path_buf()
             }
         }
     } else {
-        progress("container.layers.merge.skip", &format!("manifest=missing; rootfs={}", tmp.path().display()));
+        progress(
+            "container.layers.merge.skip",
+            &format!("layout=unknown; rootfs={}", tmp.path().display()),
+        );
         tmp.path().to_path_buf()
     };
 
-    progress("container.packages.detect.start", rootfs.to_string_lossy().as_ref());
+    progress(
+        "container.packages.detect.start",
+        rootfs.to_string_lossy().as_ref(),
+    );
     let packages = detect_os_packages(&rootfs);
-    progress("container.packages.detect.done", &format!("packages={}", packages.len()));
+    progress(
+        "container.packages.detect.done",
+        &format!("packages={}", packages.len()),
+    );
 
     // Light mode: only OSV lookups for packages; Deep mode: run YARA too
-    progress("container.osv.query.start", &format!("packages={}", packages.len()));
+    progress(
+        "container.osv.query.start",
+        &format!("packages={}", packages.len()),
+    );
     let osv_results = osv_batch_query(&packages);
     progress("container.osv.query.done", "ok");
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
 
     // Enrich with OSV details first, then NVD for CVSS/refs
-    progress("container.enrich.osv.start", &format!("findings_pre_enrich={}", findings_norm.len()));
+    progress(
+        "container.enrich.osv.start",
+        &format!("findings_pre_enrich={}", findings_norm.len()),
+    );
     let mut pg = crate::vuln::pg_connect();
-    if let Some(c) = pg.as_mut() { crate::vuln::pg_init_schema(c); }
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
     crate::vuln::osv_enrich_findings(&mut findings_norm, &mut pg);
-    progress("container.enrich.osv.done", &format!("findings={}", findings_norm.len()));
-    let unique: HashSet<String> = findings_norm
-        .iter()
-        .filter(|f| f.id.starts_with("CVE-"))
-        .map(|f| f.id.clone())
-        .collect();
-    progress("container.enrich.nvd.start", &format!("cves={}", unique.len()));
-    crate::vuln::enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg);
-    progress("container.enrich.nvd.done", "ok");
+    progress(
+        "container.enrich.osv.done",
+        &format!("findings={}", findings_norm.len()),
+    );
+    let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+    if nvd_enrich_enabled {
+        let unique: HashSet<String> = findings_norm
+            .iter()
+            .filter(|f| f.id.starts_with("CVE-"))
+            .map(|f| f.id.clone())
+            .collect();
+        progress(
+            "container.enrich.nvd.start",
+            &format!("cves={}", unique.len()),
+        );
+        crate::vuln::enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg);
+        progress("container.enrich.nvd.done", "ok");
+    } else {
+        progress(
+            "container.enrich.nvd.skip",
+            "disabled by SCANNER_NVD_ENRICH",
+        );
+    }
 
     // Fallback: if no packages detected, try filename heuristic (e.g., busybox-<ver>.tar.*)
     if packages.is_empty() {
         if let Some((name, ver)) = parse_name_version_from_filename(tar_path) {
             // Try structured (vendor=product=name) CPE first, then product/version filter, then keyword
             let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
-            if extra.is_empty() { extra = crate::vuln::nvd_findings_by_product_version(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-            if extra.is_empty() { extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-            if extra.is_empty() { extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path)); }
+            if extra.is_empty() {
+                extra = crate::vuln::nvd_findings_by_product_version(
+                    &name,
+                    &name,
+                    &ver,
+                    nvd_api_key.as_deref(),
+                    Some(tar_path),
+                );
+            }
+            if extra.is_empty() {
+                extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            }
+            if extra.is_empty() {
+                extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+            }
             findings_norm.append(&mut extra);
         }
         if findings_norm.is_empty() {
             if let Some((name, ver)) = detect_busybox_version_in_tree(&rootfs) {
                 progress("container.filename.heuristic", &format!("{} {}", name, ver));
-                let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
-                if extra.is_empty() { extra = crate::vuln::nvd_findings_by_product_version(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-                if extra.is_empty() { extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-                if extra.is_empty() { extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path)); }
+                let mut extra =
+                    nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                if extra.is_empty() {
+                    extra = crate::vuln::nvd_findings_by_product_version(
+                        &name,
+                        &name,
+                        &ver,
+                        nvd_api_key.as_deref(),
+                        Some(tar_path),
+                    );
+                }
+                if extra.is_empty() {
+                    extra =
+                        nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                }
+                if extra.is_empty() {
+                    extra =
+                        nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+                }
                 findings_norm.append(&mut extra);
             }
         }
     }
 
-    // If OVAL provided, we could cross-check CVEs to see if they are marked fixed in the distro
-    if let Some(_oval_path) = oval_redhat.as_deref() {
-        // Placeholder: integrate full OVAL evaluation per package versions; current redhat.rs only does presence checks.
-        // For now, we keep this as a hook for future implementation.
+    let oval_redhat = oval_redhat
+        .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+        .filter(|v| !v.trim().is_empty());
+    if let Some(oval_path) = oval_redhat.as_deref() {
+        progress("container.enrich.redhat.start", oval_path);
+        match filter_findings_with_redhat_oval(&mut findings_norm, &packages, oval_path) {
+            Ok(stats) => {
+                progress(
+                    "container.enrich.redhat.done",
+                    &format!(
+                        "defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        stats.definitions_evaluable,
+                        stats.definitions_total,
+                        stats.vulnerable_cves,
+                        stats.covered_cves,
+                        stats.findings_before,
+                        stats.findings_after,
+                        stats.findings_filtered
+                    ),
+                );
+            }
+            Err(e) => {
+                eprintln!("Failed Red Hat OVAL evaluation: {}", e);
+                progress("container.enrich.redhat.error", &format!("{}", e));
+            }
+        }
     }
 
     let mut yara_hits: Vec<String> = Vec::new();
@@ -150,7 +263,11 @@ pub fn scan_container(tar_path: &str, mode: ScanMode, format: OutputFormat, cach
                         if entry.file_type().is_file() {
                             if let Ok(scan) = rules.scan_file(entry.path(), 5) {
                                 for m in scan.matches {
-                                    yara_hits.push(format!("{}: {}", entry.path().display(), m.identifier));
+                                    yara_hits.push(format!(
+                                        "{}: {}",
+                                        entry.path().display(),
+                                        m.identifier
+                                    ));
                                 }
                             }
                         }
@@ -168,24 +285,45 @@ pub fn scan_container(tar_path: &str, mode: ScanMode, format: OutputFormat, cach
                 println!("- {}:{}@{}", p.ecosystem, p.name, p.version);
             }
             println!("Findings: {}", findings_norm.len());
-            if !yara_hits.is_empty() { println!("YARA hits: {}", yara_hits.len()); }
+            if !yara_hits.is_empty() {
+                println!("YARA hits: {}", yara_hits.len());
+            }
         }
         OutputFormat::Json => {
-            let scanner = ScannerInfo { name: "scanner", version: env!("CARGO_PKG_VERSION") };
-            let target = TargetInfo { target_type: "container".into(), source: tar_path.to_string(), id: None };
+            let scanner = ScannerInfo {
+                name: "scanner",
+                version: env!("CARGO_PKG_VERSION"),
+            };
+            let target = TargetInfo {
+                target_type: "container".into(),
+                source: tar_path.to_string(),
+                id: None,
+            };
             let mut sbom_info: Option<SbomInfo> = None;
             if sbom {
                 progress("container.sbom.start", rootfs.to_string_lossy().as_ref());
                 let sbom_path = tmp.path().join("sbom.cdx.json");
-                if let Err(e) = run_syft_generate_sbom(rootfs.to_str().unwrap_or("."), sbom_path.to_str().unwrap_or("sbom.cdx.json")) {
+                if let Err(e) = run_syft_generate_sbom(
+                    rootfs.to_str().unwrap_or("."),
+                    sbom_path.to_str().unwrap_or("sbom.cdx.json"),
+                ) {
                     eprintln!("Syft SBOM generation failed: {}", e);
                     progress("container.sbom.error", &format!("{}", e));
                 } else {
-                    sbom_info = Some(SbomInfo { format: "cyclonedx".into(), path: sbom_path.display().to_string() });
+                    sbom_info = Some(SbomInfo {
+                        format: "cyclonedx".into(),
+                        path: sbom_path.display().to_string(),
+                    });
                     progress("container.sbom.done", "ok");
                 }
             }
-            let mut report = Report { scanner, target, sbom: sbom_info, findings: findings_norm, summary: Default::default() };
+            let mut report = Report {
+                scanner,
+                target,
+                sbom: sbom_info,
+                findings: findings_norm,
+                summary: Default::default(),
+            };
             report.summary = compute_summary(&report.findings);
             let json = serde_json::to_string_pretty(&report).unwrap();
             println!("{}", json);
@@ -195,7 +333,14 @@ pub fn scan_container(tar_path: &str, mode: ScanMode, format: OutputFormat, cach
 }
 
 /// Build a container report (no printing)
-pub fn build_container_report(tar_path: &str, mode: ScanMode, sbom: bool, nvd_api_key: Option<String>, yara_rules: Option<String>) -> Option<Report> {
+pub fn build_container_report(
+    tar_path: &str,
+    mode: ScanMode,
+    sbom: bool,
+    nvd_api_key: Option<String>,
+    yara_rules: Option<String>,
+    oval_redhat: Option<String>,
+) -> Option<Report> {
     let tmp = tempdir().ok()?;
     progress("container.extract.start", tar_path);
     if let Err(e) = extract_tar(tar_path, tmp.path()) {
@@ -204,37 +349,172 @@ pub fn build_container_report(tar_path: &str, mode: ScanMode, sbom: bool, nvd_ap
     }
     progress("container.extract.done", tar_path);
     let manifest_path = tmp.path().join("manifest.json");
-    let rootfs = if manifest_path.exists() {
-        progress("container.layers.merge.start", "manifest=present");
-        match merge_layers(tmp.path()) {
-            Ok(p) => { progress("container.layers.merge.done", p.to_string_lossy().as_ref()); p }
-            Err(e) => { progress("container.layers.merge.error", &format!("{}", e)); tmp.path().to_path_buf() }
+    let oci_index_path = tmp.path().join("index.json");
+    let has_manifest = manifest_path.exists();
+    let has_oci_index = oci_index_path.exists();
+    let rootfs = if has_manifest {
+        progress("container.layers.merge.start", "layout=docker-save");
+        match merge_layers_docker_save(tmp.path()) {
+            Ok(p) => {
+                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                p
+            }
+            Err(e) => {
+                progress("container.layers.merge.error", &format!("{}", e));
+                tmp.path().to_path_buf()
+            }
+        }
+    } else if has_oci_index {
+        progress("container.layers.merge.start", "layout=oci");
+        match merge_layers_oci_layout(tmp.path()) {
+            Ok(p) => {
+                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                p
+            }
+            Err(e) => {
+                progress("container.layers.merge.error", &format!("{}", e));
+                tmp.path().to_path_buf()
+            }
         }
     } else {
-        progress("container.layers.merge.skip", &format!("manifest=missing; rootfs={}", tmp.path().display()));
+        progress(
+            "container.layers.merge.skip",
+            &format!("layout=unknown; rootfs={}", tmp.path().display()),
+        );
         tmp.path().to_path_buf()
     };
 
-    progress("container.packages.detect.start", rootfs.to_string_lossy().as_ref());
+    progress(
+        "container.packages.detect.start",
+        rootfs.to_string_lossy().as_ref(),
+    );
     let packages = detect_os_packages(&rootfs);
-    progress("container.packages.detect.done", &format!("packages={}", packages.len()));
-    progress("container.osv.query.start", &format!("packages={}", packages.len()));
+    progress(
+        "container.packages.detect.done",
+        &format!("packages={}", packages.len()),
+    );
+    progress(
+        "container.osv.query.start",
+        &format!("packages={}", packages.len()),
+    );
     let osv_results = osv_batch_query(&packages);
     progress("container.osv.query.done", "ok");
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
-    progress("container.enrich.osv.start", &format!("findings_pre_enrich={}", findings_norm.len()));
+    progress(
+        "container.enrich.osv.start",
+        &format!("findings_pre_enrich={}", findings_norm.len()),
+    );
     let mut pg = crate::vuln::pg_connect();
-    if let Some(c) = pg.as_mut() { crate::vuln::pg_init_schema(c); }
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
     crate::vuln::osv_enrich_findings(&mut findings_norm, &mut pg);
-    progress("container.enrich.osv.done", &format!("findings={}", findings_norm.len()));
-    let unique: HashSet<String> = findings_norm
-        .iter()
-        .filter(|f| f.id.starts_with("CVE-"))
-        .map(|f| f.id.clone())
-        .collect();
-    progress("container.enrich.nvd.start", &format!("cves={}", unique.len()));
-    enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg);
-    progress("container.enrich.nvd.done", "ok");
+    progress(
+        "container.enrich.osv.done",
+        &format!("findings={}", findings_norm.len()),
+    );
+    let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true);
+    if nvd_enrich_enabled {
+        let unique: HashSet<String> = findings_norm
+            .iter()
+            .filter(|f| f.id.starts_with("CVE-"))
+            .map(|f| f.id.clone())
+            .collect();
+        progress(
+            "container.enrich.nvd.start",
+            &format!("cves={}", unique.len()),
+        );
+        enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg);
+        progress("container.enrich.nvd.done", "ok");
+    } else {
+        progress(
+            "container.enrich.nvd.skip",
+            "disabled by SCANNER_NVD_ENRICH",
+        );
+    }
+
+    // Fallback heuristics when package DBs are absent.
+    if packages.is_empty() {
+        if let Some((name, ver)) = parse_name_version_from_filename(tar_path) {
+            let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            if extra.is_empty() {
+                extra = crate::vuln::nvd_findings_by_product_version(
+                    &name,
+                    &name,
+                    &ver,
+                    nvd_api_key.as_deref(),
+                    Some(tar_path),
+                );
+            }
+            if extra.is_empty() {
+                extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            }
+            if extra.is_empty() {
+                extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+            }
+            findings_norm.append(&mut extra);
+        }
+        if findings_norm.is_empty() {
+            if let Some((name, ver)) = detect_busybox_version_in_tree(&rootfs) {
+                progress("container.filename.heuristic", &format!("{} {}", name, ver));
+                let mut extra =
+                    nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                if extra.is_empty() {
+                    extra = crate::vuln::nvd_findings_by_product_version(
+                        &name,
+                        &name,
+                        &ver,
+                        nvd_api_key.as_deref(),
+                        Some(tar_path),
+                    );
+                }
+                if extra.is_empty() {
+                    extra =
+                        nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                }
+                if extra.is_empty() {
+                    extra =
+                        nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+                }
+                findings_norm.append(&mut extra);
+            }
+        }
+    }
+
+    let oval_redhat = oval_redhat
+        .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+        .filter(|v| !v.trim().is_empty());
+    if let Some(oval_path) = oval_redhat.as_deref() {
+        progress("container.enrich.redhat.start", oval_path);
+        match filter_findings_with_redhat_oval(&mut findings_norm, &packages, oval_path) {
+            Ok(stats) => {
+                progress(
+                    "container.enrich.redhat.done",
+                    &format!(
+                        "defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        stats.definitions_evaluable,
+                        stats.definitions_total,
+                        stats.vulnerable_cves,
+                        stats.covered_cves,
+                        stats.findings_before,
+                        stats.findings_after,
+                        stats.findings_filtered
+                    ),
+                );
+            }
+            Err(e) => {
+                progress("container.enrich.redhat.error", &format!("{}", e));
+            }
+        }
+    }
+
+    // If this doesn't look like a container and we still found nothing, let caller
+    // fall back to source/binary handlers.
+    if !has_manifest && !has_oci_index && packages.is_empty() && findings_norm.is_empty() {
+        return None;
+    }
 
     // Optional YARA in deep mode (ignored if feature not enabled)
     if let ScanMode::Deep = mode {
@@ -245,7 +525,28 @@ pub fn build_container_report(tar_path: &str, mode: ScanMode, sbom: bool, nvd_ap
                 if let Ok(rules) = compiler.compile_rules() {
                     for entry in WalkDir::new(&rootfs).into_iter().filter_map(|e| e.ok()) {
                         if entry.file_type().is_file() {
-                            let _ = rules.scan_file(entry.path(), 5);
+                            if let Ok(scan) = rules.scan_file(entry.path(), 5) {
+                                for m in scan.matches {
+                                    findings_norm.push(crate::report::Finding {
+                                        id: format!("YARA:{}", m.identifier),
+                                        source_ids: Vec::new(),
+                                        package: None,
+                                        fixed: None,
+                                        fixed_in: None,
+                                        recommendation: None,
+                                        severity: None,
+                                        cvss: None,
+                                        description: None,
+                                        evidence: vec![crate::report::EvidenceItem {
+                                            evidence_type: "yara".into(),
+                                            path: Some(entry.path().display().to_string()),
+                                            detail: Some(m.identifier.to_string()),
+                                        }],
+                                        references: Vec::new(),
+                                        confidence: Some("MEDIUM".into()),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -253,19 +554,40 @@ pub fn build_container_report(tar_path: &str, mode: ScanMode, sbom: bool, nvd_ap
         }
     }
 
-    let scanner = ScannerInfo { name: "scanner", version: env!("CARGO_PKG_VERSION") };
-    let target = TargetInfo { target_type: "container".into(), source: tar_path.to_string(), id: None };
+    let scanner = ScannerInfo {
+        name: "scanner",
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    let target = TargetInfo {
+        target_type: "container".into(),
+        source: tar_path.to_string(),
+        id: None,
+    };
     let mut sbom_info: Option<SbomInfo> = None;
     if sbom {
         progress("container.sbom.start", rootfs.to_string_lossy().as_ref());
         let sbom_path = tmp.path().join("sbom.cdx.json");
-        if run_syft_generate_sbom(rootfs.to_str().unwrap_or("."), sbom_path.to_str().unwrap_or("sbom.cdx.json")).is_ok() {
-            sbom_info = Some(SbomInfo { format: "cyclonedx".into(), path: sbom_path.display().to_string() });
+        if run_syft_generate_sbom(
+            rootfs.to_str().unwrap_or("."),
+            sbom_path.to_str().unwrap_or("sbom.cdx.json"),
+        )
+        .is_ok()
+        {
+            sbom_info = Some(SbomInfo {
+                format: "cyclonedx".into(),
+                path: sbom_path.display().to_string(),
+            });
         }
         progress("container.sbom.done", "ok");
     }
 
-    let mut report = Report { scanner, target, sbom: sbom_info, findings: findings_norm, summary: Default::default() };
+    let mut report = Report {
+        scanner,
+        target,
+        sbom: sbom_info,
+        findings: findings_norm,
+        summary: Default::default(),
+    };
     report.summary = compute_summary(&report.findings);
     Some(report)
 }
@@ -275,28 +597,61 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     let tmp = tempdir().ok()?;
     extract_tar(tar_path, tmp.path()).ok()?;
 
-    let mut candidates: Vec<(String,String)> = Vec::new();
-    if let Some((n,v)) = parse_name_version_from_filename(tar_path) { candidates.push((n,v)); }
-    if let Some((n,v)) = detect_busybox_version_in_tree(tmp.path()) { candidates.push((n,v)); }
-    if let Some((n,v)) = detect_busybox_version_from_makefile(tmp.path()) { candidates.push((n,v)); }
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some((n, v)) = parse_name_version_from_filename(tar_path) {
+        candidates.push((n, v));
+    }
+    if let Some((n, v)) = detect_busybox_version_in_tree(tmp.path()) {
+        candidates.push((n, v));
+    }
+    if let Some((n, v)) = detect_busybox_version_from_makefile(tmp.path()) {
+        candidates.push((n, v));
+    }
 
     let mut findings = Vec::new();
     for (name, ver) in candidates {
         let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
-        if extra.is_empty() { extra = crate::vuln::nvd_findings_by_product_version(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-        if extra.is_empty() { extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-        if extra.is_empty() { extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path)); }
+        if extra.is_empty() {
+            extra = crate::vuln::nvd_findings_by_product_version(
+                &name,
+                &name,
+                &ver,
+                nvd_api_key.as_deref(),
+                Some(tar_path),
+            );
+        }
+        if extra.is_empty() {
+            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+        }
+        if extra.is_empty() {
+            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+        }
         findings.extend(extra);
     }
 
-    let scanner = ScannerInfo { name: "scanner", version: env!("CARGO_PKG_VERSION") };
-    let target = TargetInfo { target_type: "source".into(), source: tar_path.to_string(), id: None };
+    let scanner = ScannerInfo {
+        name: "scanner",
+        version: env!("CARGO_PKG_VERSION"),
+    };
+    let target = TargetInfo {
+        target_type: "source".into(),
+        source: tar_path.to_string(),
+        id: None,
+    };
     // Enrich with NVD using Postgres cache
     let mut pg = crate::vuln::pg_connect();
-    if let Some(c) = pg.as_mut() { crate::vuln::pg_init_schema(c); }
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
     crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
 
-    let mut report = Report { scanner, target, sbom: None, findings, summary: Default::default() };
+    let mut report = Report {
+        scanner,
+        target,
+        sbom: None,
+        findings,
+        summary: Default::default(),
+    };
     report.summary = compute_summary(&report.findings);
     Some(report)
 }
@@ -305,11 +660,13 @@ fn detect_busybox_version_in_tree(root: &Path) -> Option<(String, String)> {
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
             if let Ok(mut f) = File::open(entry.path()) {
-                let mut buf = [0u8; 4096];
+                let mut buf = [0u8; 65536];
                 if let Ok(n) = f.read(&mut buf) {
                     let s = String::from_utf8_lossy(&buf[..n]);
                     if let Some(caps) = re.captures(&s) {
-                        if let Some(ver) = caps.get(1) { return Some(("busybox".into(), ver.as_str().to_string())); }
+                        if let Some(ver) = caps.get(1) {
+                            return Some(("busybox".into(), ver.as_str().to_string()));
+                        }
                     }
                 }
             }
@@ -320,7 +677,9 @@ fn detect_busybox_version_in_tree(root: &Path) -> Option<(String, String)> {
 
 fn detect_busybox_version_from_makefile(root: &Path) -> Option<(String, String)> {
     let makefile = root.join("Makefile");
-    if !makefile.exists() { return None; }
+    if !makefile.exists() {
+        return None;
+    }
     let content = std::fs::read_to_string(&makefile).ok()?;
     let re_ver = regex::Regex::new(r"(?m)^\s*VERSION\s*=\s*(\d+)\s*$").ok()?;
     let re_patch = regex::Regex::new(r"(?m)^\s*PATCHLEVEL\s*=\s*(\d+)\s*$").ok()?;
@@ -331,23 +690,55 @@ fn detect_busybox_version_from_makefile(root: &Path) -> Option<(String, String)>
     Some(("busybox".into(), format!("{}.{}.{}", v, p, s)))
 }
 
-pub fn scan_source_tarball(tar_path: &str, format: OutputFormat, nvd_api_key: Option<String>, out: Option<String>) {
-    let tmp = match tempdir() { Ok(td) => td, Err(e) => { eprintln!("Failed to create tempdir: {}", e); return; } };
-    if let Err(e) = extract_tar(tar_path, tmp.path()) { eprintln!("Failed to extract {}: {}", tar_path, e); return; }
+pub fn scan_source_tarball(
+    tar_path: &str,
+    format: OutputFormat,
+    nvd_api_key: Option<String>,
+    out: Option<String>,
+) {
+    let tmp = match tempdir() {
+        Ok(td) => td,
+        Err(e) => {
+            eprintln!("Failed to create tempdir: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = extract_tar(tar_path, tmp.path()) {
+        eprintln!("Failed to extract {}: {}", tar_path, e);
+        return;
+    }
 
     // Try specific detections (BusyBox) and general filename/version
-    let mut candidates: Vec<(String,String)> = Vec::new();
-    if let Some((n,v)) = parse_name_version_from_filename(tar_path) { candidates.push((n,v)); }
-    if let Some((n,v)) = detect_busybox_version_in_tree(tmp.path()) { candidates.push((n,v)); }
-    if let Some((n,v)) = detect_busybox_version_from_makefile(tmp.path()) { candidates.push((n,v)); }
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some((n, v)) = parse_name_version_from_filename(tar_path) {
+        candidates.push((n, v));
+    }
+    if let Some((n, v)) = detect_busybox_version_in_tree(tmp.path()) {
+        candidates.push((n, v));
+    }
+    if let Some((n, v)) = detect_busybox_version_from_makefile(tmp.path()) {
+        candidates.push((n, v));
+    }
     // TODO: parse generic Makefile for VERSION/PKGNAME
 
     let mut findings = Vec::new();
     for (name, ver) in candidates {
         let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
-        if extra.is_empty() { extra = crate::vuln::nvd_findings_by_product_version(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-        if extra.is_empty() { extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path)); }
-        if extra.is_empty() { extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path)); }
+        if extra.is_empty() {
+            extra = crate::vuln::nvd_findings_by_product_version(
+                &name,
+                &name,
+                &ver,
+                nvd_api_key.as_deref(),
+                Some(tar_path),
+            );
+        }
+        if extra.is_empty() {
+            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+        }
+        if extra.is_empty() {
+            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+        }
         findings.extend(extra);
     }
 
@@ -357,9 +748,22 @@ pub fn scan_source_tarball(tar_path: &str, format: OutputFormat, nvd_api_key: Op
             println!("Findings: {}", findings.len());
         }
         OutputFormat::Json => {
-            let scanner = ScannerInfo { name: "scanner", version: env!("CARGO_PKG_VERSION") };
-            let target = TargetInfo { target_type: "source".into(), source: tar_path.to_string(), id: None };
-            let mut report = Report { scanner, target, sbom: None, findings, summary: Default::default() };
+            let scanner = ScannerInfo {
+                name: "scanner",
+                version: env!("CARGO_PKG_VERSION"),
+            };
+            let target = TargetInfo {
+                target_type: "source".into(),
+                source: tar_path.to_string(),
+                id: None,
+            };
+            let mut report = Report {
+                scanner,
+                target,
+                sbom: None,
+                findings,
+                summary: Default::default(),
+            };
             report.summary = compute_summary(&report.findings);
             let json = serde_json::to_string_pretty(&report).unwrap();
             println!("{}", json);
@@ -368,20 +772,24 @@ pub fn scan_source_tarball(tar_path: &str, format: OutputFormat, nvd_api_key: Op
     }
 }
 
-fn merge_layers(extracted: &Path) -> anyhow::Result<PathBuf> {
+fn merge_layers_docker_save(extracted: &Path) -> anyhow::Result<PathBuf> {
     // docker save layout: manifest.json + layer tarballs and config
     let manifest_path = extracted.join("manifest.json");
     let mut manifest_str = String::new();
     File::open(&manifest_path)?.read_to_string(&mut manifest_str)?;
     let manifest_json: serde_json::Value = serde_json::from_str(&manifest_str)?;
     let first = &manifest_json[0];
-    let layers = first["Layers"].as_array().ok_or_else(|| anyhow::anyhow!("No Layers"))?;
+    let layers = first["Layers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("No Layers"))?;
 
     let rootfs_dir = extracted.join("rootfs");
     fs::create_dir_all(&rootfs_dir)?;
 
     for layer_rel in layers {
-        let layer_rel = layer_rel.as_str().ok_or_else(|| anyhow::anyhow!("Layer not string"))?;
+        let layer_rel = layer_rel
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Layer not string"))?;
         let layer_path = extracted.join(layer_rel);
         apply_layer_tar(&layer_path, &rootfs_dir)?;
     }
@@ -389,18 +797,69 @@ fn merge_layers(extracted: &Path) -> anyhow::Result<PathBuf> {
     Ok(rootfs_dir)
 }
 
+fn merge_layers_oci_layout(extracted: &Path) -> anyhow::Result<PathBuf> {
+    // OCI image layout: index.json -> manifest blob -> layer blobs
+    let index_path = extracted.join("index.json");
+    let index_str = fs::read_to_string(&index_path)?;
+    let index_json: serde_json::Value = serde_json::from_str(&index_str)?;
+    let manifests = index_json["manifests"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("OCI index missing manifests"))?;
+    let first = manifests
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("OCI index manifests empty"))?;
+    let manifest_digest = first["digest"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("OCI descriptor missing digest"))?;
+    let manifest_blob = blob_path_from_digest(extracted, manifest_digest)?;
+
+    let manifest_str = fs::read_to_string(&manifest_blob)?;
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_str)?;
+    let layers = manifest_json["layers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("OCI manifest missing layers"))?;
+
+    let rootfs_dir = extracted.join("rootfs");
+    fs::create_dir_all(&rootfs_dir)?;
+
+    for layer in layers {
+        let digest = layer["digest"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("OCI layer missing digest"))?;
+        let layer_path = blob_path_from_digest(extracted, digest)?;
+        apply_layer_tar(&layer_path, &rootfs_dir)?;
+    }
+
+    Ok(rootfs_dir)
+}
+
+fn blob_path_from_digest(extracted: &Path, digest: &str) -> anyhow::Result<PathBuf> {
+    let mut parts = digest.splitn(2, ':');
+    let algo = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid digest: missing algorithm"))?;
+    let hash = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid digest: missing hash"))?;
+    Ok(extracted.join("blobs").join(algo).join(hash))
+}
+
 fn apply_layer_tar(layer_tar: &Path, rootfs: &Path) -> anyhow::Result<()> {
-    let file = File::open(layer_tar)?;
-    // Docker save typically produces uncompressed layer.tar; handle both .tar and .tar.gz
-    let is_gz = layer_tar
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.ends_with(".tar.gz") || n.ends_with(".tgz") || n.ends_with(".gz"))
-        .unwrap_or(false);
+    let mut file = File::open(layer_tar)?;
+    let mut head = [0u8; 3];
+    let n = file.read(&mut head)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    let is_gz = n >= 2 && head[0] == 0x1f && head[1] == 0x8b;
+    let is_bz2 = n >= 3 && head[0] == b'B' && head[1] == b'Z' && head[2] == b'h';
 
     if is_gz {
         let gz = GzDecoder::new(file);
         let mut ar = Archive::new(gz);
+        ar.unpack(rootfs)?;
+    } else if is_bz2 {
+        let bz = BzDecoder::new(file);
+        let mut ar = Archive::new(bz);
         ar.unpack(rootfs)?;
     } else {
         let mut ar = Archive::new(file);
@@ -415,7 +874,7 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
     // Debian/Ubuntu: /var/lib/dpkg/status
     let dpkg_status = rootfs.join("var/lib/dpkg/status");
     if dpkg_status.exists() {
-        if let Ok(mut s) = fs::read_to_string(&dpkg_status) {
+        if let Ok(s) = fs::read_to_string(&dpkg_status) {
             parse_dpkg_status(&s, &mut packages);
         }
     }
@@ -423,22 +882,86 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
     // Alpine: /lib/apk/db/installed
     let apk_db = rootfs.join("lib/apk/db/installed");
     if apk_db.exists() {
-        if let Ok(mut s) = fs::read_to_string(&apk_db) {
+        if let Ok(s) = fs::read_to_string(&apk_db) {
             parse_apk_installed(&s, &mut packages);
         }
     }
 
     // RPM: try host rpm CLI as a fallback (if available)
-    let rpmdb = rootfs.join("var/lib/rpm");
-    if rpmdb.exists() {
-        if let Ok(list) = detect_rpm_packages_cli(rootfs) {
-            for (name, version) in list {
-                packages.push(PackageCoordinate { ecosystem: "rpm".into(), name, version });
+    // RHEL-like images may use /var/lib/rpm, newer distros may use /usr/lib/sysimage/rpm.
+    let rpmdb_legacy = rootfs.join("var/lib/rpm");
+    let rpmdb_modern = rootfs.join("usr/lib/sysimage/rpm");
+    if rpmdb_legacy.exists() || rpmdb_modern.exists() {
+        let rpm_ecosystem = detect_rpm_ecosystem(rootfs);
+        progress("container.rpm.ecosystem", &format!("detected={}", rpm_ecosystem));
+        match detect_rpm_packages_cli(rootfs) {
+            Ok(list) => {
+                if list.is_empty() {
+                    progress("container.rpm.detect.warn", "rpm CLI returned 0 packages");
+                } else {
+                    progress("container.rpm.detect.done", &format!("ecosystem={} packages={}", rpm_ecosystem, list.len()));
+                }
+                for (name, version) in list {
+                    packages.push(PackageCoordinate {
+                        ecosystem: rpm_ecosystem.clone(),
+                        name,
+                        version,
+                    });
+                }
+            }
+            Err(e) => {
+                progress("container.rpm.detect.warn", &format!("rpm CLI failed: {}", e));
+                eprintln!("Warning: RPM package detection failed: {}", e);
             }
         }
     }
 
     packages
+}
+
+fn detect_rpm_ecosystem(rootfs: &Path) -> String {
+    let os_release = rootfs.join("etc/os-release");
+    let content = match fs::read_to_string(os_release) {
+        Ok(s) => s,
+        Err(_) => return "redhat".to_string(),
+    };
+
+    let mut id = String::new();
+    let mut like = String::new();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = trim_os_release_value(v).to_lowercase();
+        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
+            like = trim_os_release_value(v).to_lowercase();
+        }
+    }
+    let hay = format!("{} {}", id, like);
+
+    if hay.contains("rocky") {
+        return "rocky".to_string();
+    }
+    if hay.contains("alma") {
+        return "almalinux".to_string();
+    }
+    if hay.contains("opensuse") {
+        return "opensuse".to_string();
+    }
+    if hay.contains("sles") || hay.contains("suse") {
+        return "suse".to_string();
+    }
+    if id == "fedora" {
+        return "fedora".to_string();
+    }
+    if id == "centos" {
+        return "centos".to_string();
+    }
+
+    // Default all RHEL-like RPM families to Red Hat for OSV queries.
+    "redhat".to_string()
+}
+
+fn trim_os_release_value(v: &str) -> String {
+    v.trim().trim_matches('"').to_string()
 }
 
 fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
@@ -448,7 +971,13 @@ fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
     for line in contents.lines() {
         if line.starts_with("Package:") {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                if installed_ok { out.push(PackageCoordinate { ecosystem: "deb".into(), name: n, version: v }); }
+                if installed_ok {
+                    out.push(PackageCoordinate {
+                        ecosystem: "deb".into(),
+                        name: n,
+                        version: v,
+                    });
+                }
             }
             name = Some(line[8..].trim().to_string());
             version = None;
@@ -460,12 +989,24 @@ fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
             installed_ok = line.contains("install ok installed");
         } else if line.is_empty() {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                if installed_ok { out.push(PackageCoordinate { ecosystem: "deb".into(), name: n, version: v }); }
+                if installed_ok {
+                    out.push(PackageCoordinate {
+                        ecosystem: "deb".into(),
+                        name: n,
+                        version: v,
+                    });
+                }
             }
         }
     }
     if let (Some(n), Some(v)) = (name.take(), version.take()) {
-        if installed_ok { out.push(PackageCoordinate { ecosystem: "deb".into(), name: n, version: v }); }
+        if installed_ok {
+            out.push(PackageCoordinate {
+                ecosystem: "deb".into(),
+                name: n,
+                version: v,
+            });
+        }
     }
 }
 
@@ -479,38 +1020,82 @@ fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
             version = Some(line[2..].trim().to_string());
         } else if line.is_empty() {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                out.push(PackageCoordinate { ecosystem: "apk".into(), name: n, version: v });
+                out.push(PackageCoordinate {
+                    ecosystem: "apk".into(),
+                    name: n,
+                    version: v,
+                });
             }
         }
     }
     if let (Some(n), Some(v)) = (name.take(), version.take()) {
-        out.push(PackageCoordinate { ecosystem: "apk".into(), name: n, version: v });
+        out.push(PackageCoordinate {
+            ecosystem: "apk".into(),
+            name: n,
+            version: v,
+        });
     }
 }
 
-fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String,String)>> {
+fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)>> {
     use std::process::Command;
-    let output = Command::new("rpm")
-        .arg("--root")
-        .arg(rootfs)
-        .arg("-qa")
-        .arg("--qf")
-        .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\n")
-        .output();
-    let mut results = Vec::new();
-    match output {
-        Ok(out) if out.status.success() => {
-            let s = String::from_utf8_lossy(&out.stdout);
-            for line in s.lines() {
-                let mut parts = line.split_whitespace();
-                if let (Some(name), Some(ver)) = (parts.next(), parts.next()) {
-                    let version = ver.trim_start_matches(":").to_string();
-                    results.push((name.to_string(), version));
-                }
-            }
-            Ok(results)
+    let dbpaths = [
+        rootfs.join("var/lib/rpm"),
+        rootfs.join("usr/lib/sysimage/rpm"),
+    ];
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for dbpath in dbpaths.iter() {
+        if !dbpath.exists() {
+            continue;
         }
-        Ok(out) => Err(anyhow::anyhow!("rpm exited with status {}", out.status)),
-        Err(e) => Err(anyhow::anyhow!("failed to invoke rpm: {}", e)),
+
+        let output = Command::new("rpm")
+            .arg("-qa")
+            .arg("--dbpath")
+            .arg(dbpath)
+            .arg("--qf")
+            .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\n")
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                let mut results = Vec::new();
+                for line in s.lines() {
+                    let mut parts = line.split_whitespace();
+                    if let (Some(name), Some(ver)) = (parts.next(), parts.next()) {
+                        // Strip "(none):" epoch prefix that rpm outputs when epoch is unset
+                        let ver = ver.trim_start_matches("(none):");
+                        results.push((name.to_string(), ver.to_string()));
+                    }
+                }
+                if !results.is_empty() {
+                    return Ok(results);
+                }
+                last_err = Some(anyhow::anyhow!(
+                    "rpm query returned no packages for dbpath {}",
+                    dbpath.display()
+                ));
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                last_err = Some(anyhow::anyhow!(
+                    "rpm exited with status {} for dbpath {}: {}",
+                    out.status,
+                    dbpath.display(),
+                    stderr.trim()
+                ));
+            }
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!(
+                    "failed to invoke rpm for dbpath {}: {}",
+                    dbpath.display(),
+                    e
+                ));
+            }
+        }
     }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no rpm database found in rootfs")))
 }

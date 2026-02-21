@@ -1,15 +1,18 @@
 mod binary;
-mod container;
-mod license;
-mod vuln;
-mod redhat;
-mod utils;
 mod cache;
+mod container;
+mod iso;
+mod license;
+mod redhat;
 mod report;
+mod utils;
+mod vuln;
 
+use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use crate::utils::progress;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Parser)]
 #[command(name = "scanner", version = env!("CARGO_PKG_VERSION"))]
@@ -50,7 +53,7 @@ pub enum ScanMode {
 enum Commands {
     /// Smart scan: detect type (container tar, source tar, or binary) and report
     Scan {
-        /// Path to file (tar/tar.gz/tar.bz2/bin)
+        /// Path to file (tar/tar.gz/tar.bz2/iso/bin)
         #[arg(short, long)]
         file: String,
         /// Output format: json or text
@@ -65,6 +68,9 @@ enum Commands {
         /// Scan mode: light or deep (deep enables YARA if available)
         #[arg(long, value_enum, default_value_t = ScanMode::Light)]
         mode: ScanMode,
+        /// Path to Red Hat OVAL XML for fixed checks in RPM/container scans
+        #[arg(long)]
+        oval_redhat: Option<String>,
     },
     /// Scan a binary file
     Bin {
@@ -131,7 +137,7 @@ enum Commands {
         cve: String,
         #[arg(short, long)]
         oval: String,
-    }
+    },
 }
 
 #[derive(Serialize)]
@@ -145,26 +151,98 @@ struct BinReport {
 
 fn main() {
     let cli = Cli::parse();
+    let nvd_api_key = cli
+        .nvd_api_key
+        .clone()
+        .or_else(|| std::env::var("NVD_API_KEY").ok())
+        .filter(|v| !v.trim().is_empty());
 
     if let Some(dir) = &cli.cache_dir {
         std::env::set_var("SCANNER_CACHE", dir);
     }
-    if cli.progress { std::env::set_var("SCANNER_PROGRESS_STDERR", "1"); }
-    if let Some(p) = &cli.progress_file { std::env::set_var("SCANNER_PROGRESS_FILE", p); }
+    if cli.progress {
+        std::env::set_var("SCANNER_PROGRESS_STDERR", "1");
+    }
+    if let Some(p) = &cli.progress_file {
+        std::env::set_var("SCANNER_PROGRESS_FILE", p);
+    }
 
     match cli.command {
-        Commands::Scan { file, format, out, refs, mode } => {
+        Commands::Scan {
+            file,
+            format,
+            out,
+            refs,
+            mode,
+            oval_redhat,
+        } => {
+            // Keep default scans responsive:
+            // - refs=true: full enrichment (OSV + NVD)
+            // - refs=false: keep OSV enrichment and enable NVD only when API key is available
+            if refs {
+                std::env::set_var("SCANNER_OSV_ENRICH", "1");
+                std::env::set_var("SCANNER_NVD_ENRICH", "1");
+            } else {
+                std::env::set_var("SCANNER_OSV_ENRICH", "1");
+                if std::env::var("SCANNER_NVD_ENRICH").is_err() {
+                    let nvd_on = if nvd_api_key.is_some() { "1" } else { "0" };
+                    std::env::set_var("SCANNER_NVD_ENRICH", nvd_on);
+                }
+            }
             progress("scan.start", &file);
-            // Heuristic: tar? → container or source; default to container, fallback to source if no manifest
-            let lower = file.to_lowercase();
+            // Smart detection:
+            // - tar-like input: container -> source -> binary fallback
+            // - iso-like input: ISO metadata scan -> binary fallback
+            // - non-tar, non-iso input: binary
+            let tar_like = looks_like_tar_input(&file);
+            let iso_like = looks_like_iso_input(&file);
+            let oval_redhat = oval_redhat
+                .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+                .filter(|v| !v.trim().is_empty());
             let mut report_json = None;
-            if lower.ends_with(".tar") || lower.ends_with(".tar.gz") || lower.ends_with(".tgz") || lower.ends_with(".tar.bz2") || lower.ends_with(".tbz2") || lower.ends_with(".tbz") {
-                if let Some(r) = container::build_container_report(&file, mode.clone(), false, cli.nvd_api_key.clone(), cli.yara.clone()) {
+            if tar_like {
+                if let Some(r) = container::build_container_report(
+                    &file,
+                    mode.clone(),
+                    false,
+                    nvd_api_key.clone(),
+                    cli.yara.clone(),
+                    oval_redhat.clone(),
+                ) {
                     report_json = Some(serde_json::to_value(r).unwrap());
-                } else if let Some(r) = container::build_source_report(&file, cli.nvd_api_key.clone()) {
+                } else if let Some(r) = container::build_source_report(&file, nvd_api_key.clone()) {
+                    report_json = Some(serde_json::to_value(r).unwrap());
+                } else if let Some(r) = binary::build_binary_report(
+                    &file,
+                    mode.clone(),
+                    cli.yara.clone(),
+                    nvd_api_key.clone(),
+                ) {
                     report_json = Some(serde_json::to_value(r).unwrap());
                 }
-            } else if let Some(r) = binary::build_binary_report(&file, mode.clone(), cli.yara.clone(), cli.nvd_api_key.clone()) {
+            } else if iso_like {
+                if let Some(r) = iso::build_iso_report(
+                    &file,
+                    mode.clone(),
+                    cli.yara.clone(),
+                    nvd_api_key.clone(),
+                    oval_redhat.clone(),
+                ) {
+                    report_json = Some(serde_json::to_value(r).unwrap());
+                } else if let Some(r) = binary::build_binary_report(
+                    &file,
+                    mode.clone(),
+                    cli.yara.clone(),
+                    nvd_api_key.clone(),
+                ) {
+                    report_json = Some(serde_json::to_value(r).unwrap());
+                }
+            } else if let Some(r) = binary::build_binary_report(
+                &file,
+                mode.clone(),
+                cli.yara.clone(),
+                nvd_api_key.clone(),
+            ) {
                 report_json = Some(serde_json::to_value(r).unwrap());
             }
 
@@ -172,36 +250,70 @@ fn main() {
                 if !refs {
                     // Strip references array from each finding when refs flag not set
                     if let Some(arr) = v.get_mut("findings").and_then(|f| f.as_array_mut()) {
-                        for f in arr.iter_mut() { f.as_object_mut().map(|o| o.remove("references")); }
+                        for f in arr.iter_mut() {
+                            f.as_object_mut().map(|o| o.remove("references"));
+                        }
                     }
                 }
-                let text = if matches!(format, OutputFormat::Json) { serde_json::to_string_pretty(&v).unwrap() } else { format!("{}", v) };
+                let text = if matches!(format, OutputFormat::Json) {
+                    serde_json::to_string_pretty(&v).unwrap()
+                } else {
+                    format!("{}", v)
+                };
                 println!("{}", text);
                 utils::write_output_if_needed(&out, &text);
-                let summary = v.get("summary").and_then(|s| s.as_object()).and_then(|o| o.get("total_findings")).and_then(|n| n.as_u64()).unwrap_or(0);
+                let summary = v
+                    .get("summary")
+                    .and_then(|s| s.as_object())
+                    .and_then(|o| o.get("total_findings"))
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
                 progress("scan.done", &format!("file={} findings={}", file, summary));
             } else {
                 eprintln!("Failed to detect or scan file: {}", file);
                 progress("scan.error", &format!("file={}", file));
+                std::process::exit(1);
             }
         }
-        Commands::Bin { path, format, out, mode } => {
-            match format {
-                OutputFormat::Text => binary::scan_binary(&path),
-                OutputFormat::Json => {
-                    if let Some(report) = binary::build_binary_report(&path, mode, None, cli.nvd_api_key.clone()) {
-                        let json = serde_json::to_string_pretty(&report).unwrap();
-                        println!("{}", json);
-                        utils::write_output_if_needed(&out, &json);
-                    }
+        Commands::Bin {
+            path,
+            format,
+            out,
+            mode,
+        } => match format {
+            OutputFormat::Text => binary::scan_binary(&path),
+            OutputFormat::Json => {
+                if let Some(report) =
+                    binary::build_binary_report(&path, mode, None, nvd_api_key.clone())
+                {
+                    let json = serde_json::to_string_pretty(&report).unwrap();
+                    println!("{}", json);
+                    utils::write_output_if_needed(&out, &json);
                 }
             }
-        }
-        Commands::Container { tar, mode, format, out, sbom, oval_redhat } => {
-            container::scan_container(&tar, mode, format, cli.cache_dir.clone(), cli.yara.clone(), out, sbom, cli.nvd_api_key.clone(), oval_redhat);
+        },
+        Commands::Container {
+            tar,
+            mode,
+            format,
+            out,
+            sbom,
+            oval_redhat,
+        } => {
+            container::scan_container(
+                &tar,
+                mode,
+                format,
+                cli.cache_dir.clone(),
+                cli.yara.clone(),
+                out,
+                sbom,
+                nvd_api_key.clone(),
+                oval_redhat,
+            );
         }
         Commands::Source { tar, format, out } => {
-            container::scan_source_tarball(&tar, format, cli.nvd_api_key.clone(), out);
+            container::scan_source_tarball(&tar, format, nvd_api_key.clone(), out);
         }
         Commands::License { path } => {
             license::detect_license(&path);
@@ -213,4 +325,70 @@ fn main() {
             redhat::check_redhat_cve(&cve, &oval);
         }
     }
+}
+
+fn looks_like_tar_input(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".tar")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.bz2")
+        || lower.ends_with(".tbz2")
+        || lower.ends_with(".tbz")
+    {
+        return true;
+    }
+
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut head = [0u8; 512];
+    let n = match f.read(&mut head) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+
+    // gzip / bzip2 signatures (can still be non-tar, but worth trying tar path first)
+    if n >= 2 && head[0] == 0x1f && head[1] == 0x8b {
+        return true;
+    }
+    if n >= 3 && head[0] == b'B' && head[1] == b'Z' && head[2] == b'h' {
+        return true;
+    }
+
+    // USTAR magic at offset 257.
+    if n >= 262 && &head[257..262] == b"ustar" {
+        return true;
+    }
+    if n < 262 {
+        let mut block = [0u8; 262];
+        if f.seek(SeekFrom::Start(0)).is_ok() && f.read(&mut block).ok().unwrap_or(0) >= 262 {
+            return &block[257..262] == b"ustar";
+        }
+    }
+    false
+}
+
+fn looks_like_iso_input(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".iso") {
+        return true;
+    }
+
+    let mut f = match File::open(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // ISO9660 PVD at sector 16 (offset 32768):
+    // byte 0 = descriptor type (1 for primary), bytes 1..5 = "CD001"
+    if f.seek(SeekFrom::Start(32768)).is_err() {
+        return false;
+    }
+    let mut pvd = [0u8; 7];
+    if f.read(&mut pvd).ok().unwrap_or(0) < 7 {
+        return false;
+    }
+    pvd[0] == 0x01 && &pvd[1..6] == b"CD001"
 }

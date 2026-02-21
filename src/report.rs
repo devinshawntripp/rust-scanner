@@ -54,6 +54,8 @@ pub struct Finding {
     pub source_ids: Vec<String>,
     pub package: Option<PackageInfo>,
     pub fixed: Option<bool>,
+    pub fixed_in: Option<String>,
+    pub recommendation: Option<String>,
     pub severity: Option<String>,
     pub cvss: Option<CvssInfo>,
     pub description: Option<String>,
@@ -96,10 +98,15 @@ pub fn compute_summary(findings: &[Finding]) -> Summary {
 }
 
 pub fn severity_from_score(score: f32) -> &'static str {
-    if score >= 9.0 { "CRITICAL" }
-    else if score >= 7.0 { "HIGH" }
-    else if score >= 4.0 { "MEDIUM" }
-    else if score > 0.0 { "LOW" }
-    else { "LOW" }
+    if score >= 9.0 {
+        "CRITICAL"
+    } else if score >= 7.0 {
+        "HIGH"
+    } else if score >= 4.0 {
+        "MEDIUM"
+    } else if score > 0.0 {
+        "LOW"
+    } else {
+        "None"
+    }
 }
-

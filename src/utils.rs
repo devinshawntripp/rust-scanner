@@ -1,10 +1,14 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::io::{self, Read};
 use std::process::Command;
-use std::path::PathBuf;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::sync::{Mutex, OnceLock};
+
+/// Global cached file handle for progress output.
+/// Initialized on first call to `progress()` when SCANNER_PROGRESS_FILE is set.
+static PROGRESS_FILE_HANDLE: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
 
 pub fn run() {
     println!("Module running...");
@@ -55,7 +59,9 @@ pub fn run_syft_generate_sbom(target_dir: &str, out_path: &str) -> io::Result<()
 pub fn parse_name_version_from_filename(filename: &str) -> Option<(String, String)> {
     // Strip common archive extensions
     let mut name = filename.to_string();
-    for ext in [".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".zip", ".tar"] {
+    for ext in [
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".zip", ".tar",
+    ] {
         if name.ends_with(ext) {
             name.truncate(name.len() - ext.len());
             break;
@@ -71,7 +77,12 @@ pub fn parse_name_version_from_filename(filename: &str) -> Option<(String, Strin
     if let Some(idx) = base.rfind('-') {
         let (n, v) = base.split_at(idx);
         let ver = v.trim_start_matches('-');
-        if ver.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if ver
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             return Some((n.to_string(), ver.to_string()));
         }
     }
@@ -88,9 +99,19 @@ pub fn progress(stage: &str, detail: &str) {
     if std::env::var("SCANNER_PROGRESS_STDERR").ok().as_deref() == Some("1") {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
-    if let Ok(path) = std::env::var("SCANNER_PROGRESS_FILE") {
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(line.as_bytes());
+    // Use cached file handle to avoid re-opening on every progress event.
+    let handle = PROGRESS_FILE_HANDLE.get_or_init(|| {
+        if let Ok(path) = std::env::var("SCANNER_PROGRESS_FILE") {
+            if let Ok(f) = OpenOptions::new().create(true).append(true).open(&path) {
+                return Some(Mutex::new(BufWriter::new(f)));
+            }
+        }
+        None
+    });
+    if let Some(mutex) = handle {
+        if let Ok(mut writer) = mutex.lock() {
+            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.flush();
         }
     }
 }

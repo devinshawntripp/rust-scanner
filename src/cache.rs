@@ -1,7 +1,7 @@
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use sha2::{Digest, Sha256};
 
 pub fn cache_key(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -18,7 +18,11 @@ pub fn cache_get(cache_dir: Option<&Path>, key: &str) -> Option<Vec<u8>> {
     match fs::File::open(&path) {
         Ok(mut f) => {
             let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() { Some(buf) } else { None }
+            if f.read_to_end(&mut buf).is_ok() {
+                Some(buf)
+            } else {
+                None
+            }
         }
         Err(_) => None,
     }
@@ -33,4 +37,3 @@ pub fn cache_put(cache_dir: Option<&Path>, key: &str, data: &[u8]) {
         }
     }
 }
-
