@@ -1,0 +1,33 @@
+{
+  "findings": [],
+  "inventory_reason": "deep_mode_requires_installed_inventory",
+  "inventory_status": "missing",
+  "sbom": null,
+  "scan_status": "partial_failed",
+  "scanner": {
+    "name": "scanrook",
+    "version": "1.3.3"
+  },
+  "summary": {
+    "confirmed_critical": 0,
+    "confirmed_high": 0,
+    "confirmed_low": 0,
+    "confirmed_medium": 0,
+    "confirmed_total_findings": 0,
+    "critical": 0,
+    "heuristic_critical": 0,
+    "heuristic_high": 0,
+    "heuristic_low": 0,
+    "heuristic_medium": 0,
+    "heuristic_total_findings": 0,
+    "high": 0,
+    "low": 0,
+    "medium": 0,
+    "total_findings": 0
+  },
+  "target": {
+    "id": null,
+    "source": "./benchmark-artifacts/rockylinux-9.tar",
+    "type": "container"
+  }
+}

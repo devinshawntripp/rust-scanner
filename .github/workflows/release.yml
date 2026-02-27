@@ -1,0 +1,121 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scanrook-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scanrook-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: scanrook-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: scanrook-darwin-arm64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN_PATH="target/${{ matrix.target }}/release/scanner"
+          STAGE_DIR="$(mktemp -d)"
+          cp "${BIN_PATH}" "${STAGE_DIR}/scanrook"
+          chmod +x "${STAGE_DIR}/scanrook"
+
+          ARCHIVE="scanrook-${VERSION}-$(echo ${{ matrix.artifact }} | sed 's/scanrook-//').tar.gz"
+          tar -czf "${ARCHIVE}" -C "${STAGE_DIR}" scanrook
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+          shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate combined checksums
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd artifacts
+          find . -name "*.tar.gz" -exec sha256sum {} \; | sed 's|  \./[^/]*/||' > "scanrook-${VERSION}-checksums.txt"
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+          body: |
+            ## ScanRook v${{ env.VERSION }}
+
+            ### New Features
+            - **EPSS enrichment** — Every finding now includes EPSS exploit probability scores from FIRST.org
+            - **CISA KEV tagging** — Findings matching the Known Exploited Vulnerabilities catalog are automatically flagged
+            - **SBOM policy gates** — New `sbom policy check` subcommand for CI/CD enforcement of vulnerability thresholds
+            - **License detection** — Detect 15 license types (MIT, Apache-2.0, GPL, BSD, ISC, MPL, etc.) in source trees
+            - **5 new distro ecosystems** — Amazon Linux, Oracle Linux, AlmaLinux, Chainguard, Wolfi
+
+            ### Security
+            - Fixed path traversal (Zip Slip) vulnerability in tar extraction
+            - Hardened ISO extraction against symlink escape
+            - Cache directories now created with 0o700 permissions
+            - Decompression bomb protection (2GB per-entry limit)
+
+            ### Improvements
+            - Expanded benchmark matrix: ubuntu:22.04, debian:12, alpine:3.20, rockylinux:9, node:22-slim
+            - Updated README with full benchmark comparison table (ScanRook vs Trivy vs Grype)
+
+            ### Install
+            ```bash
+            curl -fsSL https://scanrook.sh/install | bash
+            ```
+
+            Or download the binary for your platform below.
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/scanrook-*-checksums.txt

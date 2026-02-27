@@ -25,53 +25,13 @@
       "package": {
         "ecosystem": "deb",
         "name": "apt",
-        "version": "2.4.14"
+        "version": "2.6.1"
       },
       "recommendation": null,
       "references": [],
       "severity": "LOW",
       "source_ids": [
         "DEBIAN-CVE-2011-3374"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=bash status=resolved fixed_version=5.2-1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 7.800000190734863,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
-      },
-      "description": "A flaw was found in the bash package, where a heap-buffer overflow can occur in valid parameter_transform. This issue may lead to memory problems.",
-      "epss_percentile": 0.17351000010967255,
-      "epss_score": 0.0005600000149570405,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "5.2-1",
-      "id": "CVE-2022-3715",
-      "package": {
-        "ecosystem": "deb",
-        "name": "bash",
-        "version": "5.1-6ubuntu1.1"
-      },
-      "recommendation": "Upgrade bash to 5.2-1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2022-3715"
-        }
-      ],
-      "severity": "HIGH",
-      "source_ids": [
-        "DEBIAN-CVE-2022-3715",
-        "debian:security-tracker"
       ]
     },
     {
@@ -99,7 +59,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "coreutils",
-        "version": "8.32-4.1ubuntu1.2"
+        "version": "9.1-1"
       },
       "recommendation": "Upgrade coreutils to 9.4-1 or later (debian:security-tracker).",
       "references": [
@@ -139,7 +99,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "coreutils",
-        "version": "8.32-4.1ubuntu1.2"
+        "version": "9.1-1"
       },
       "recommendation": null,
       "references": [],
@@ -173,7 +133,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "coreutils",
-        "version": "8.32-4.1ubuntu1.2"
+        "version": "9.1-1"
       },
       "recommendation": "Upgrade coreutils to 9.5-1 or later (debian:security-tracker).",
       "references": [
@@ -213,53 +173,13 @@
       "package": {
         "ecosystem": "deb",
         "name": "coreutils",
-        "version": "8.32-4.1ubuntu1.2"
+        "version": "9.1-1"
       },
       "recommendation": null,
       "references": [],
       "severity": "MEDIUM",
       "source_ids": [
         "DEBIAN-CVE-2025-5278"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=dpkg status=resolved fixed_version=1.21.8",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 9.800000190734863,
-        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-      },
-      "description": "Dpkg::Source::Archive in dpkg, the Debian package management system, before version 1.21.8, 1.20.10, 1.19.8, 1.18.26 is prone to a directory traversal vulnerability. When extracting untrusted source packages in v2 and v3 source package formats that include a debian.tar, the in-place extraction can lead to directory traversal situations on specially crafted orig.tar and debian.tar tarballs.",
-      "epss_percentile": 0.557479977607727,
-      "epss_score": 0.0033400000538676977,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1.21.8",
-      "id": "CVE-2022-1664",
-      "package": {
-        "ecosystem": "deb",
-        "name": "dpkg",
-        "version": "1.21.1ubuntu2.6"
-      },
-      "recommendation": "Upgrade dpkg to 1.21.8 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2022-1664"
-        }
-      ],
-      "severity": "CRITICAL",
-      "source_ids": [
-        "DEBIAN-CVE-2022-1664",
-        "debian:security-tracker"
       ]
     },
     {
@@ -287,7 +207,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "dpkg",
-        "version": "1.21.1ubuntu2.6"
+        "version": "1.21.22"
       },
       "recommendation": "Upgrade dpkg to 1.22.21 or later (debian:security-tracker).",
       "references": [
@@ -303,167 +223,7 @@
       ]
     },
     {
-      "accuracy_note": "Debian tracker source=e2fsprogs status=resolved fixed_version=1.46.6~rc1-1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 7.800000190734863,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:H"
-      },
-      "description": "An out-of-bounds read/write vulnerability was found in e2fsprogs 1.46.5. This issue leads to a segmentation fault and possibly arbitrary code execution via a specially crafted filesystem.",
-      "epss_percentile": 0.6690800189971924,
-      "epss_score": 0.005319999996572733,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1.46.6~rc1-1",
-      "id": "CVE-2022-1304",
-      "package": {
-        "ecosystem": "deb",
-        "name": "e2fsprogs",
-        "version": "1.46.5-2ubuntu1.2"
-      },
-      "recommendation": "Upgrade e2fsprogs to 1.46.6~rc1-1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2022-1304"
-        }
-      ],
-      "severity": "HIGH",
-      "source_ids": [
-        "DEBIAN-CVE-2022-1304",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=gzip status=resolved fixed_version=1.10-4+deb11u1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 8.800000190734863,
-        "vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
-      },
-      "description": "An arbitrary file write vulnerability was found in GNU gzip's zgrep utility. When zgrep is applied on the attacker's chosen file name (for example, a crafted file name), this can overwrite an attacker's content to an arbitrary attacker-selected file. This flaw occurs due to insufficient validation when processing filenames with two or more newlines where selected content and the target file names are embedded in crafted multi-line file names. This flaw allows a remote, low privileged attacker to force zgrep to write arbitrary files on the system.",
-      "epss_percentile": 0.7396600246429443,
-      "epss_score": 0.008129999972879887,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1.10-4+deb11u1",
-      "id": "CVE-2022-1271",
-      "package": {
-        "ecosystem": "deb",
-        "name": "gzip",
-        "version": "1.10-4ubuntu4.1"
-      },
-      "recommendation": "Upgrade gzip to 1.10-4+deb11u1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2022-1271"
-        }
-      ],
-      "severity": "HIGH",
-      "source_ids": [
-        "DEBIAN-CVE-2022-1271",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=libcap2 status=resolved fixed_version=1:2.44-1+deb11u1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 3.299999952316284,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:L"
-      },
-      "description": "A vulnerability was found in the pthread_create() function in libcap. This issue may allow a malicious actor to use cause __real_pthread_create() to return an error, which can exhaust the process memory.",
-      "epss_percentile": 0.030069999396800995,
-      "epss_score": 0.0001500000071246177,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1:2.44-1+deb11u1",
-      "id": "CVE-2023-2602",
-      "package": {
-        "ecosystem": "deb",
-        "name": "libcap2",
-        "version": "1:2.44-1ubuntu0.22.04.2"
-      },
-      "recommendation": "Upgrade libcap2 to 1:2.44-1+deb11u1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2023-2602"
-        }
-      ],
-      "severity": "LOW",
-      "source_ids": [
-        "DEBIAN-CVE-2023-2602",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=libcap2 status=resolved fixed_version=1:2.44-1+deb11u1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 7.800000190734863,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
-      },
-      "description": "A vulnerability was found in libcap. This issue occurs in the _libcap_strdup() function and can lead to an integer overflow if the input string is close to 4GiB.",
-      "epss_percentile": 0.7819200158119202,
-      "epss_score": 0.011459999717772007,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1:2.44-1+deb11u1",
-      "id": "CVE-2023-2603",
-      "package": {
-        "ecosystem": "deb",
-        "name": "libcap2",
-        "version": "1:2.44-1ubuntu0.22.04.2"
-      },
-      "recommendation": "Upgrade libcap2 to 1:2.44-1+deb11u1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2023-2603"
-        }
-      ],
-      "severity": "HIGH",
-      "source_ids": [
-        "DEBIAN-CVE-2023-2603",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=libcap2 status=resolved fixed_version=1:2.44-1+deb11u1",
+      "accuracy_note": "Debian tracker source=libcap2 status=resolved fixed_version=1:2.66-4+deb12u1",
       "confidence": "HIGH",
       "confidence_tier": "confirmed_installed",
       "cvss": {
@@ -482,14 +242,14 @@
       ],
       "evidence_source": "installed_db",
       "fixed": false,
-      "fixed_in": "1:2.44-1+deb11u1",
+      "fixed_in": "1:2.66-4+deb12u1",
       "id": "CVE-2025-1390",
       "package": {
         "ecosystem": "deb",
         "name": "libcap2",
-        "version": "1:2.44-1ubuntu0.22.04.2"
+        "version": "1:2.66-4+deb12u2+b2"
       },
-      "recommendation": "Upgrade libcap2 to 1:2.44-1+deb11u1 or later (debian:security-tracker).",
+      "recommendation": "Upgrade libcap2 to 1:2.66-4+deb12u1 or later (debian:security-tracker).",
       "references": [
         {
           "type": "advisory",
@@ -527,53 +287,13 @@
       "package": {
         "ecosystem": "deb",
         "name": "libgcrypt20",
-        "version": "1.9.4-3ubuntu3"
+        "version": "1.10.1-3"
       },
       "recommendation": null,
       "references": [],
       "severity": "HIGH",
       "source_ids": [
         "DEBIAN-CVE-2018-6829"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=libgcrypt20 status=resolved fixed_version=1.9.4-2",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 7.5,
-        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
-      },
-      "description": "Libgcrypt before 1.8.8 and 1.9.x before 1.9.3 mishandles ElGamal encryption because it lacks exponent blinding to address a side-channel attack against mpi_powm, and the window size is not chosen appropriately. This, for example, affects use of ElGamal in OpenPGP.",
-      "epss_percentile": 0.6178200244903564,
-      "epss_score": 0.0042500002309679985,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "1.9.4-2",
-      "id": "CVE-2021-33560",
-      "package": {
-        "ecosystem": "deb",
-        "name": "libgcrypt20",
-        "version": "1.9.4-3ubuntu3"
-      },
-      "recommendation": "Upgrade libgcrypt20 to 1.9.4-2 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2021-33560"
-        }
-      ],
-      "severity": "HIGH",
-      "source_ids": [
-        "DEBIAN-CVE-2021-33560",
-        "debian:security-tracker"
       ]
     },
     {
@@ -601,7 +321,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "libgcrypt20",
-        "version": "1.9.4-3ubuntu3"
+        "version": "1.10.1-3"
       },
       "recommendation": null,
       "references": [],
@@ -611,47 +331,7 @@
       ]
     },
     {
-      "accuracy_note": "Debian tracker source=libtasn1-6 status=resolved fixed_version=4.19.0-2",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 9.100000381469727,
-        "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:H"
-      },
-      "description": "GNU Libtasn1 before 4.19.0 has an ETYPE_OK off-by-one array size check that affects asn1_encode_simple_der.",
-      "epss_percentile": 0.5870100259780884,
-      "epss_score": 0.0037499999161809683,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "4.19.0-2",
-      "id": "CVE-2021-46848",
-      "package": {
-        "ecosystem": "deb",
-        "name": "libtasn1-6",
-        "version": "4.18.0-4ubuntu0.2"
-      },
-      "recommendation": "Upgrade libtasn1-6 to 4.19.0-2 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2021-46848"
-        }
-      ],
-      "severity": "CRITICAL",
-      "source_ids": [
-        "DEBIAN-CVE-2021-46848",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=libtasn1-6 status=resolved fixed_version=4.19.0-2+deb12u1",
+      "accuracy_note": "Debian tracker source=libtasn1-6 status=resolved fixed_version=4.20.0-1",
       "confidence": "HIGH",
       "confidence_tier": "confirmed_installed",
       "cvss": {
@@ -670,14 +350,14 @@
       ],
       "evidence_source": "installed_db",
       "fixed": false,
-      "fixed_in": "4.19.0-2+deb12u1",
+      "fixed_in": "4.20.0-1",
       "id": "CVE-2024-12133",
       "package": {
         "ecosystem": "deb",
         "name": "libtasn1-6",
-        "version": "4.18.0-4ubuntu0.2"
+        "version": "4.19.0-2+deb12u1"
       },
-      "recommendation": "Upgrade libtasn1-6 to 4.19.0-2+deb12u1 or later (debian:security-tracker).",
+      "recommendation": "Upgrade libtasn1-6 to 4.20.0-1 or later (debian:security-tracker).",
       "references": [
         {
           "type": "advisory",
@@ -715,7 +395,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "libtasn1-6",
-        "version": "4.18.0-4ubuntu0.2"
+        "version": "4.19.0-2+deb12u1"
       },
       "recommendation": "Upgrade libtasn1-6 to 4.21.0-2 or later (debian:security-tracker).",
       "references": [
@@ -727,46 +407,6 @@
       "severity": "HIGH",
       "source_ids": [
         "DEBIAN-CVE-2025-13151",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=procps status=resolved fixed_version=2:4.0.4-1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 2.5,
-        "vector": "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:N/I:N/A:L"
-      },
-      "description": "Under some circumstances, this weakness allows a user who has access to run the “ps” utility on a machine, the ability to write almost unlimited amounts of unfiltered data into the process heap.",
-      "epss_percentile": 0.021059999242424965,
-      "epss_score": 0.00013000000035390258,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "2:4.0.4-1",
-      "id": "CVE-2023-4016",
-      "package": {
-        "ecosystem": "deb",
-        "name": "procps",
-        "version": "2:3.3.17-6ubuntu2.1"
-      },
-      "recommendation": "Upgrade procps to 2:4.0.4-1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2023-4016"
-        }
-      ],
-      "severity": "LOW",
-      "source_ids": [
-        "DEBIAN-CVE-2023-4016",
         "debian:security-tracker"
       ]
     },
@@ -795,7 +435,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "tar",
-        "version": "1.34+dfsg-1ubuntu0.1.22.04.2"
+        "version": "1.34+dfsg-1.2+deb12u1"
       },
       "recommendation": null,
       "references": [],
@@ -805,7 +445,7 @@
       ]
     },
     {
-      "accuracy_note": "Debian tracker source=tar status=resolved fixed_version=1.34+dfsg-1+deb11u1",
+      "accuracy_note": "Debian tracker source=tar status=resolved fixed_version=1.34+dfsg-1.4",
       "confidence": "HIGH",
       "confidence_tier": "confirmed_installed",
       "cvss": {
@@ -824,14 +464,14 @@
       ],
       "evidence_source": "installed_db",
       "fixed": false,
-      "fixed_in": "1.34+dfsg-1+deb11u1",
+      "fixed_in": "1.34+dfsg-1.4",
       "id": "CVE-2022-48303",
       "package": {
         "ecosystem": "deb",
         "name": "tar",
-        "version": "1.34+dfsg-1ubuntu0.1.22.04.2"
+        "version": "1.34+dfsg-1.2+deb12u1"
       },
-      "recommendation": "Upgrade tar to 1.34+dfsg-1+deb11u1 or later (debian:security-tracker).",
+      "recommendation": "Upgrade tar to 1.34+dfsg-1.4 or later (debian:security-tracker).",
       "references": [
         {
           "type": "advisory",
@@ -845,7 +485,7 @@
       ]
     },
     {
-      "accuracy_note": "Debian tracker source=tar status=resolved fixed_version=1.34+dfsg-1+deb11u1",
+      "accuracy_note": "Debian tracker source=tar status=resolved fixed_version=1.34+dfsg-1.3",
       "confidence": "HIGH",
       "confidence_tier": "confirmed_installed",
       "cvss": {
@@ -864,14 +504,14 @@
       ],
       "evidence_source": "installed_db",
       "fixed": false,
-      "fixed_in": "1.34+dfsg-1+deb11u1",
+      "fixed_in": "1.34+dfsg-1.3",
       "id": "CVE-2023-39804",
       "package": {
         "ecosystem": "deb",
         "name": "tar",
-        "version": "1.34+dfsg-1ubuntu0.1.22.04.2"
+        "version": "1.34+dfsg-1.2+deb12u1"
       },
-      "recommendation": "Upgrade tar to 1.34+dfsg-1+deb11u1 or later (debian:security-tracker).",
+      "recommendation": "Upgrade tar to 1.34+dfsg-1.3 or later (debian:security-tracker).",
       "references": [
         {
           "type": "advisory",
@@ -881,86 +521,6 @@
       "severity": "MEDIUM",
       "source_ids": [
         "DEBIAN-CVE-2023-39804",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=util-linux status=resolved fixed_version=2.37.3-1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 5.5,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H"
-      },
-      "description": "A logic error was found in the libmount library of util-linux in the function that allows an unprivileged user to unmount a FUSE filesystem. This flaw allows an unprivileged local attacker to unmount FUSE filesystems that belong to certain other users who have a UID that is a prefix of the UID of the attacker in its string form. An attacker may use this flaw to cause a denial of service to applications that use the affected filesystems.",
-      "epss_percentile": 0.5022100210189819,
-      "epss_score": 0.0027099999133497477,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "2.37.3-1",
-      "id": "CVE-2021-3995",
-      "package": {
-        "ecosystem": "deb",
-        "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
-      },
-      "recommendation": "Upgrade util-linux to 2.37.3-1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2021-3995"
-        }
-      ],
-      "severity": "MEDIUM",
-      "source_ids": [
-        "DEBIAN-CVE-2021-3995",
-        "debian:security-tracker"
-      ]
-    },
-    {
-      "accuracy_note": "Debian tracker source=util-linux status=resolved fixed_version=2.37.3-1",
-      "confidence": "HIGH",
-      "confidence_tier": "confirmed_installed",
-      "cvss": {
-        "base": 5.5,
-        "vector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:H"
-      },
-      "description": "A logic error was found in the libmount library of util-linux in the function that allows an unprivileged user to unmount a FUSE filesystem. This flaw allows a local user on a vulnerable system to unmount other users' filesystems that are either world-writable themselves (like /tmp) or mounted in a world-writable directory. An attacker may use this flaw to cause a denial of service to applications that use the affected filesystems.",
-      "epss_percentile": 0.4588800072669983,
-      "epss_score": 0.0023300000466406345,
-      "evidence": [
-        {
-          "detail": "package db record",
-          "path": null,
-          "type": "file"
-        }
-      ],
-      "evidence_source": "installed_db",
-      "fixed": false,
-      "fixed_in": "2.37.3-1",
-      "id": "CVE-2021-3996",
-      "package": {
-        "ecosystem": "deb",
-        "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
-      },
-      "recommendation": "Upgrade util-linux to 2.37.3-1 or later (debian:security-tracker).",
-      "references": [
-        {
-          "type": "advisory",
-          "url": "https://security-tracker.debian.org/tracker/CVE-2021-3996"
-        }
-      ],
-      "severity": "MEDIUM",
-      "source_ids": [
-        "DEBIAN-CVE-2021-3996",
         "debian:security-tracker"
       ]
     },
@@ -989,7 +549,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
+        "version": "2.38.1-5+deb12u3"
       },
       "recommendation": null,
       "references": [],
@@ -999,7 +559,7 @@
       ]
     },
     {
-      "accuracy_note": "Debian tracker source=util-linux status=resolved fixed_version=2.38.1-5+deb12u1",
+      "accuracy_note": "Debian tracker source=util-linux status=resolved fixed_version=2.39.3-11",
       "confidence": "HIGH",
       "confidence_tier": "confirmed_installed",
       "cvss": {
@@ -1018,14 +578,14 @@
       ],
       "evidence_source": "installed_db",
       "fixed": false,
-      "fixed_in": "2.38.1-5+deb12u1",
+      "fixed_in": "2.39.3-11",
       "id": "CVE-2024-28085",
       "package": {
         "ecosystem": "deb",
         "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
+        "version": "2.38.1-5+deb12u3"
       },
-      "recommendation": "Upgrade util-linux to 2.38.1-5+deb12u1 or later (debian:security-tracker).",
+      "recommendation": "Upgrade util-linux to 2.39.3-11 or later (debian:security-tracker).",
       "references": [
         {
           "type": "advisory",
@@ -1063,7 +623,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
+        "version": "2.38.1-5+deb12u3"
       },
       "recommendation": "Upgrade util-linux to 2.41.3-1 or later (debian:security-tracker).",
       "references": [
@@ -1098,7 +658,7 @@
       "package": {
         "ecosystem": "deb",
         "name": "util-linux",
-        "version": "2.37.2-4ubuntu3.4"
+        "version": "2.38.1-5+deb12u3"
       },
       "recommendation": null,
       "references": [],
@@ -1117,25 +677,25 @@
     "version": "1.3.3"
   },
   "summary": {
-    "confirmed_critical": 3,
-    "confirmed_high": 9,
-    "confirmed_low": 4,
-    "confirmed_medium": 12,
-    "confirmed_total_findings": 29,
-    "critical": 3,
+    "confirmed_critical": 1,
+    "confirmed_high": 4,
+    "confirmed_low": 2,
+    "confirmed_medium": 10,
+    "confirmed_total_findings": 18,
+    "critical": 1,
     "heuristic_critical": 0,
     "heuristic_high": 0,
     "heuristic_low": 0,
     "heuristic_medium": 0,
     "heuristic_total_findings": 0,
-    "high": 9,
-    "low": 4,
-    "medium": 12,
-    "total_findings": 29
+    "high": 4,
+    "low": 2,
+    "medium": 10,
+    "total_findings": 18
   },
   "target": {
     "id": null,
-    "source": "./benchmark-artifacts/ubuntu-22.04.tar",
+    "source": "./benchmark-artifacts/node-22-slim.tar",
     "type": "container"
   }
 }

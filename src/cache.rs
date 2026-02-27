@@ -43,9 +43,20 @@ pub fn cache_put(cache_dir: Option<&Path>, key: &str, data: &[u8]) {
     }
     if let Some(dir) = cache_dir {
         let _ = fs::create_dir_all(dir);
+        set_dir_permissions(dir);
         let path = dir.join(key);
         if let Ok(mut f) = fs::File::create(path) {
             let _ = f.write_all(data);
         }
     }
 }
+
+/// Set directory permissions to 0o700 (owner-only) on unix systems.
+#[cfg(unix)]
+fn set_dir_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions(_dir: &Path) {}

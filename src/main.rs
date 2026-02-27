@@ -5,6 +5,7 @@ mod iso;
 mod license;
 mod redhat;
 mod report;
+mod sbom;
 mod usercli;
 mod utils;
 mod vuln;
@@ -15,7 +16,7 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -94,6 +95,55 @@ pub enum DbSource {
     Nvd,
     Osv,
     Redhat,
+}
+
+#[derive(Subcommand)]
+enum SbomCommands {
+    /// Import and scan an SBOM (CycloneDX JSON, SPDX JSON, or Syft JSON)
+    Import {
+        /// Path to SBOM JSON
+        #[arg(short, long)]
+        file: String,
+        /// Output format: json or text
+        #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
+        format: OutputFormat,
+        /// Output file for JSON format
+        #[arg(long)]
+        out: Option<String>,
+        /// Scan mode: light or deep
+        #[arg(long, value_enum, default_value_t = ScanMode::Light)]
+        mode: ScanMode,
+        /// Include references in report
+        #[arg(long, default_value_t = false)]
+        refs: bool,
+    },
+    /// Compare two SBOM snapshots to monitor package change over time
+    Diff {
+        /// Baseline SBOM JSON path
+        #[arg(long)]
+        baseline: String,
+        /// Current SBOM JSON path
+        #[arg(long)]
+        current: String,
+        /// Emit JSON diff
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Optional output file
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Check SBOM diff against a policy file (exit code 1 if violated)
+    Policy {
+        /// Path to policy file (YAML or JSON)
+        #[arg(long)]
+        policy: String,
+        /// Path to diff JSON file (from `sbom diff --json`)
+        #[arg(long)]
+        diff: String,
+        /// Path to current scan report JSON (optional, used for severity checks)
+        #[arg(long)]
+        report: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -234,6 +284,11 @@ enum Commands {
         #[command(subcommand)]
         command: DbCommands,
     },
+    /// SBOM import and SDLC change monitoring
+    Sbom {
+        #[command(subcommand)]
+        command: SbomCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -328,11 +383,20 @@ fn main() {
         if let Some(home) = std::env::var_os("HOME") {
             let default_cache = PathBuf::from(home).join(".scanrook").join("cache");
             let _ = std::fs::create_dir_all(&default_cache);
+            set_dir_permissions_0700(&default_cache);
             std::env::set_var("SCANNER_CACHE", default_cache);
         }
     }
     if cli.progress {
         std::env::set_var("SCANNER_PROGRESS_STDERR", "1");
+    }
+    let is_interactive_scan = std::io::stderr().is_terminal()
+        && matches!(&cli.command, Commands::Scan { .. } | Commands::Sbom { .. });
+    if is_interactive_scan && std::env::var("SCANNER_PROGRESS_STDERR").is_err() {
+        std::env::set_var("SCANNER_PROGRESS_STDERR", "1");
+    }
+    if is_interactive_scan && std::env::var("SCANNER_PROGRESS_COMPACT").is_err() {
+        std::env::set_var("SCANNER_PROGRESS_COMPACT", "1");
     }
     if let Some(p) = &cli.progress_file {
         std::env::set_var("SCANNER_PROGRESS_FILE", p);
@@ -412,13 +476,6 @@ fn main() {
                     // Strip references array from each finding when refs flag not set
                     strip_references_in_findings(&mut v);
                 }
-                let text = if matches!(format, OutputFormat::Json) {
-                    serde_json::to_string_pretty(&v).unwrap()
-                } else {
-                    format!("{}", v)
-                };
-                println!("{}", text);
-                utils::write_output_if_needed(&out, &text);
                 let summary = v
                     .get("summary")
                     .and_then(|s| s.as_object())
@@ -426,9 +483,19 @@ fn main() {
                     .and_then(|n| n.as_u64())
                     .unwrap_or(0);
                 progress("scan.done", &format!("file={} findings={}", file, summary));
+                utils::progress_panel_finish(&format!("scan complete findings={}", summary));
+
+                let text = if matches!(format, OutputFormat::Json) {
+                    serde_json::to_string_pretty(&v).unwrap()
+                } else {
+                    format!("{}", v)
+                };
+                println!("{}", text);
+                utils::write_output_if_needed(&out, &text);
             } else {
                 eprintln!("Failed to detect or scan file: {}", file);
                 progress("scan.error", &format!("file={}", file));
+                utils::progress_panel_finish("scan failed");
                 std::process::exit(1);
             }
         }
@@ -540,6 +607,133 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Sbom { command } => match command {
+            SbomCommands::Import {
+                file,
+                format,
+                out,
+                mode,
+                refs,
+            } => {
+                std::env::set_var("SCANNER_OSV_ENRICH", "1");
+                if std::env::var("SCANNER_NVD_ENRICH").is_err() {
+                    let nvd_on = if nvd_api_key.is_some() { "1" } else { "0" };
+                    std::env::set_var("SCANNER_NVD_ENRICH", nvd_on);
+                }
+                progress("sbom.scan.start", &file);
+                if let Some(mut report) = sbom::build_sbom_report(&file, mode, nvd_api_key.clone())
+                    .and_then(|r| serde_json::to_value(r).ok())
+                {
+                    if !refs {
+                        strip_references_in_findings(&mut report);
+                    }
+                    let summary = report
+                        .get("summary")
+                        .and_then(|s| s.as_object())
+                        .and_then(|o| o.get("total_findings"))
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                    progress(
+                        "sbom.scan.done",
+                        &format!("file={} findings={}", file, summary),
+                    );
+                    utils::progress_panel_finish(&format!(
+                        "sbom import complete findings={}",
+                        summary
+                    ));
+
+                    let text = if matches!(format, OutputFormat::Json) {
+                        serde_json::to_string_pretty(&report).unwrap()
+                    } else {
+                        format!("{}", report)
+                    };
+                    println!("{}", text);
+                    utils::write_output_if_needed(&out, &text);
+                } else {
+                    progress("sbom.scan.error", &file);
+                    utils::progress_panel_finish("sbom import failed");
+                    eprintln!("failed to import SBOM: {}", file);
+                    std::process::exit(1);
+                }
+            }
+            SbomCommands::Diff {
+                baseline,
+                current,
+                json,
+                out,
+            } => {
+                let diff = match sbom::build_sbom_diff(&baseline, &current) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("sbom diff failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+
+                if json {
+                    let payload = serde_json::to_string_pretty(&diff).unwrap_or_default();
+                    println!("{}", payload);
+                    utils::write_output_if_needed(&out, &payload);
+                } else {
+                    println!(
+                        "sbom_diff baseline={} current={} baseline_pkgs={} current_pkgs={} added={} removed={} changed={}",
+                        baseline,
+                        current,
+                        diff.summary.baseline_packages,
+                        diff.summary.current_packages,
+                        diff.summary.added,
+                        diff.summary.removed,
+                        diff.summary.changed
+                    );
+                    for c in diff.changed.iter().take(20) {
+                        println!(
+                            "changed\t{}\t{}\t{} -> {}",
+                            c.ecosystem, c.name, c.from_version, c.to_version
+                        );
+                    }
+                    for a in diff.added.iter().take(20) {
+                        println!("added\t{}\t{}\t{}", a.ecosystem, a.name, a.version);
+                    }
+                    for r in diff.removed.iter().take(20) {
+                        println!("removed\t{}\t{}\t{}", r.ecosystem, r.name, r.version);
+                    }
+                }
+            }
+            SbomCommands::Policy {
+                policy,
+                diff,
+                report,
+            } => {
+                let pol = match sbom::load_policy(&policy) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("failed to load policy: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let diff_json: sbom::SbomDiff = match std::fs::read_to_string(&diff)
+                    .map_err(|e| anyhow::anyhow!("{}", e))
+                    .and_then(|s| serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{}", e)))
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("failed to parse diff JSON: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                let report_value: Option<Value> = report.and_then(|p| {
+                    std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                });
+                let result = sbom::check_policy_from_value(&pol, &diff_json, report_value.as_ref());
+                let output = serde_json::to_string_pretty(&result).unwrap_or_default();
+                println!("{}", output);
+                if !result.passed {
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 
@@ -560,6 +754,7 @@ fn build_scan_report_value(
 ) -> Option<Value> {
     let tar_like = looks_like_tar_input(file);
     let iso_like = looks_like_iso_input(file);
+    let sbom_like = looks_like_sbom_input(file);
     if tar_like {
         if let Some(r) = container::build_container_report(
             file,
@@ -578,6 +773,12 @@ fn build_scan_report_value(
     }
     if iso_like {
         if let Some(r) = iso::build_iso_report(file, mode, yara, nvd_api_key, oval_redhat) {
+            return serde_json::to_value(r).ok();
+        }
+        return None;
+    }
+    if sbom_like {
+        if let Some(r) = sbom::build_sbom_report(file, mode, nvd_api_key) {
             return serde_json::to_value(r).ok();
         }
         return None;
@@ -602,8 +803,19 @@ fn clear_scanrook_cache() -> anyhow::Result<()> {
         std::fs::remove_dir_all(&dir)?;
     }
     std::fs::create_dir_all(&dir)?;
+    set_dir_permissions_0700(&dir);
     Ok(())
 }
+
+/// Set directory permissions to 0o700 (owner-only) on unix systems.
+#[cfg(unix)]
+fn set_dir_permissions_0700(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn set_dir_permissions_0700(_dir: &std::path::Path) {}
 
 fn clear_trivy_cache() {
     let _ = Command::new("trivy").arg("clean").arg("--all").status();
@@ -670,32 +882,96 @@ const SCANROOK_DATA_SOURCES: &[DataSourceDef] = &[
         provider: "redhat_oval",
         ecosystems: "RPM (RHEL family)",
         kind: "fixed-state verification",
-        status: "optional",
-        notes: "local file input via --oval-redhat",
+        status: "active",
+        notes: "full OVAL applicability when file is provided via --oval-redhat",
     },
     DataSourceDef {
         source: "Ubuntu CVE Tracker",
         provider: "ubuntu",
         ecosystems: "DPKG",
         kind: "distribution advisories",
-        status: "planned",
-        notes: "roadmap source",
+        status: "active",
+        notes: "direct notices feed enrichment with package-level fixed version mapping",
     },
     DataSourceDef {
         source: "Debian Security Tracker",
         provider: "debian",
         ecosystems: "DPKG",
         kind: "distribution advisories",
-        status: "planned",
-        notes: "roadmap source",
+        status: "active",
+        notes: "direct tracker feed enrichment with package-level fixed version mapping",
     },
     DataSourceDef {
         source: "Alpine SecDB",
         provider: "alpine",
         ecosystems: "APK",
         kind: "distribution advisories",
+        status: "active",
+        notes: "direct SecDB enrichment with package-level secfix mapping",
+    },
+    DataSourceDef {
+        source: "AlmaLinux OSV Database",
+        provider: "alma",
+        ecosystems: "RPM",
+        kind: "distribution advisories",
         status: "planned",
-        notes: "roadmap source",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "Amazon Linux Security Center",
+        provider: "amazon",
+        ecosystems: "RPM",
+        kind: "distribution advisories",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "SUSE Security OVAL",
+        provider: "sles",
+        ecosystems: "RPM",
+        kind: "distribution advisories",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "Oracle Linux Security",
+        provider: "oracle",
+        ecosystems: "RPM",
+        kind: "distribution advisories",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "Chainguard Security",
+        provider: "chainguard",
+        ecosystems: "APK",
+        kind: "distribution advisories",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "Wolfi Security",
+        provider: "wolfi",
+        ecosystems: "APK",
+        kind: "distribution advisories",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "EPSS",
+        provider: "epss",
+        ecosystems: "cross-ecosystem",
+        kind: "auxiliary prioritization",
+        status: "planned",
+        notes: "not yet first-class in scanner",
+    },
+    DataSourceDef {
+        source: "CISA KEV",
+        provider: "kev",
+        ecosystems: "cross-ecosystem",
+        kind: "auxiliary exploit status",
+        status: "planned",
+        notes: "not yet first-class in scanner",
     },
 ];
 
@@ -1466,4 +1742,35 @@ fn looks_like_iso_input(path: &str) -> bool {
         return false;
     }
     pvd[0] == 0x01 && &pvd[1..6] == b"CD001"
+}
+
+fn looks_like_sbom_input(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".spdx.json")
+        || lower.ends_with(".cyclonedx.json")
+        || lower.ends_with(".cdx.json")
+        || lower.ends_with(".sbom.json")
+    {
+        return true;
+    }
+    if !lower.ends_with(".json") {
+        return false;
+    }
+
+    let mut f = match File::open(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let mut head = vec![0u8; 8192];
+    let n = match f.read(&mut head) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if n == 0 {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&head[..n]).to_lowercase();
+    text.contains("\"bomformat\"")
+        || text.contains("\"spdxversion\"")
+        || text.contains("\"artifacts\"")
 }

@@ -1,4 +1,4 @@
 tool,duration_seconds,findings_count,output_path
-scanrook,0.172,33,./docs/benchmarks/reports/ubuntu-22.04/scanrook.json
-trivy,0.176,28,./docs/benchmarks/reports/ubuntu-22.04/trivy.json
-grype,1.056,34,./docs/benchmarks/reports/ubuntu-22.04/grype.json
+scanrook,15.248,29,./docs/benchmarks/reports/ubuntu-22.04/scanrook.json
+trivy,0.157,28,./docs/benchmarks/reports/ubuntu-22.04/trivy.json
+grype,1.075,34,./docs/benchmarks/reports/ubuntu-22.04/grype.json

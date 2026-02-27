@@ -19,12 +19,8 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     pkg-config libssl-dev ca-certificates build-essential curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Cache cargo dependencies
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && echo "fn main(){}" > src/main.rs
-RUN cargo build --release || true
-
-# Build + install the binary into /usr/local using cargo (single build)
+# Build + install the scanner binary into /usr/local.
+# Keep this as a single deterministic build step to avoid stale placeholder binaries.
 COPY . .
 RUN cargo install --path . --root /usr/local --locked
 
@@ -33,8 +29,8 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 
 # Minimal runtime deps for scanner
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
-    apt-get update && apt-get install -y --no-install-recommends \
+# Keep default apt sources here so ca-certificates can be installed before any HTTPS switch.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 rpm && \
     rm -rf /var/lib/apt/lists/*
 

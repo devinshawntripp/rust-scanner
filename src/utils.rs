@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +12,15 @@ use walkdir::WalkDir;
 /// Global cached file handle for progress output.
 /// Initialized on first call to `progress()` when SCANNER_PROGRESS_FILE is set.
 static PROGRESS_FILE_HANDLE: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
+static PROGRESS_TTY_STATE: OnceLock<Mutex<ProgressTtyState>> = OnceLock::new();
+
+#[derive(Default)]
+struct ProgressTtyState {
+    total_events: usize,
+    lines: Vec<String>,
+    rendered_lines: usize,
+    max_lines: usize,
+}
 
 fn level_rank(level: &str) -> u8 {
     match level {
@@ -75,6 +84,108 @@ fn as_text_line(ts: &str, level: &str, component: &str, stage: &str, detail: &st
             "{}\t{}\t[{}]\t{}\t{}",
             ts, level_up, component, stage, detail
         )
+    }
+}
+
+fn compact_progress_enabled() -> bool {
+    std::env::var("SCANNER_PROGRESS_COMPACT")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+        && std::io::stderr().is_terminal()
+}
+
+fn compact_progress_max_lines() -> usize {
+    std::env::var("SCANNER_PROGRESS_MAX_LINES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(4, 24))
+        .unwrap_or(8)
+}
+
+fn compact_trim_line(line: &str, max: usize) -> String {
+    let mut out = line.trim().to_string();
+    if out.chars().count() <= max {
+        return out;
+    }
+    out = out.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn panel_state() -> &'static Mutex<ProgressTtyState> {
+    PROGRESS_TTY_STATE.get_or_init(|| {
+        Mutex::new(ProgressTtyState {
+            total_events: 0,
+            lines: Vec::new(),
+            rendered_lines: 0,
+            max_lines: compact_progress_max_lines(),
+        })
+    })
+}
+
+fn clear_rendered_panel_lines(stderr: &mut std::io::Stderr, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let _ = write!(stderr, "\x1b[{}F", count);
+    for _ in 0..count {
+        let _ = write!(stderr, "\x1b[2K\x1b[1E");
+    }
+    let _ = write!(stderr, "\x1b[{}F", count);
+}
+
+fn render_compact_progress_line(line: &str) {
+    let state_lock = panel_state();
+    if let Ok(mut state) = state_lock.lock() {
+        state.total_events = state.total_events.saturating_add(1);
+        if state.max_lines == 0 {
+            state.max_lines = compact_progress_max_lines();
+        }
+        state.lines.push(compact_trim_line(line, 140));
+        if state.lines.len() > state.max_lines {
+            let drop_n = state.lines.len().saturating_sub(state.max_lines);
+            state.lines.drain(0..drop_n);
+        }
+
+        let mut panel_lines: Vec<String> = Vec::with_capacity(state.lines.len() + 2);
+        panel_lines.push(format!(
+            "┌ ScanRook workflow events={} showing_last={}",
+            state.total_events,
+            state.lines.len()
+        ));
+        for row in &state.lines {
+            panel_lines.push(format!("│ {}", row));
+        }
+        panel_lines.push("└ scanning...".to_string());
+
+        let mut stderr = std::io::stderr();
+        clear_rendered_panel_lines(&mut stderr, state.rendered_lines);
+        for row in &panel_lines {
+            let _ = writeln!(stderr, "{}", row);
+        }
+        let _ = stderr.flush();
+        state.rendered_lines = panel_lines.len();
+    }
+}
+
+pub fn progress_panel_finish(summary: &str) {
+    if !compact_progress_enabled() {
+        return;
+    }
+    let state_lock = panel_state();
+    if let Ok(mut state) = state_lock.lock() {
+        let mut stderr = std::io::stderr();
+        clear_rendered_panel_lines(&mut stderr, state.rendered_lines);
+        let _ = writeln!(
+            stderr,
+            "✓ {} ({})",
+            summary.trim(),
+            chrono::Local::now().format("%H:%M:%S")
+        );
+        let _ = stderr.flush();
+        state.rendered_lines = 0;
+        state.total_events = 0;
+        state.lines.clear();
     }
 }
 
@@ -171,7 +282,16 @@ pub fn progress(stage: &str, detail: &str) {
     if std::env::var("SCANNER_PROGRESS_STDERR").ok().as_deref() == Some("1") {
         let desired = configured_level();
         if level_rank(stage_level(stage)) <= level_rank(&desired) {
-            if configured_format() == "json" {
+            if compact_progress_enabled() {
+                let text_line = as_text_line(
+                    event["ts"].as_str().unwrap_or(""),
+                    event["level"].as_str().unwrap_or("info"),
+                    event["component"].as_str().unwrap_or("scanner"),
+                    event["stage"].as_str().unwrap_or(stage),
+                    event["detail"].as_str().unwrap_or(""),
+                );
+                render_compact_progress_line(&text_line);
+            } else if configured_format() == "json" {
                 let _ = std::io::stderr().write_all(json_line.as_bytes());
             } else {
                 let text_line = as_text_line(

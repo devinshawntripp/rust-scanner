@@ -179,7 +179,10 @@ pub fn login(api_base: Option<String>, api_key: Option<String>) -> Result<()> {
         .send()
         .context("device start request failed")?;
     if !start_resp.status().is_success() {
-        return Err(anyhow!("device start failed with status {}", start_resp.status()));
+        return Err(anyhow!(
+            "device start failed with status {}",
+            start_resp.status()
+        ));
     }
     let start_json: Value = start_resp.json().context("invalid device start response")?;
 
@@ -299,7 +302,11 @@ pub fn whoami(api_base: Option<String>, api_key: Option<String>, json_output: bo
     Ok(())
 }
 
-pub fn show_limits(api_base: Option<String>, api_key: Option<String>, json_output: bool) -> Result<()> {
+pub fn show_limits(
+    api_base: Option<String>,
+    api_key: Option<String>,
+    json_output: bool,
+) -> Result<()> {
     let cfg = load_config();
     let base = resolved_api_base(api_base, &cfg);
     let key = resolved_api_key(api_key, &cfg);

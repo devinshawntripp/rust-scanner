@@ -3,8 +3,8 @@
   "Trivy": {
     "Version": "0.69.1"
   },
-  "ReportID": "019ca00c-788e-7cb9-a3ff-c8e1bbbe1dd5",
-  "CreatedAt": "2026-02-27T11:01:37.806838-06:00",
+  "ReportID": "019ca160-968c-7d27-b17f-579096cf93ba",
+  "CreatedAt": "2026-02-27T17:13:07.724863-06:00",
   "ArtifactID": "sha256:7a0ef74dc198635fd7521798167d2afbfddf438589fc116a1c8f724d4cdfeae6",
   "ArtifactName": "./benchmark-artifacts/ubuntu-22.04.tar",
   "ArtifactType": "container_image",

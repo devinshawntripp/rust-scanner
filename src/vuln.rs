@@ -75,6 +75,7 @@ fn build_http_client(timeout_secs: u64) -> Client {
 }
 
 static NVD_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static ENRICH_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
 static REDIS_CLIENT: OnceLock<Option<redis::Client>> = OnceLock::new();
 
 fn nvd_timeout_secs() -> u64 {
@@ -100,6 +101,10 @@ fn nvd_retry_base_ms() -> u64 {
 
 fn nvd_http_client() -> &'static Client {
     NVD_HTTP_CLIENT.get_or_init(|| build_http_client(nvd_timeout_secs()))
+}
+
+fn enrich_http_client() -> &'static Client {
+    ENRICH_HTTP_CLIENT.get_or_init(|| build_http_client(30))
 }
 
 fn redis_client() -> Option<&'static redis::Client> {
@@ -538,8 +543,12 @@ fn map_ecosystem_name_version(p: &PackageCoordinate) -> (String, String, String)
         "redhat" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
         "rocky" => ("Rocky Linux".into(), p.name.clone(), p.version.clone()),
         "almalinux" => ("AlmaLinux".into(), p.name.clone(), p.version.clone()),
+        "amazonlinux" => ("Amazon Linux".into(), p.name.clone(), p.version.clone()),
+        "oraclelinux" => ("Oracle Linux".into(), p.name.clone(), p.version.clone()),
         "suse" => ("SUSE".into(), p.name.clone(), p.version.clone()),
         "opensuse" => ("openSUSE".into(), p.name.clone(), p.version.clone()),
+        "chainguard" => ("Chainguard".into(), p.name.clone(), p.version.clone()),
+        "wolfi" => ("Wolfi".into(), p.name.clone(), p.version.clone()),
         "fedora" => ("Fedora".into(), p.name.clone(), p.version.clone()),
         "centos" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
         // Legacy fallback from older detector output.
@@ -739,6 +748,9 @@ pub fn map_osv_results_to_findings(
                             evidence: evidence.clone(),
                             references: references.clone(),
                             confidence: Some("HIGH".into()),
+                            epss_score: None,
+                            epss_percentile: None,
+                            in_kev: None,
                         });
                     }
                 } else {
@@ -759,6 +771,9 @@ pub fn map_osv_results_to_findings(
                         evidence,
                         references,
                         confidence: Some("LOW".into()),
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
                     });
                 }
             }
@@ -1052,10 +1067,7 @@ fn osv_fetch_cve_details() -> bool {
 
 fn finding_dedupe_key(f: &Finding) -> String {
     if let Some(pkg) = f.package.as_ref() {
-        format!(
-            "{}|{}|{}|{}",
-            f.id, pkg.ecosystem, pkg.name, pkg.version
-        )
+        format!("{}|{}|{}|{}", f.id, pkg.ecosystem, pkg.name, pkg.version)
     } else {
         format!("{}|||", f.id)
     }
@@ -1117,7 +1129,10 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     if skipped_cve_fetch > 0 {
         progress(
             "osv.enrich.cve_fetch.skip",
-            &format!("count={} reason=SCANNER_OSV_FETCH_CVE_DETAILS=0", skipped_cve_fetch),
+            &format!(
+                "count={} reason=SCANNER_OSV_FETCH_CVE_DETAILS=0",
+                skipped_cve_fetch
+            ),
         );
     }
     progress_timing("osv.enrich.pg_cache_lookup", phase_pg_started);
@@ -1158,7 +1173,10 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
         .collect();
     let total_apply = ids_to_apply.len();
     for (idx, id) in ids_to_apply.into_iter().enumerate() {
-        progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total_apply, id));
+        progress(
+            "osv.fetch.start",
+            &format!("{}/{} {}", idx + 1, total_apply, id),
+        );
         if let Some(json) = all_payloads.get(&id) {
             osv_apply_payload_to_findings(&id, json, findings);
             progress("osv.fetch.ok", &id);
@@ -1171,6 +1189,8 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     redhat_enrich_findings(findings, pg);
     // CVE-level Red Hat enrichment computes package applicability and fixed package versions.
     redhat_enrich_cve_findings(findings, pg);
+    // First-class distro advisory enrichment for Debian/Ubuntu/Alpine.
+    distro_feed_enrich_findings(findings);
     let dropped_fixed = drop_fixed_findings(findings);
     if dropped_fixed > 0 {
         progress("osv.fixed.drop", &format!("count={}", dropped_fixed));
@@ -1206,6 +1226,571 @@ fn map_debian_advisory_to_cves(advisory_id: &str) -> Option<Vec<String>> {
         set.insert(m.as_str().to_string());
     }
     Some(set.into_iter().collect())
+}
+
+#[derive(Debug, Clone)]
+struct DistroFixCandidate {
+    fixed_version: String,
+    source_id: String,
+    reference_url: String,
+    note: String,
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn cached_http_json(url: &str, tag: &str, ttl_secs: i64, timeout_secs: u64) -> Option<Value> {
+    let cache_dir = std::env::var_os("SCANNER_CACHE").map(PathBuf::from);
+    let key = cache_key(&["distro_feed", tag, url]);
+    if let Some(bytes) = cache_get(cache_dir.as_deref(), &key) {
+        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+            // New wrapper format: {"fetched_at": <unix>, "payload": {...}}
+            if let (Some(fetched_at), Some(payload)) = (
+                v.get("fetched_at").and_then(|x| x.as_i64()),
+                v.get("payload"),
+            ) {
+                if Utc::now().timestamp().saturating_sub(fetched_at) <= ttl_secs {
+                    return Some(payload.clone());
+                }
+            } else if v.is_object() || v.is_array() {
+                // Backward compatibility if older cache writes raw JSON.
+                return Some(v);
+            }
+        }
+    }
+
+    let client = build_http_client(timeout_secs);
+    let resp = client.get(url).send().ok()?;
+    if !resp.status().is_success() {
+        progress(
+            "distro.feed.http.err",
+            &format!("tag={} status={} url={}", tag, resp.status(), url),
+        );
+        return None;
+    }
+    let payload: Value = resp.json().ok()?;
+    let wrapped = serde_json::json!({
+        "fetched_at": Utc::now().timestamp(),
+        "payload": payload
+    });
+    cache_put(cache_dir.as_deref(), &key, wrapped.to_string().as_bytes());
+    wrapped.get("payload").cloned()
+}
+
+fn is_cve_id(id: &str) -> bool {
+    id.starts_with("CVE-")
+}
+
+fn pkg_cve_key(pkg: &str, cve: &str) -> String {
+    format!("{}|{}", pkg.to_ascii_lowercase(), cve.to_ascii_uppercase())
+}
+
+fn select_best_candidate(
+    installed_version: &str,
+    candidates: &[DistroFixCandidate],
+) -> Option<DistroFixCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut greater: Vec<DistroFixCandidate> = Vec::new();
+    let mut less_or_equal: Vec<DistroFixCandidate> = Vec::new();
+
+    for c in candidates {
+        if cmp_versions(installed_version, &c.fixed_version) == std::cmp::Ordering::Less {
+            greater.push(c.clone());
+        } else {
+            less_or_equal.push(c.clone());
+        }
+    }
+
+    if !greater.is_empty() {
+        greater.sort_by(|a, b| cmp_versions(&a.fixed_version, &b.fixed_version));
+        return greater.into_iter().next();
+    }
+    less_or_equal.sort_by(|a, b| cmp_versions(&b.fixed_version, &a.fixed_version));
+    less_or_equal.into_iter().next()
+}
+
+fn apply_distro_candidate_to_finding(f: &mut Finding, candidate: &DistroFixCandidate) {
+    let Some(pkg) = f.package.as_ref() else {
+        return;
+    };
+    let is_fixed = cmp_versions(&pkg.version, &candidate.fixed_version) != std::cmp::Ordering::Less;
+
+    if is_fixed {
+        f.fixed = Some(true);
+        if f.recommendation.is_none() {
+            f.recommendation = Some(format!(
+                "Installed {} {} is at or above fixed version {} ({}).",
+                pkg.name, pkg.version, candidate.fixed_version, candidate.source_id
+            ));
+        }
+    } else {
+        if f.fixed.is_none() {
+            f.fixed = Some(false);
+        }
+        f.fixed_in = Some(candidate.fixed_version.clone());
+        if f.recommendation.is_none() {
+            f.recommendation = Some(format!(
+                "Upgrade {} to {} or later ({}).",
+                pkg.name, candidate.fixed_version, candidate.source_id
+            ));
+        }
+    }
+
+    if !f.source_ids.iter().any(|sid| sid == &candidate.source_id) {
+        f.source_ids.push(candidate.source_id.clone());
+    }
+    if !candidate.reference_url.is_empty()
+        && !f
+            .references
+            .iter()
+            .any(|r| r.url.eq_ignore_ascii_case(&candidate.reference_url))
+    {
+        f.references.push(ReferenceInfo {
+            reference_type: "advisory".into(),
+            url: candidate.reference_url.clone(),
+        });
+    }
+    if f.accuracy_note.is_none() {
+        f.accuracy_note = Some(candidate.note.clone());
+    }
+}
+
+fn debian_source_name_candidates(name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let base = name
+        .split(':')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .to_ascii_lowercase();
+    if base.is_empty() {
+        return out;
+    }
+    out.push(base.clone());
+
+    // Common binary-package suffixes where source package often maps to the prefix.
+    let suffixes = [
+        "-dev", "-dbg", "-doc", "-data", "-bin", "-common", "-utils", "-tools", "-libs",
+    ];
+    for suffix in suffixes {
+        if let Some(prefix) = base.strip_suffix(suffix) {
+            if !prefix.is_empty() {
+                out.push(prefix.to_string());
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn load_debian_tracker_data() -> Option<Value> {
+    let ttl = env_i64("SCANNER_DEBIAN_TRACKER_TTL_SECS", 6 * 60 * 60);
+    let timeout = env_u64("SCANNER_DISTRO_FEED_TIMEOUT_SECS", 45);
+    cached_http_json(
+        "https://security-tracker.debian.org/tracker/data/json",
+        "debian_tracker",
+        ttl,
+        timeout,
+    )
+}
+
+fn build_debian_candidate_index(
+    debian_data: &Value,
+    needed: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, Vec<DistroFixCandidate>> {
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    let Some(root) = debian_data.as_object() else {
+        return out;
+    };
+
+    for (pkg, cves) in needed {
+        let source_names = debian_source_name_candidates(pkg);
+        for source in source_names {
+            let Some(pkg_obj) = root.get(&source).and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for cve in cves {
+                let Some(cve_obj) = pkg_obj.get(cve).and_then(|v| v.as_object()) else {
+                    continue;
+                };
+                let Some(releases) = cve_obj.get("releases").and_then(|v| v.as_object()) else {
+                    continue;
+                };
+                for (_release, rel_obj) in releases {
+                    let Some(rel) = rel_obj.as_object() else {
+                        continue;
+                    };
+                    let fixed_version = rel
+                        .get("fixed_version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    if fixed_version.is_empty() || fixed_version == "0" {
+                        continue;
+                    }
+                    let status = rel
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let key = pkg_cve_key(pkg, cve);
+                    out.entry(key).or_default().push(DistroFixCandidate {
+                        fixed_version: fixed_version.to_string(),
+                        source_id: "debian:security-tracker".into(),
+                        reference_url: format!(
+                            "https://security-tracker.debian.org/tracker/{}",
+                            cve
+                        ),
+                        note: format!(
+                            "Debian tracker source={} status={} fixed_version={}",
+                            source, status, fixed_version
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn load_ubuntu_notices_data() -> Option<Value> {
+    let ttl = env_i64("SCANNER_UBUNTU_NOTICES_TTL_SECS", 60 * 60);
+    let timeout = env_u64("SCANNER_DISTRO_FEED_TIMEOUT_SECS", 45);
+    cached_http_json(
+        "https://ubuntu.com/security/notices.json",
+        "ubuntu_notices",
+        ttl,
+        timeout,
+    )
+}
+
+fn build_ubuntu_candidate_index(
+    ubuntu_data: &Value,
+    needed_keys: &HashSet<String>,
+) -> HashMap<String, Vec<DistroFixCandidate>> {
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    let notices = ubuntu_data
+        .get("notices")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    for notice in notices {
+        let Some(cves) = notice.get("cves_ids").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let usn_id = notice
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("USN")
+            .to_string();
+        let matched_cves: Vec<String> = cves
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|id| is_cve_id(id))
+            .map(|s| s.to_ascii_uppercase())
+            .collect();
+        if matched_cves.is_empty() {
+            continue;
+        }
+        let Some(release_pkgs) = notice.get("release_packages").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for entries in release_pkgs.values() {
+            let Some(arr) = entries.as_array() else {
+                continue;
+            };
+            for pkg_entry in arr {
+                let name = pkg_entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let fixed_version = pkg_entry
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if name.is_empty() || fixed_version.is_empty() {
+                    continue;
+                }
+                for cve in &matched_cves {
+                    let key = pkg_cve_key(&name, cve);
+                    if !needed_keys.contains(&key) {
+                        continue;
+                    }
+                    out.entry(key).or_default().push(DistroFixCandidate {
+                        fixed_version: fixed_version.to_string(),
+                        source_id: usn_id.clone(),
+                        reference_url: format!("https://ubuntu.com/security/{}", usn_id),
+                        note: format!("Ubuntu notice {} fixed package {}", usn_id, name),
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn alpine_secdb_branches() -> Vec<String> {
+    if let Ok(raw) = std::env::var("SCANNER_ALPINE_SECDB_BRANCHES") {
+        let mut out: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec![
+        "v3.23".to_string(),
+        "v3.22".to_string(),
+        "v3.21".to_string(),
+        "v3.20".to_string(),
+        "edge".to_string(),
+    ]
+}
+
+fn load_alpine_secdb(branch: &str, repo: &str) -> Option<Value> {
+    let ttl = env_i64("SCANNER_ALPINE_SECDB_TTL_SECS", 6 * 60 * 60);
+    let timeout = env_u64("SCANNER_DISTRO_FEED_TIMEOUT_SECS", 45);
+    let url = format!("https://secdb.alpinelinux.org/{}/{}.json", branch, repo);
+    cached_http_json(
+        &url,
+        &format!("alpine_secdb_{}_{}", branch, repo),
+        ttl,
+        timeout,
+    )
+}
+
+fn build_alpine_candidate_index(
+    needed_keys: &HashSet<String>,
+    needed_pkgs: &HashSet<String>,
+    needed_cves: &HashSet<String>,
+) -> HashMap<String, Vec<DistroFixCandidate>> {
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    for branch in alpine_secdb_branches() {
+        for repo in ["main", "community"] {
+            let Some(doc) = load_alpine_secdb(&branch, repo) else {
+                continue;
+            };
+            let Some(packages) = doc.get("packages").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for item in packages {
+                let Some(pkg_obj) = item.get("pkg").and_then(|v| v.as_object()) else {
+                    continue;
+                };
+                let pkg_name = pkg_obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                if pkg_name.is_empty() || !needed_pkgs.contains(&pkg_name) {
+                    continue;
+                }
+                let Some(secfixes) = pkg_obj.get("secfixes").and_then(|v| v.as_object()) else {
+                    continue;
+                };
+                for (fixed_version, cve_list) in secfixes {
+                    let Some(arr) = cve_list.as_array() else {
+                        continue;
+                    };
+                    for cve in arr.iter().filter_map(|v| v.as_str()) {
+                        let cve_up = cve.to_ascii_uppercase();
+                        if !needed_cves.contains(&cve_up) {
+                            continue;
+                        }
+                        let key = pkg_cve_key(&pkg_name, &cve_up);
+                        if !needed_keys.contains(&key) {
+                            continue;
+                        }
+                        out.entry(key).or_default().push(DistroFixCandidate {
+                            fixed_version: fixed_version.clone(),
+                            source_id: format!("alpine-secdb:{}:{}", branch, repo),
+                            reference_url: format!(
+                                "https://secdb.alpinelinux.org/{}/{}.json",
+                                branch, repo
+                            ),
+                            note: format!(
+                                "Alpine SecDB branch={} repo={} package={}",
+                                branch, repo, pkg_name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
+    if findings.is_empty() {
+        return;
+    }
+    if !env_bool("SCANNER_DISTRO_FEED_ENRICH", true) {
+        progress("distro.feed.skip", "disabled by SCANNER_DISTRO_FEED_ENRICH");
+        return;
+    }
+
+    let mut needed_deb: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut needed_apk_pkgs: HashSet<String> = HashSet::new();
+    let mut needed_apk_cves: HashSet<String> = HashSet::new();
+    let mut needed_ubuntu_keys: HashSet<String> = HashSet::new();
+    let mut needed_alpine_keys: HashSet<String> = HashSet::new();
+
+    for f in findings.iter() {
+        if !is_cve_id(&f.id) {
+            continue;
+        }
+        let Some(pkg) = f.package.as_ref() else {
+            continue;
+        };
+        let pkg_name = pkg.name.to_ascii_lowercase();
+        if pkg.ecosystem == "deb" {
+            needed_deb
+                .entry(pkg_name.clone())
+                .or_default()
+                .insert(f.id.to_ascii_uppercase());
+            needed_ubuntu_keys.insert(pkg_cve_key(&pkg_name, &f.id));
+        } else if pkg.ecosystem == "apk" {
+            needed_apk_pkgs.insert(pkg_name.clone());
+            needed_apk_cves.insert(f.id.to_ascii_uppercase());
+            needed_alpine_keys.insert(pkg_cve_key(&pkg_name, &f.id));
+        }
+    }
+
+    let ubuntu_enabled = env_bool("SCANNER_UBUNTU_TRACKER_ENRICH", true);
+    let debian_enabled = env_bool("SCANNER_DEBIAN_TRACKER_ENRICH", true);
+    let alpine_enabled = env_bool("SCANNER_ALPINE_SECDB_ENRICH", true);
+
+    let ubuntu_index = if ubuntu_enabled && !needed_ubuntu_keys.is_empty() {
+        let started = std::time::Instant::now();
+        let idx = load_ubuntu_notices_data()
+            .map(|v| build_ubuntu_candidate_index(&v, &needed_ubuntu_keys))
+            .unwrap_or_default();
+        progress_timing("distro.ubuntu.enrich", started);
+        idx
+    } else {
+        HashMap::new()
+    };
+
+    let debian_index = if debian_enabled && !needed_deb.is_empty() {
+        let started = std::time::Instant::now();
+        let idx = load_debian_tracker_data()
+            .map(|v| build_debian_candidate_index(&v, &needed_deb))
+            .unwrap_or_default();
+        progress_timing("distro.debian.enrich", started);
+        idx
+    } else {
+        HashMap::new()
+    };
+
+    let alpine_index = if alpine_enabled && !needed_alpine_keys.is_empty() {
+        let started = std::time::Instant::now();
+        let idx =
+            build_alpine_candidate_index(&needed_alpine_keys, &needed_apk_pkgs, &needed_apk_cves);
+        progress_timing("distro.alpine.enrich", started);
+        idx
+    } else {
+        HashMap::new()
+    };
+
+    let mut applied = 0usize;
+    for f in findings.iter_mut() {
+        if !is_cve_id(&f.id) {
+            continue;
+        }
+        let Some((ecosystem, pkg_name, pkg_version)) = f
+            .package
+            .as_ref()
+            .map(|p| (p.ecosystem.clone(), p.name.clone(), p.version.clone()))
+        else {
+            continue;
+        };
+        let key = pkg_cve_key(&pkg_name, &f.id);
+
+        if ecosystem == "apk" {
+            if let Some(cands) = alpine_index.get(&key) {
+                if let Some(best) = select_best_candidate(&pkg_version, cands) {
+                    apply_distro_candidate_to_finding(f, &best);
+                    applied += 1;
+                }
+            }
+            continue;
+        }
+
+        if ecosystem != "deb" {
+            continue;
+        }
+
+        let looks_ubuntu = pkg_version.to_ascii_lowercase().contains("ubuntu")
+            || f.source_ids
+                .iter()
+                .any(|sid| sid.to_ascii_uppercase().starts_with("USN-"));
+
+        let mut applied_one = false;
+        if looks_ubuntu {
+            if let Some(cands) = ubuntu_index.get(&key) {
+                if let Some(best) = select_best_candidate(&pkg_version, cands) {
+                    apply_distro_candidate_to_finding(f, &best);
+                    applied += 1;
+                    applied_one = true;
+                }
+            }
+            if !applied_one {
+                if let Some(cands) = debian_index.get(&key) {
+                    if let Some(best) = select_best_candidate(&pkg_version, cands) {
+                        apply_distro_candidate_to_finding(f, &best);
+                        applied += 1;
+                    }
+                }
+            }
+        } else {
+            if let Some(cands) = debian_index.get(&key) {
+                if let Some(best) = select_best_candidate(&pkg_version, cands) {
+                    apply_distro_candidate_to_finding(f, &best);
+                    applied += 1;
+                    applied_one = true;
+                }
+            }
+            if !applied_one {
+                if let Some(cands) = ubuntu_index.get(&key) {
+                    if let Some(best) = select_best_candidate(&pkg_version, cands) {
+                        apply_distro_candidate_to_finding(f, &best);
+                        applied += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if applied > 0 {
+        progress("distro.feed.enrich.ok", &format!("applied={}", applied));
+    } else {
+        progress("distro.feed.enrich.skip", "no matching distro candidates");
+    }
 }
 
 fn normalize_redhat_errata_id(id: &str) -> String {
@@ -2744,6 +3329,9 @@ pub fn nvd_keyword_findings(
                 evidence,
                 references,
                 confidence: Some("MEDIUM".into()),
+                epss_score: None,
+                epss_percentile: None,
+                in_kev: None,
             });
         }
     }
@@ -2856,6 +3444,9 @@ pub fn nvd_cpe_findings(
                 evidence,
                 references,
                 confidence: Some("MEDIUM".into()),
+                epss_score: None,
+                epss_percentile: None,
+                in_kev: None,
             });
         }
     }
@@ -2965,6 +3556,9 @@ pub fn nvd_keyword_findings_name(
                 evidence,
                 references,
                 confidence: Some("LOW".into()),
+                epss_score: None,
+                epss_percentile: None,
+                in_kev: None,
             });
         }
     }
@@ -3200,6 +3794,9 @@ pub fn nvd_findings_by_product_version(
                                         evidence,
                                         references,
                                         confidence: Some("MEDIUM".into()),
+                                        epss_score: None,
+                                        epss_percentile: None,
+                                        in_kev: None,
                                     });
                                     continue 'outer;
                                 }
@@ -3704,6 +4301,218 @@ fn pg_put_redhat_cve(
     }
 }
 
+/// Returns the cache directory for enrichment functions to use from other modules.
+pub fn resolve_enrich_cache_dir() -> Option<PathBuf> {
+    std::env::var("SCANNER_CACHE").ok().map(PathBuf::from)
+}
+
+// ─── EPSS enrichment ───────────────────────────────────────────────
+
+fn epss_enrich_enabled() -> bool {
+    std::env::var("SCANNER_EPSS_ENRICH")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true)
+}
+
+/// Enrich findings with EPSS (Exploit Prediction Scoring System) scores.
+/// Batch queries the FIRST.org EPSS API in groups of 100 CVE IDs.
+pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::path::Path>) {
+    if !epss_enrich_enabled() {
+        progress("epss.enrich.skip", "disabled by SCANNER_EPSS_ENRICH");
+        return;
+    }
+    let cve_ids: Vec<String> = findings
+        .iter()
+        .filter(|f| f.id.starts_with("CVE-"))
+        .map(|f| f.id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if cve_ids.is_empty() {
+        return;
+    }
+    progress("epss.enrich.start", &format!("cves={}", cve_ids.len()));
+    let started = std::time::Instant::now();
+
+    let mut scores: HashMap<String, (f32, f32)> = HashMap::new();
+
+    // Batch in groups of 100
+    for chunk in cve_ids.chunks(100) {
+        let cache_k = cache_key(
+            &std::iter::once("epss_v1")
+                .chain(chunk.iter().map(|s| s.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        if let Some(cached) = cache_get(cache_dir, &cache_k) {
+            if let Ok(map) = serde_json::from_slice::<HashMap<String, (f32, f32)>>(&cached) {
+                scores.extend(map);
+                continue;
+            }
+        }
+
+        let cve_param = chunk.join(",");
+        let url = format!("https://api.first.org/data/v1/epss?cve={}", cve_param);
+        match enrich_http_client().get(&url).send() {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<Value>() {
+                    let mut chunk_scores: HashMap<String, (f32, f32)> = HashMap::new();
+                    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                        for entry in data {
+                            let cve = entry
+                                .get("cve")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let score = entry
+                                .get("epss")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f32>().ok())
+                                .or_else(|| {
+                                    entry.get("epss").and_then(|v| v.as_f64()).map(|f| f as f32)
+                                });
+                            let percentile = entry
+                                .get("percentile")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f32>().ok())
+                                .or_else(|| {
+                                    entry
+                                        .get("percentile")
+                                        .and_then(|v| v.as_f64())
+                                        .map(|f| f as f32)
+                                });
+                            if let (Some(s), Some(p)) = (score, percentile) {
+                                chunk_scores.insert(cve.to_string(), (s, p));
+                            }
+                        }
+                    }
+                    if let Ok(serialized) = serde_json::to_vec(&chunk_scores) {
+                        cache_put(cache_dir, &cache_k, &serialized);
+                    }
+                    scores.extend(chunk_scores);
+                }
+            }
+            Ok(resp) => {
+                progress(
+                    "epss.enrich.http_error",
+                    &format!("status={}", resp.status()),
+                );
+            }
+            Err(e) => {
+                progress("epss.enrich.error", &format!("{}", e));
+            }
+        }
+    }
+
+    let mut enriched = 0usize;
+    for finding in findings.iter_mut() {
+        if let Some(&(score, percentile)) = scores.get(&finding.id) {
+            finding.epss_score = Some(score);
+            finding.epss_percentile = Some(percentile);
+            enriched += 1;
+        }
+    }
+    progress_timing("epss.enrich", started);
+    progress(
+        "epss.enrich.done",
+        &format!("enriched={}/{}", enriched, findings.len()),
+    );
+}
+
+// ─── CISA KEV enrichment ──────────────────────────────────────────
+
+fn kev_enrich_enabled() -> bool {
+    std::env::var("SCANNER_KEV_ENRICH")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true)
+}
+
+/// Enrich findings with CISA KEV (Known Exploited Vulnerabilities) data.
+/// Downloads the full KEV catalog JSON and marks matching findings.
+pub fn kev_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::path::Path>) {
+    if !kev_enrich_enabled() {
+        progress("kev.enrich.skip", "disabled by SCANNER_KEV_ENRICH");
+        return;
+    }
+    let has_cves = findings.iter().any(|f| f.id.starts_with("CVE-"));
+    if !has_cves {
+        return;
+    }
+    progress("kev.enrich.start", "downloading CISA KEV catalog");
+    let started = std::time::Instant::now();
+
+    let cache_k = cache_key(&["kev_catalog_v1"]);
+    let kev_set: HashSet<String> = if let Some(cached) = cache_get(cache_dir, &cache_k) {
+        if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&cached) {
+            progress("kev.enrich.cache_hit", &format!("cves={}", set.len()));
+            set
+        } else {
+            match fetch_kev_catalog() {
+                Some(set) => {
+                    if let Ok(serialized) = serde_json::to_vec(&set) {
+                        cache_put(cache_dir, &cache_k, &serialized);
+                    }
+                    set
+                }
+                None => return,
+            }
+        }
+    } else {
+        match fetch_kev_catalog() {
+            Some(set) => {
+                if let Ok(serialized) = serde_json::to_vec(&set) {
+                    cache_put(cache_dir, &cache_k, &serialized);
+                }
+                set
+            }
+            None => return,
+        }
+    };
+
+    let mut enriched = 0usize;
+    for finding in findings.iter_mut() {
+        if finding.id.starts_with("CVE-") && kev_set.contains(&finding.id) {
+            finding.in_kev = Some(true);
+            enriched += 1;
+        }
+    }
+    progress_timing("kev.enrich", started);
+    progress(
+        "kev.enrich.done",
+        &format!(
+            "kev_total={} matched={}/{}",
+            kev_set.len(),
+            enriched,
+            findings.len()
+        ),
+    );
+}
+
+fn fetch_kev_catalog() -> Option<HashSet<String>> {
+    let url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+    match enrich_http_client().get(url).send() {
+        Ok(resp) if resp.status().is_success() => {
+            let body: Value = resp.json().ok()?;
+            let vulns = body.get("vulnerabilities")?.as_array()?;
+            let set: HashSet<String> = vulns
+                .iter()
+                .filter_map(|v| v.get("cveID").and_then(|c| c.as_str()).map(String::from))
+                .collect();
+            progress("kev.enrich.catalog_fetched", &format!("cves={}", set.len()));
+            Some(set)
+        }
+        Ok(resp) => {
+            progress(
+                "kev.enrich.http_error",
+                &format!("status={}", resp.status()),
+            );
+            None
+        }
+        Err(e) => {
+            progress("kev.enrich.error", &format!("{}", e));
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3829,6 +4638,9 @@ mod tests {
             evidence: Vec::new(),
             references: Vec::new(),
             confidence: Some("HIGH".to_string()),
+            epss_score: None,
+            epss_percentile: None,
+            in_kev: None,
         }
     }
 
@@ -3843,5 +4655,55 @@ mod tests {
         assert_eq!(dropped, 1);
         assert_eq!(findings.len(), 2);
         assert!(findings.iter().all(|f| f.fixed != Some(true)));
+    }
+
+    #[test]
+    fn select_best_candidate_prefers_nearest_fix() {
+        let candidates = vec![
+            DistroFixCandidate {
+                fixed_version: "1.2.0".into(),
+                source_id: "src".into(),
+                reference_url: "https://example.test/a".into(),
+                note: "a".into(),
+            },
+            DistroFixCandidate {
+                fixed_version: "1.1.0".into(),
+                source_id: "src".into(),
+                reference_url: "https://example.test/b".into(),
+                note: "b".into(),
+            },
+            DistroFixCandidate {
+                fixed_version: "2.0.0".into(),
+                source_id: "src".into(),
+                reference_url: "https://example.test/c".into(),
+                note: "c".into(),
+            },
+        ];
+        let best = select_best_candidate("1.0.5", &candidates).expect("best candidate");
+        assert_eq!(best.fixed_version, "1.1.0");
+    }
+
+    #[test]
+    fn build_ubuntu_candidate_index_maps_notice_to_pkg_cve_key() {
+        let data = serde_json::json!({
+            "notices": [
+                {
+                    "id": "USN-1000-1",
+                    "cves_ids": ["CVE-2024-12345"],
+                    "release_packages": {
+                        "jammy": [
+                            {"name":"bash","version":"5.1-2ubuntu3.4"}
+                        ]
+                    }
+                }
+            ]
+        });
+        let mut needed = std::collections::HashSet::new();
+        needed.insert(pkg_cve_key("bash", "CVE-2024-12345"));
+        let idx = build_ubuntu_candidate_index(&data, &needed);
+        let key = pkg_cve_key("bash", "CVE-2024-12345");
+        let rows = idx.get(&key).expect("ubuntu candidate present");
+        assert_eq!(rows[0].fixed_version, "5.1-2ubuntu3.4");
+        assert_eq!(rows[0].source_id, "USN-1000-1");
     }
 }

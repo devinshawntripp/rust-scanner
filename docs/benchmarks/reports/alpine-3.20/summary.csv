@@ -1,0 +1,4 @@
+tool,duration_seconds,findings_count,output_path
+scanrook,5.092,0,./docs/benchmarks/reports/alpine-3.20/scanrook.json
+trivy,0.181,0,./docs/benchmarks/reports/alpine-3.20/trivy.json
+grype,1.054,4,./docs/benchmarks/reports/alpine-3.20/grype.json

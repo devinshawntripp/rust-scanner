@@ -256,6 +256,10 @@ pub fn build_iso_report(
         id: None,
     };
     let files = iso_entries_to_file_rows(&entries, 20_000);
+    let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+
     let mut report = Report {
         scanner,
         target,
@@ -468,12 +472,14 @@ fn extract_runtime_image(image_path: &Path, dest: &Path) -> anyhow::Result<bool>
     if command_exists("unsquashfs") {
         let output = Command::new("unsquashfs")
             .arg("-f")
+            .arg("-no-xattrs")
             .arg("-d")
             .arg(dest)
             .arg(image_path)
             .output()
             .with_context(|| format!("failed to invoke unsquashfs on {}", image_path.display()))?;
         if output.status.success() {
+            validate_extraction_within(dest)?;
             return Ok(true);
         }
         progress(
@@ -483,6 +489,7 @@ fn extract_runtime_image(image_path: &Path, dest: &Path) -> anyhow::Result<bool>
     }
 
     let output = Command::new("bsdtar")
+        .arg("--no-fflags")
         .arg("-xf")
         .arg(image_path)
         .arg("-C")
@@ -490,6 +497,7 @@ fn extract_runtime_image(image_path: &Path, dest: &Path) -> anyhow::Result<bool>
         .output()
         .with_context(|| format!("failed to invoke bsdtar on {}", image_path.display()))?;
     if output.status.success() {
+        validate_extraction_within(dest)?;
         return Ok(true);
     }
     progress(
@@ -497,6 +505,47 @@ fn extract_runtime_image(image_path: &Path, dest: &Path) -> anyhow::Result<bool>
         &String::from_utf8_lossy(&output.stderr),
     );
     Ok(false)
+}
+
+/// Walks the extraction directory and verifies no symlinks escape it.
+fn validate_extraction_within(dest: &Path) -> anyhow::Result<()> {
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+    for entry in WalkDir::new(dest).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_symlink() {
+            if let Ok(target) = fs::read_link(path) {
+                let resolved = if target.is_absolute() {
+                    target.clone()
+                } else {
+                    path.parent().unwrap_or(dest).join(&target)
+                };
+                // Normalize to handle .. components
+                let mut normalized = std::path::PathBuf::new();
+                for comp in resolved.components() {
+                    match comp {
+                        std::path::Component::ParentDir => {
+                            normalized.pop();
+                        }
+                        std::path::Component::CurDir => {}
+                        other => normalized.push(other),
+                    }
+                }
+                if !normalized.starts_with(&canonical_dest) {
+                    // Remove the offending symlink rather than aborting the whole scan
+                    let _ = fs::remove_file(path);
+                    crate::utils::progress(
+                        "iso.security.symlink_removed",
+                        &format!(
+                            "removed symlink escaping dest: {} -> {}",
+                            path.display(),
+                            target.display()
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn command_exists(cmd: &str) -> bool {
@@ -655,8 +704,21 @@ fn extract_iso_entries_bulk(path: &str, dest: &Path, entries: &[String]) -> anyh
     if entries.is_empty() {
         return Ok(());
     }
+    // Reject entries with path-traversal components before passing to bsdtar
+    for entry in entries {
+        if entry.contains("..") {
+            return Err(anyhow!(
+                "refusing ISO entry with path-traversal component: {}",
+                entry
+            ));
+        }
+    }
     let mut cmd = Command::new("bsdtar");
-    cmd.arg("-xf").arg(path).arg("-C").arg(dest);
+    cmd.arg("--no-fflags")
+        .arg("-xf")
+        .arg(path)
+        .arg("-C")
+        .arg(dest);
     for entry in entries {
         cmd.arg(entry);
     }
@@ -669,6 +731,7 @@ fn extract_iso_entries_bulk(path: &str, dest: &Path, entries: &[String]) -> anyh
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
+    validate_extraction_within(dest)?;
     Ok(())
 }
 

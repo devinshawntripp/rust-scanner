@@ -51,57 +51,43 @@ Notes:
 - This table is positioning-level and should be backed by benchmarks for strict feature parity claims.
 - Benchmark report is planned in the launch content track.
 
-## Benchmark Snapshot (Real Run)
+## Benchmark Results
 
-Artifact:
-- `ubuntu:22.04` saved tar (`benchmark-artifacts/ubuntu-22.04.tar`, ~69MB)
+Environment: macOS (darwin/amd64), `scanrook 1.3.1`, `trivy 0.69.1`, `grype 0.109.0`
 
-Environment:
-- macOS (darwin/amd64)
-- `scanrook 1.3.2`
-- `trivy 0.69.1`
-- `grype 0.109.0`
+### Full Matrix (warm-cache)
 
-Results (warm-cache local run):
+| Image | Size | ScanRook | Trivy | Grype |
+|---|---:|---:|---:|---:|
+| **ubuntu:22.04** | 69 MB | 15.2s / 29 findings | 0.2s / 28 | 1.1s / 34 |
+| **debian:12** | 137 MB | 1.7s / 18 findings | 0.7s / 92 | 1.2s / 86 |
+| **alpine:3.20** | 8.7 MB | 5.1s / 0 findings | 0.2s / 0 | 1.1s / 4 |
+| **rockylinux:9** | 189 MB | 1.1s / 0 findings | 2.6s / 176 | 2.0s / 539 |
+| **node:22-slim** | 240 MB | 1.2s / 18 findings | 0.8s / 109 | 3.8s / 103 |
 
-| Tool | Duration (s) | Total Findings |
-|---|---:|---:|
-| ScanRook | 0.172 | 33 |
-| Trivy | 0.176 | 28 |
-| Grype | 1.056 | 34 |
+### Why ScanRook Reports Fewer Findings
 
-Note:
-- ScanRook now defaults to `~/.scanrook/cache` for repeatable warm-cache performance.
+ScanRook uses an **installed-state-first** approach — it reads actual package manager databases (dpkg, RPM, APK) and only reports vulnerabilities for confirmed installed packages. Other scanners report all advisories matching file paths or heuristics, which includes:
 
-Findings graph (relative count):
+- Unfixed/unpatched advisories (no available fix)
+- Build-time dependencies not present in the final image
+- Disputed or withdrawn CVEs
 
-```text
-ScanRook  33 | ██████████████████████████████
-Trivy     28 | █████████████████████████
-Grype     34 | ███████████████████████████████
-```
+ScanRook's findings include **EPSS scores** and **CISA KEV status** for prioritization — data not provided by Trivy or Grype by default.
 
-Duration graph (seconds):
+Every finding includes a **confidence tier** (`ConfirmedInstalled` or `HeuristicUnverified`) so teams know exactly how the package was detected.
+
+### CVE Overlap (ubuntu:22.04)
 
 ```text
-ScanRook  0.172s | █████
-Trivy     0.176s | █████
-Grype     1.056s | ██████████████████████████████
+ScanRook vs Trivy:  29 ScanRook CVEs, 16 Trivy CVEs (unique), 27 extra in ScanRook, 14 missing
+ScanRook vs Grype:  29 ScanRook CVEs, 18 Grype CVEs (unique), 26 extra in ScanRook, 15 missing
 ```
 
-Data source:
-- [`docs/benchmarks/reports/ubuntu-22.04/summary.csv`](docs/benchmarks/reports/ubuntu-22.04/summary.csv)
-- [`docs/benchmarks/reports/ubuntu-22.04/scanrook.json`](docs/benchmarks/reports/ubuntu-22.04/scanrook.json)
-- [`docs/benchmarks/reports/ubuntu-22.04/trivy.json`](docs/benchmarks/reports/ubuntu-22.04/trivy.json)
-- [`docs/benchmarks/reports/ubuntu-22.04/grype.json`](docs/benchmarks/reports/ubuntu-22.04/grype.json)
-- [`docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json`](docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json)
-- [`docs/benchmarks/reports/ubuntu-22.04/diff-vs-grype.json`](docs/benchmarks/reports/ubuntu-22.04/diff-vs-grype.json)
-
-Reproduce:
+### Reproduce
 
 ```bash
-SCANNER_NVD_ENRICH=0 SCANNER_OSV_ENRICH=0 SCANNER_REDHAT_ENRICH=0 \
-  scanrook benchmark \
+scanrook benchmark \
   --file ./benchmark-artifacts/ubuntu-22.04.tar \
   --out-dir ./docs/benchmarks/reports/ubuntu-22.04 \
   --profile warm
@@ -112,11 +98,7 @@ scanrook diff \
   --out ./docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json
 ```
 
-Cleanup benchmark tools after run:
-
-```bash
-brew uninstall trivy grype
-```
+Full reports: [`docs/benchmarks/reports/`](docs/benchmarks/reports/)
 
 ## Commands
 
@@ -146,14 +128,18 @@ Compatibility note: `scanner` remains as a temporary alias and prints a deprecat
 
 ## Data Sources
 
-Current active vulnerability sources in ScanRook:
+Active vulnerability and enrichment sources:
 
-- OSV API (`osv`)
-- NVD CVE API (`nvd`)
-- Red Hat Security Data API (`redhat`)
-- Optional user-supplied Red Hat OVAL XML (`redhat_oval`)
+- OSV API (`osv`) — 10+ ecosystems including npm, PyPI, Go, Maven, crates.io
+- NVD CVE API (`nvd`) — CVSS scoring and CPE matching
+- Red Hat Security Data API (`redhat`) — RHEL-specific fix information
+- Red Hat OVAL XML (`redhat_oval`) — Optional user-supplied OVAL data
+- EPSS (`epss`) — Exploit prediction scores from FIRST.org
+- CISA KEV (`kev`) — Known Exploited Vulnerabilities catalog
+- Alpine SecDB — Alpine Linux security advisories
+- Ubuntu CVE Tracker, Debian Security Tracker
 
-Roadmap sources are exposed via `scanrook db sources` and currently include Ubuntu CVE Tracker, Debian Security Tracker, and Alpine SecDB.
+Supported container ecosystems: Ubuntu, Debian, Alpine, RHEL, CentOS, Fedora, Rocky Linux, AlmaLinux, Amazon Linux, Oracle Linux, Chainguard, Wolfi
 
 ## Logging
 

@@ -387,6 +387,9 @@ pub fn build_binary_report(
                                 }],
                                 references: Vec::new(),
                                 confidence: Some("MEDIUM".into()),
+                                epss_score: None,
+                                epss_percentile: None,
+                                in_kev: None,
                             });
                         }
                     }
@@ -405,6 +408,10 @@ pub fn build_binary_report(
         crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
         progress_timing("binary.enrich.nvd", nvd_started);
     }
+
+    let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
 
     let mut report = Report {
         scanner,

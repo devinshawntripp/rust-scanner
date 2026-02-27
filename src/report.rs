@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanStatus {
     Complete,
@@ -14,7 +14,7 @@ impl Default for ScanStatus {
     }
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InventoryStatus {
     Complete,
@@ -28,7 +28,7 @@ impl Default for InventoryStatus {
     }
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfidenceTier {
     ConfirmedInstalled,
@@ -41,7 +41,7 @@ impl Default for ConfidenceTier {
     }
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceSource {
     InstalledDb,
@@ -62,7 +62,7 @@ pub struct ScannerInfo {
     pub version: &'static str,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TargetInfo {
     #[serde(rename = "type")]
     pub target_type: String,
@@ -70,33 +70,33 @@ pub struct TargetInfo {
     pub id: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SbomInfo {
     pub format: String,
     pub path: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CvssInfo {
     pub base: f32,
     pub vector: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PackageInfo {
     pub name: String,
     pub ecosystem: String,
     pub version: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReferenceInfo {
     #[serde(rename = "type")]
     pub reference_type: String,
     pub url: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EvidenceItem {
     #[serde(rename = "type")]
     pub evidence_type: String,
@@ -104,7 +104,7 @@ pub struct EvidenceItem {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Finding {
     pub id: String,
     pub source_ids: Vec<String>,
@@ -121,9 +121,15 @@ pub struct Finding {
     pub evidence: Vec<EvidenceItem>,
     pub references: Vec<ReferenceInfo>,
     pub confidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epss_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epss_percentile: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_kev: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileEntry {
     pub path: String,
     pub entry_type: String,
@@ -134,7 +140,7 @@ pub struct FileEntry {
     pub parent_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Summary {
     pub total_findings: usize,
     pub critical: usize,
@@ -268,6 +274,9 @@ mod tests {
             evidence: Vec::new(),
             references: Vec::new(),
             confidence: None,
+            epss_score: None,
+            epss_percentile: None,
+            in_kev: None,
         }
     }
 

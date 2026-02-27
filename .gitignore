@@ -22,6 +22,11 @@ target
 .env
 /.env
 
-devintripp/rust-scanner-worker@sha256:da00c5ea8c802c13ec097e9b16e570f5433c97512d69e0dc55986ab7a36777cf
+# Large binary artifacts
+benchmark-artifacts/*.tar
+benchmark-out/
+dist/
 
-        image: devintripp/deltaguard-ui@sha256:2aba74569c8ea8bcdadb99b896ab9ad0f1315150455b1cc0a6da2ad444206c47
+# Claude Code
+CLAUDE.md
+.claude/

@@ -23,7 +23,13 @@ use walkdir::WalkDir;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
-/// Extracts a tar archive (optionally gzipped) to ./extracted
+/// Maximum decompressed size per tar entry (2 GB) to guard against decompression bombs
+const MAX_ENTRY_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Extracts a tar archive (optionally gzipped) to dest with path-traversal protection.
+///
+/// Each entry's path is validated to stay within `dest`. Symlinks pointing outside
+/// the destination are rejected. Individual entry sizes are capped at MAX_ENTRY_SIZE.
 pub fn extract_tar(tar_path: &str, dest: &Path) -> anyhow::Result<()> {
     let file = File::open(tar_path)?;
     let mut archive: Archive<Box<dyn std::io::Read>> =
@@ -37,11 +43,95 @@ pub fn extract_tar(tar_path: &str, dest: &Path) -> anyhow::Result<()> {
         } else {
             Archive::new(Box::new(file))
         };
-    archive.unpack(dest)?;
+
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let raw_path = entry.path()?.to_path_buf();
+
+        // Reject entries with absolute paths or path-traversal components
+        if raw_path.is_absolute() {
+            anyhow::bail!(
+                "tar entry has absolute path (potential path traversal): {}",
+                raw_path.display()
+            );
+        }
+        for component in raw_path.components() {
+            if let std::path::Component::ParentDir = component {
+                anyhow::bail!(
+                    "tar entry contains '..' (potential path traversal): {}",
+                    raw_path.display()
+                );
+            }
+        }
+
+        let target = dest.join(&raw_path);
+        // After joining, canonicalize parent to verify it's within dest
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let canonical_target = target
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p.join(target.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| target.clone());
+        if !canonical_target.starts_with(&canonical_dest) {
+            anyhow::bail!(
+                "tar entry escapes destination directory (path traversal): {}",
+                raw_path.display()
+            );
+        }
+
+        // Reject symlinks that point outside the destination
+        if entry.header().entry_type().is_symlink() {
+            if let Ok(link_target) = entry.link_name() {
+                if let Some(link_path) = link_target.as_ref() {
+                    let resolved = if link_path.is_absolute() {
+                        link_path.to_path_buf()
+                    } else {
+                        canonical_target
+                            .parent()
+                            .unwrap_or(&canonical_dest)
+                            .join(link_path)
+                    };
+                    // Normalize the resolved path by stripping .. components
+                    let mut normalized = PathBuf::new();
+                    for comp in resolved.components() {
+                        match comp {
+                            std::path::Component::ParentDir => {
+                                normalized.pop();
+                            }
+                            std::path::Component::CurDir => {}
+                            other => normalized.push(other),
+                        }
+                    }
+                    if !normalized.starts_with(&canonical_dest) {
+                        anyhow::bail!(
+                            "tar symlink escapes destination directory: {} -> {}",
+                            raw_path.display(),
+                            link_path.display()
+                        );
+                    }
+                }
+            }
+        }
+
+        // Guard against decompression bombs
+        if entry.header().size()? > MAX_ENTRY_SIZE {
+            anyhow::bail!(
+                "tar entry exceeds maximum allowed size ({} bytes): {}",
+                MAX_ENTRY_SIZE,
+                raw_path.display()
+            );
+        }
+
+        entry.unpack(&target)?;
+    }
     Ok(())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct PackageCoordinate {
     pub ecosystem: String,
     pub name: String,
@@ -113,7 +203,10 @@ fn file_tree_limit() -> usize {
 
 fn collect_file_tree_if_enabled(root: &Path) -> Vec<crate::report::FileEntry> {
     if !include_file_tree() {
-        progress("files.collect.skip", "disabled by SCANNER_INCLUDE_FILE_TREE");
+        progress(
+            "files.collect.skip",
+            "disabled by SCANNER_INCLUDE_FILE_TREE",
+        );
         return Vec::new();
     }
     let started = std::time::Instant::now();
@@ -479,6 +572,10 @@ pub fn scan_container(
             }
             let (scan_status, inventory_status, inventory_reason) =
                 report_state_for_inventory(packages.len(), &mode, heuristic_used);
+            let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+            crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+            crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+
             let mut report = Report {
                 scanner,
                 target,
@@ -797,6 +894,9 @@ pub fn build_container_report(
                                         }],
                                         references: Vec::new(),
                                         confidence: Some("MEDIUM".into()),
+                                        epss_score: None,
+                                        epss_percentile: None,
+                                        in_kev: None,
                                     });
                                         heuristic_used = true;
                                     }
@@ -837,6 +937,10 @@ pub fn build_container_report(
         progress_timing("container.sbom", sbom_started);
         progress("container.sbom.done", "ok");
     }
+
+    let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
 
     let (scan_status, inventory_status, inventory_reason) =
         report_state_for_inventory(packages.len(), &mode, heuristic_used);
@@ -907,6 +1011,10 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
         crate::vuln::pg_init_schema(c);
     }
     crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
+
+    let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
 
     let mut report = Report {
         scanner,
@@ -1015,6 +1123,10 @@ pub fn scan_source_tarball(
             println!("Findings: {}", findings.len());
         }
         OutputFormat::Json => {
+            let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+            crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
+            crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
+
             let scanner = ScannerInfo {
                 name: "scanrook",
                 version: env!("CARGO_PKG_VERSION"),
@@ -1109,7 +1221,9 @@ fn oci_layer_paths(extracted: &Path) -> anyhow::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn detect_os_packages_from_layers(layer_paths: &[PathBuf]) -> anyhow::Result<Vec<PackageCoordinate>> {
+fn detect_os_packages_from_layers(
+    layer_paths: &[PathBuf],
+) -> anyhow::Result<Vec<PackageCoordinate>> {
     let mut dpkg_status: Option<Vec<u8>> = None;
     let mut apk_installed: Option<Vec<u8>> = None;
 
@@ -1287,11 +1401,12 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
         }
     }
 
-    // Alpine: /lib/apk/db/installed
+    // Alpine / Chainguard / Wolfi: /lib/apk/db/installed
     let apk_db = rootfs.join("lib/apk/db/installed");
     if apk_db.exists() {
+        let apk_eco = detect_apk_ecosystem(rootfs);
         if let Ok(s) = fs::read_to_string(&apk_db) {
-            parse_apk_installed(&s, &mut packages);
+            parse_apk_installed_with_ecosystem(&s, &apk_eco, &mut packages);
         }
     }
 
@@ -1360,11 +1475,17 @@ fn detect_rpm_ecosystem(rootfs: &Path) -> String {
     if hay.contains("alma") {
         return "almalinux".to_string();
     }
+    if id == "amzn" || hay.contains("amazon") {
+        return "amazonlinux".to_string();
+    }
     if hay.contains("opensuse") {
         return "opensuse".to_string();
     }
     if hay.contains("sles") || hay.contains("suse") {
         return "suse".to_string();
+    }
+    if id == "ol" || hay.contains("oracle") {
+        return "oraclelinux".to_string();
     }
     if id == "fedora" {
         return "fedora".to_string();
@@ -1372,9 +1493,40 @@ fn detect_rpm_ecosystem(rootfs: &Path) -> String {
     if id == "centos" {
         return "centos".to_string();
     }
+    if id == "chainguard" || hay.contains("chainguard") {
+        return "chainguard".to_string();
+    }
+    if id == "wolfi" || hay.contains("wolfi") {
+        return "wolfi".to_string();
+    }
 
     // Default all RHEL-like RPM families to Red Hat for OSV queries.
     "redhat".to_string()
+}
+
+fn detect_apk_ecosystem(rootfs: &Path) -> String {
+    let os_release = rootfs.join("etc/os-release");
+    let content = match fs::read_to_string(os_release) {
+        Ok(s) => s,
+        Err(_) => return "apk".to_string(),
+    };
+    let mut id = String::new();
+    let mut like = String::new();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = trim_os_release_value(v).to_lowercase();
+        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
+            like = trim_os_release_value(v).to_lowercase();
+        }
+    }
+    let hay = format!("{} {}", id, like);
+    if id == "chainguard" || hay.contains("chainguard") {
+        return "chainguard".to_string();
+    }
+    if id == "wolfi" || hay.contains("wolfi") {
+        return "wolfi".to_string();
+    }
+    "apk".to_string()
 }
 
 fn trim_os_release_value(v: &str) -> String {
@@ -1428,6 +1580,14 @@ fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
 }
 
 fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
+    parse_apk_installed_with_ecosystem(contents, "apk", out);
+}
+
+fn parse_apk_installed_with_ecosystem(
+    contents: &str,
+    ecosystem: &str,
+    out: &mut Vec<PackageCoordinate>,
+) {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     for line in contents.lines() {
@@ -1438,7 +1598,7 @@ fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
         } else if line.is_empty() {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
                 out.push(PackageCoordinate {
-                    ecosystem: "apk".into(),
+                    ecosystem: ecosystem.into(),
                     name: n,
                     version: v,
                 });
@@ -1447,7 +1607,7 @@ fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
     }
     if let (Some(n), Some(v)) = (name.take(), version.take()) {
         out.push(PackageCoordinate {
-            ecosystem: "apk".into(),
+            ecosystem: ecosystem.into(),
             name: n,
             version: v,
         });
