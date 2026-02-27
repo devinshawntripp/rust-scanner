@@ -1,0 +1,95 @@
+name: "ScanRook Scan"
+description: "Install ScanRook and scan a local artifact (tar/iso/bin) in CI."
+author: "ScanRook"
+branding:
+  icon: "shield"
+  color: "green"
+inputs:
+  artifact_path:
+    description: "Path to artifact to scan."
+    required: true
+  mode:
+    description: "Scan mode: light or deep."
+    required: false
+    default: "deep"
+  format:
+    description: "Output format: json or text."
+    required: false
+    default: "json"
+  out_file:
+    description: "Report file path when format=json."
+    required: false
+    default: "scanrook-report.json"
+  refs:
+    description: "Enable reference/enrichment output (true|false)."
+    required: false
+    default: "true"
+  version:
+    description: "Release version to install. Use latest by default."
+    required: false
+    default: "latest"
+  api_base:
+    description: "Optional ScanRook API base URL."
+    required: false
+    default: "https://scanrook.io"
+  api_key:
+    description: "Optional ScanRook API key for cloud enrichment."
+    required: false
+    default: ""
+outputs:
+  report_path:
+    description: "Path to generated report when format=json."
+    value: ${{ steps.scan.outputs.report_path }}
+runs:
+  using: "composite"
+  steps:
+    - name: Install ScanRook CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        export SCANROOK_VERSION="${{ inputs.version }}"
+        curl -fsSL https://scanrook.sh/install | bash
+        scanrook --version
+
+    - name: Execute scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_ARTIFACT: ${{ inputs.artifact_path }}
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_FORMAT: ${{ inputs.format }}
+        INPUT_OUT: ${{ inputs.out_file }}
+        INPUT_REFS: ${{ inputs.refs }}
+        INPUT_API_BASE: ${{ inputs.api_base }}
+        INPUT_API_KEY: ${{ inputs.api_key }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! -f "${INPUT_ARTIFACT}" ]]; then
+          echo "artifact_path not found: ${INPUT_ARTIFACT}" >&2
+          exit 1
+        fi
+
+        cmd=(scanrook)
+        if [[ -n "${INPUT_API_BASE}" ]]; then
+          cmd+=(--api-base "${INPUT_API_BASE}")
+        fi
+        if [[ -n "${INPUT_API_KEY}" ]]; then
+          cmd+=(--api-key "${INPUT_API_KEY}")
+        fi
+        cmd+=(scan --file "${INPUT_ARTIFACT}" --mode "${INPUT_MODE}" --format "${INPUT_FORMAT}")
+
+        if [[ "${INPUT_FORMAT}" == "json" ]]; then
+          cmd+=(--out "${INPUT_OUT}")
+        fi
+        if [[ "${INPUT_REFS}" == "true" ]]; then
+          cmd+=(--refs)
+        fi
+
+        "${cmd[@]}"
+
+        if [[ "${INPUT_FORMAT}" == "json" ]]; then
+          echo "report_path=${INPUT_OUT}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "report_path=" >> "${GITHUB_OUTPUT}"
+        fi

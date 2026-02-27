@@ -1,0 +1,52 @@
+name: scanrook-action-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_path:
+        description: "Path to artifact in repo or workspace"
+        required: false
+        default: "sample.tar"
+  pull_request:
+    paths:
+      - "action.yml"
+      - ".github/workflows/scanrook-action-smoke.yml"
+      - "README.md"
+      - "docs/guides/github-actions.md"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "${{ github.event.inputs.artifact_path || '' }}" ]]; then
+            echo "path=${{ github.event.inputs.artifact_path }}" >> "$GITHUB_OUTPUT"
+          else
+            # Small fallback fixture for smoke execution.
+            tar -cf sample.tar Cargo.toml README.md
+            echo "path=sample.tar" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run ScanRook action
+        id: scan
+        uses: ./
+        with:
+          artifact_path: ${{ steps.artifact.outputs.path }}
+          mode: deep
+          format: json
+          out_file: scanrook-report.json
+          refs: true
+
+      - name: Upload report artifact
+        if: ${{ steps.scan.outputs.report_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanrook-report
+          path: ${{ steps.scan.outputs.report_path }}
