@@ -124,7 +124,12 @@ brew uninstall trivy grype
 scanrook scan --file ./image.tar --format json --out report.json
 scanrook benchmark --file ./image.tar --out-dir ./benchmark-out --profile warm
 scanrook diff --ours ./scanrook.json --against ./trivy.json --out ./diff.json
+scanrook db sources
 scanrook db status
+scanrook db check
+scanrook db update --source all
+scanrook db update --source nvd --cve CVE-2021-25219
+scanrook db update --source redhat --cve CVE-2021-25219 --errata RHSA-2022:8162
 scanrook db clear
 scanrook db download --file ./image.tar --mode deep
 scanrook db warm --file ./image.tar --mode deep
@@ -136,6 +141,17 @@ scanrook config set telemetry.opt_in true
 ```
 
 Compatibility note: `scanner` remains as a temporary alias and prints a deprecation warning.
+
+## Data Sources
+
+Current active vulnerability sources in ScanRook:
+
+- OSV API (`osv`)
+- NVD CVE API (`nvd`)
+- Red Hat Security Data API (`redhat`)
+- Optional user-supplied Red Hat OVAL XML (`redhat_oval`)
+
+Roadmap sources are exposed via `scanrook db sources` and currently include Ubuntu CVE Tracker, Debian Security Tracker, and Alpine SecDB.
 
 ## Release Artifacts
 
