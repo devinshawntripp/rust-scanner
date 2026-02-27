@@ -51,6 +51,43 @@ Notes:
 - This table is positioning-level and should be backed by benchmarks for strict feature parity claims.
 - Benchmark report is planned in the launch content track.
 
+## Benchmark Snapshot (Real Run)
+
+Artifact:
+- `ubuntu:22.04` saved tar (`benchmark-artifacts/ubuntu-22.04.tar`, ~69MB)
+
+Environment:
+- macOS (darwin/amd64)
+- `scanrook 1.3.1`
+- `trivy 0.69.1`
+- `grype 0.109.0`
+
+Results (single run, local):
+
+| Tool | Duration (s) | Total Findings |
+|---|---:|---:|
+| ScanRook | 4 | 29 |
+| Trivy | 1 | 28 |
+| Grype | 1 | 34 |
+
+Data source:
+- `benchmark-out/summary.csv`
+- `benchmark-out/scanrook.json`
+- `benchmark-out/trivy.json`
+- `benchmark-out/grype.json`
+
+Reproduce:
+
+```bash
+./scripts/benchmark-compare.sh ./benchmark-artifacts/ubuntu-22.04.tar ./benchmark-out
+```
+
+Cleanup benchmark tools after run:
+
+```bash
+brew uninstall trivy grype
+```
+
 ## Commands
 
 ```bash
@@ -110,10 +147,9 @@ jobs:
 ## Benchmarks and Launch Docs
 
 - Benchmark methodology + reproducibility: `docs/benchmarks/README.md`
-- Distribution/launch playbook: `docs/marketing/launch-pack.md`
-- Launch post draft: `docs/marketing/launch-blog-draft.md`
 - Package manager publishing runbook: `docs/distribution/package-managers.md`
 - Local comparison helper script: `scripts/benchmark-compare.sh`
+- Public launch post: [https://scanrook.io/blog/why-we-built-scanrook](https://scanrook.io/blog/why-we-built-scanrook)
 
 ## Cloud Enrichment Limits
 
