@@ -70,6 +70,22 @@ Results (single run, local):
 | Trivy | 1 | 28 |
 | Grype | 1 | 34 |
 
+Findings graph (relative count):
+
+```text
+ScanRook  29 | ██████████████████████████
+Trivy     28 | █████████████████████████
+Grype     34 | ███████████████████████████████
+```
+
+Duration graph (seconds):
+
+```text
+ScanRook   4s | ████
+Trivy      1s | █
+Grype      1s | █
+```
+
 Data source:
 - `benchmark-out/summary.csv`
 - `benchmark-out/scanrook.json`
