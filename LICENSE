@@ -1,21 +1,20 @@
-MIT License
+ScanRook Source-Available License (Provisional)
 
-Copyright (c) 2025 devinshawntripp
+Copyright (c) 2026 Devin Tripp
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This license is a provisional source-available grant intended for beta and evaluation usage.
+It should be reviewed by legal counsel before public GA.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+You may:
+1. Use, run, and evaluate the software internally.
+2. Modify the software for internal use.
+3. Share patches with the project owner.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+You may not:
+1. Offer the software as a hosted or managed commercial service.
+2. Resell, sublicense, or redistribute the software as a competing scanner/platform.
+3. Remove or alter attribution and license notices.
+
+The software is provided "AS IS", without warranty of any kind.
+
+This file is a stopgap to match current product policy and must be replaced with finalized legal terms before public launch.
