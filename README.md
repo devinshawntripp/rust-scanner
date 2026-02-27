@@ -66,9 +66,9 @@ Results (warm-cache local run):
 
 | Tool | Duration (s) | Total Findings |
 |---|---:|---:|
-| ScanRook | 0.510 | 29 |
-| Trivy | 0.524 | 28 |
-| Grype | 1.133 | 34 |
+| ScanRook | 0.172 | 33 |
+| Trivy | 0.176 | 28 |
+| Grype | 1.056 | 34 |
 
 Note:
 - ScanRook now defaults to `~/.scanrook/cache` for repeatable warm-cache performance.
@@ -76,7 +76,7 @@ Note:
 Findings graph (relative count):
 
 ```text
-ScanRook  29 | ██████████████████████████
+ScanRook  33 | ██████████████████████████████
 Trivy     28 | █████████████████████████
 Grype     34 | ███████████████████████████████
 ```
@@ -84,21 +84,32 @@ Grype     34 | █████████████████████�
 Duration graph (seconds):
 
 ```text
-ScanRook  0.510s | ██████████
-Trivy     0.524s | ██████████
-Grype     1.133s | ███████████████████████
+ScanRook  0.172s | █████
+Trivy     0.176s | █████
+Grype     1.056s | ██████████████████████████████
 ```
 
 Data source:
-- `benchmark-out/summary.csv`
-- `benchmark-out/scanrook.json`
-- `benchmark-out/trivy.json`
-- `benchmark-out/grype.json`
+- [`docs/benchmarks/reports/ubuntu-22.04/summary.csv`](docs/benchmarks/reports/ubuntu-22.04/summary.csv)
+- [`docs/benchmarks/reports/ubuntu-22.04/scanrook.json`](docs/benchmarks/reports/ubuntu-22.04/scanrook.json)
+- [`docs/benchmarks/reports/ubuntu-22.04/trivy.json`](docs/benchmarks/reports/ubuntu-22.04/trivy.json)
+- [`docs/benchmarks/reports/ubuntu-22.04/grype.json`](docs/benchmarks/reports/ubuntu-22.04/grype.json)
+- [`docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json`](docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json)
+- [`docs/benchmarks/reports/ubuntu-22.04/diff-vs-grype.json`](docs/benchmarks/reports/ubuntu-22.04/diff-vs-grype.json)
 
 Reproduce:
 
 ```bash
-SCANROOK_BIN=./target/release/scanner ./scripts/benchmark-compare.sh ./benchmark-artifacts/ubuntu-22.04.tar ./benchmark-out
+SCANNER_NVD_ENRICH=0 SCANNER_OSV_ENRICH=0 SCANNER_REDHAT_ENRICH=0 \
+  scanrook benchmark \
+  --file ./benchmark-artifacts/ubuntu-22.04.tar \
+  --out-dir ./docs/benchmarks/reports/ubuntu-22.04 \
+  --profile warm
+
+scanrook diff \
+  --ours ./docs/benchmarks/reports/ubuntu-22.04/scanrook.json \
+  --against ./docs/benchmarks/reports/ubuntu-22.04/trivy.json \
+  --out ./docs/benchmarks/reports/ubuntu-22.04/diff-vs-trivy.json
 ```
 
 Cleanup benchmark tools after run:
@@ -111,6 +122,12 @@ brew uninstall trivy grype
 
 ```bash
 scanrook scan --file ./image.tar --format json --out report.json
+scanrook benchmark --file ./image.tar --out-dir ./benchmark-out --profile warm
+scanrook diff --ours ./scanrook.json --against ./trivy.json --out ./diff.json
+scanrook db status
+scanrook db clear
+scanrook db download --file ./image.tar --mode deep
+scanrook db warm --file ./image.tar --mode deep
 scanrook auth login --api-key <API_KEY>
 scanrook auth logout
 scanrook whoami

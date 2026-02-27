@@ -11,9 +11,13 @@ mod vuln;
 
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::process::Command;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "scanrook", version = env!("CARGO_PKG_VERSION"))]
@@ -54,6 +58,13 @@ pub enum OutputFormat {
 pub enum ScanMode {
     Light,
     Deep,
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+pub enum BenchmarkProfile {
+    Warm,
+    Cold,
+    NoCache,
 }
 
 #[derive(Subcommand)]
@@ -165,6 +176,35 @@ enum Commands {
         #[command(subcommand)]
         command: ConfigCommands,
     },
+    /// Benchmark ScanRook vs Trivy/Grype on the same artifact
+    Benchmark {
+        /// Artifact path (tar/iso/bin)
+        #[arg(short, long)]
+        file: String,
+        /// Output directory for summary.csv and tool JSON outputs
+        #[arg(long, default_value = "benchmark-out")]
+        out_dir: String,
+        /// Benchmark profile: warm, cold, no-cache
+        #[arg(long, value_enum, default_value_t = BenchmarkProfile::Warm)]
+        profile: BenchmarkProfile,
+    },
+    /// Diff CVE IDs between ScanRook output and another scanner JSON
+    Diff {
+        /// ScanRook report JSON path
+        #[arg(long)]
+        ours: String,
+        /// Other report JSON path (Trivy/Grype/ScanRook)
+        #[arg(long)]
+        against: String,
+        /// Optional JSON output path for full diff details
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Manage local vulnerability cache
+    Db {
+        #[command(subcommand)]
+        command: DbCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,9 +223,32 @@ enum AuthCommands {
 #[derive(Subcommand)]
 enum ConfigCommands {
     /// Set config values. Example: scanrook config set telemetry.opt_in true
-    Set {
-        key: String,
-        value: String,
+    Set { key: String, value: String },
+}
+
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Show local cache path and size
+    Status,
+    /// Remove local cache contents
+    Clear,
+    /// Download and pre-warm local vulnerability DB/cache for an artifact
+    Download {
+        /// Artifact path to prefetch advisories for
+        #[arg(short, long)]
+        file: String,
+        /// Scan mode used during prefetch
+        #[arg(long, value_enum, default_value_t = ScanMode::Deep)]
+        mode: ScanMode,
+    },
+    /// Pre-warm local cache by scanning an artifact
+    Warm {
+        /// Artifact path to prefetch advisories for
+        #[arg(short, long)]
+        file: String,
+        /// Scan mode used during warm-up
+        #[arg(long, value_enum, default_value_t = ScanMode::Deep)]
+        mode: ScanMode,
     },
 }
 
@@ -264,56 +327,20 @@ fn main() {
             }
 
             progress("scan.start", &file);
-            // Smart detection:
-            // - tar-like input: container -> source fallback
-            // - iso-like input: ISO scanner only
-            // - non-tar, non-iso input: binary
-            let tar_like = looks_like_tar_input(&file);
-            let iso_like = looks_like_iso_input(&file);
-            let oval_redhat = oval_redhat
-                .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-                .filter(|v| !v.trim().is_empty());
-            let mut report_json = None;
-            if tar_like {
-                if let Some(r) = container::build_container_report(
-                    &file,
-                    mode.clone(),
-                    false,
-                    nvd_api_key.clone(),
-                    cli.yara.clone(),
-                    oval_redhat.clone(),
-                ) {
-                    report_json = Some(serde_json::to_value(r).unwrap());
-                } else if let Some(r) = container::build_source_report(&file, nvd_api_key.clone()) {
-                    report_json = Some(serde_json::to_value(r).unwrap());
-                }
-            } else if iso_like {
-                if let Some(r) = iso::build_iso_report(
-                    &file,
-                    mode.clone(),
-                    cli.yara.clone(),
-                    nvd_api_key.clone(),
-                    oval_redhat.clone(),
-                ) {
-                    report_json = Some(serde_json::to_value(r).unwrap());
-                }
-            } else if let Some(r) = binary::build_binary_report(
+            let report_json = build_scan_report_value(
                 &file,
                 mode.clone(),
                 cli.yara.clone(),
                 nvd_api_key.clone(),
-            ) {
-                report_json = Some(serde_json::to_value(r).unwrap());
-            }
+                oval_redhat
+                    .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+                    .filter(|v| !v.trim().is_empty()),
+            );
 
             if let Some(mut v) = report_json {
                 if !refs {
                     // Strip references array from each finding when refs flag not set
-                    if let Some(arr) = v.get_mut("findings").and_then(|f| f.as_array_mut()) {
-                        for f in arr.iter_mut() {
-                            f.as_object_mut().map(|o| o.remove("references"));
-                        }
-                    }
+                    strip_references_in_findings(&mut v);
                 }
                 let text = if matches!(format, OutputFormat::Json) {
                     serde_json::to_string_pretty(&v).unwrap()
@@ -386,7 +413,10 @@ fn main() {
         }
         Commands::Auth { command } => match command {
             AuthCommands::Login { api_key, api_base } => {
-                if let Err(e) = usercli::login(api_base.or(cli.api_base.clone()), api_key.or(cli.api_key.clone())) {
+                if let Err(e) = usercli::login(
+                    api_base.or(cli.api_base.clone()),
+                    api_key.or(cli.api_key.clone()),
+                ) {
                     eprintln!("login failed: {}", e);
                     std::process::exit(1);
                 }
@@ -418,7 +448,470 @@ fn main() {
                 }
             }
         },
+        Commands::Benchmark {
+            file,
+            out_dir,
+            profile,
+        } => {
+            if let Err(e) = run_benchmark(&file, &out_dir, profile) {
+                eprintln!("benchmark failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Diff { ours, against, out } => {
+            if let Err(e) = run_diff(&ours, &against, out.as_deref()) {
+                eprintln!("diff failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Db { command } => {
+            if let Err(e) = run_db(command, cli.yara.clone(), nvd_api_key.clone()) {
+                eprintln!("db command failed: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn strip_references_in_findings(v: &mut Value) {
+    if let Some(arr) = v.get_mut("findings").and_then(|f| f.as_array_mut()) {
+        for f in arr.iter_mut() {
+            f.as_object_mut().map(|o| o.remove("references"));
+        }
+    }
+}
+
+fn build_scan_report_value(
+    file: &str,
+    mode: ScanMode,
+    yara: Option<String>,
+    nvd_api_key: Option<String>,
+    oval_redhat: Option<String>,
+) -> Option<Value> {
+    let tar_like = looks_like_tar_input(file);
+    let iso_like = looks_like_iso_input(file);
+    if tar_like {
+        if let Some(r) = container::build_container_report(
+            file,
+            mode.clone(),
+            false,
+            nvd_api_key.clone(),
+            yara.clone(),
+            oval_redhat.clone(),
+        ) {
+            return serde_json::to_value(r).ok();
+        }
+        if let Some(r) = container::build_source_report(file, nvd_api_key) {
+            return serde_json::to_value(r).ok();
+        }
+        return None;
+    }
+    if iso_like {
+        if let Some(r) = iso::build_iso_report(file, mode, yara, nvd_api_key, oval_redhat) {
+            return serde_json::to_value(r).ok();
+        }
+        return None;
+    }
+    binary::build_binary_report(file, mode, yara, nvd_api_key)
+        .and_then(|r| serde_json::to_value(r).ok())
+}
+
+fn resolve_cache_dir() -> PathBuf {
+    if let Ok(v) = std::env::var("SCANNER_CACHE") {
+        return PathBuf::from(v);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".scanrook").join("cache");
+    }
+    PathBuf::from(".scanrook-cache")
+}
+
+fn clear_scanrook_cache() -> anyhow::Result<()> {
+    let dir = resolve_cache_dir();
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(())
+}
+
+fn clear_trivy_cache() {
+    let _ = Command::new("trivy").arg("clean").arg("--all").status();
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_dir_all(PathBuf::from(&home).join(".cache").join("trivy"));
+        let _ = std::fs::remove_dir_all(
+            PathBuf::from(&home)
+                .join("Library")
+                .join("Caches")
+                .join("trivy"),
+        );
+    }
+}
+
+fn clear_grype_cache() {
+    if let Some(home) = std::env::var_os("HOME") {
+        let _ = std::fs::remove_dir_all(PathBuf::from(&home).join(".cache").join("grype"));
+        let _ = std::fs::remove_dir_all(
+            PathBuf::from(&home)
+                .join("Library")
+                .join("Caches")
+                .join("grype"),
+        );
+    }
+}
+
+fn run_db(
+    command: DbCommands,
+    yara: Option<String>,
+    nvd_api_key: Option<String>,
+) -> anyhow::Result<()> {
+    match command {
+        DbCommands::Status => {
+            let dir = resolve_cache_dir();
+            let mut files = 0usize;
+            let mut bytes = 0u64;
+            if dir.exists() {
+                for e in walkdir::WalkDir::new(&dir)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    if e.file_type().is_file() {
+                        files += 1;
+                        if let Ok(m) = e.metadata() {
+                            bytes += m.len();
+                        }
+                    }
+                }
+            }
+            println!("cache_dir={}", dir.display());
+            println!("entries={}", files);
+            println!("bytes={}", bytes);
+        }
+        DbCommands::Clear => {
+            clear_scanrook_cache()?;
+            println!("cache_cleared path={}", resolve_cache_dir().display());
+        }
+        DbCommands::Download { file, mode } | DbCommands::Warm { file, mode } => {
+            std::env::remove_var("SCANNER_SKIP_CACHE");
+            let started = Instant::now();
+            let report = build_scan_report_value(&file, mode, yara, nvd_api_key, None)
+                .ok_or_else(|| anyhow::anyhow!("scan warm-up failed to produce report"))?;
+            let findings = report
+                .get("findings")
+                .and_then(|f| f.as_array())
+                .map(|v| v.len())
+                .unwrap_or(0);
+            println!(
+                "cache_warm_done file={} findings={} elapsed_ms={}",
+                file,
+                findings,
+                started.elapsed().as_millis()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_benchmark(file: &str, out_dir: &str, profile: BenchmarkProfile) -> anyhow::Result<()> {
+    let out_dir = PathBuf::from(out_dir);
+    std::fs::create_dir_all(&out_dir)?;
+
+    if matches!(profile, BenchmarkProfile::Cold) {
+        clear_scanrook_cache()?;
+        clear_trivy_cache();
+        clear_grype_cache();
+    }
+
+    let sr_out = out_dir.join("scanrook.json");
+    let tr_out = out_dir.join("trivy.json");
+    let gr_out = out_dir.join("grype.json");
+
+    let mut rows: Vec<(String, f64, usize, String)> = Vec::new();
+
+    // ScanRook
+    let sr_started = Instant::now();
+    let prev_skip = std::env::var("SCANNER_SKIP_CACHE").ok();
+    if matches!(profile, BenchmarkProfile::NoCache) {
+        std::env::set_var("SCANNER_SKIP_CACHE", "1");
+    } else {
+        std::env::remove_var("SCANNER_SKIP_CACHE");
+    }
+    let report = build_scan_report_value(file, ScanMode::Deep, None, None, None)
+        .ok_or_else(|| anyhow::anyhow!("scanrook benchmark run failed"))?;
+    std::fs::write(&sr_out, serde_json::to_string_pretty(&report)?)?;
+    match prev_skip {
+        Some(v) => std::env::set_var("SCANNER_SKIP_CACHE", v),
+        None => std::env::remove_var("SCANNER_SKIP_CACHE"),
+    }
+    let sr_secs = sr_started.elapsed().as_secs_f64();
+    let sr_findings = count_scanrook_findings(&sr_out)?;
+    rows.push((
+        "scanrook".to_string(),
+        sr_secs,
+        sr_findings,
+        sr_out.to_string_lossy().to_string(),
+    ));
+
+    // Trivy
+    if command_exists("trivy") {
+        let tr_started = Instant::now();
+        let mut tr_cmd = Command::new("trivy");
+        tr_cmd
+            .arg("image")
+            .arg("--input")
+            .arg(file)
+            .arg("--format")
+            .arg("json")
+            .arg("--output")
+            .arg(tr_out.to_string_lossy().to_string());
+        let temp_cache;
+        if matches!(profile, BenchmarkProfile::NoCache) {
+            temp_cache = tempfile::tempdir()?;
+            tr_cmd.env("TRIVY_CACHE_DIR", temp_cache.path());
+        }
+        let tr_status = tr_cmd.status()?;
+        if tr_status.success() {
+            let tr_secs = tr_started.elapsed().as_secs_f64();
+            let tr_findings = count_trivy_findings(&tr_out)?;
+            rows.push((
+                "trivy".to_string(),
+                tr_secs,
+                tr_findings,
+                tr_out.to_string_lossy().to_string(),
+            ));
+        }
+    } else {
+        eprintln!("trivy not found on PATH; skipping");
+    }
+
+    // Grype
+    if command_exists("grype") {
+        let gr_started = Instant::now();
+        let output = {
+            let mut gr_cmd = Command::new("grype");
+            gr_cmd.arg(file).arg("-o").arg("json");
+            let temp_cache;
+            if matches!(profile, BenchmarkProfile::NoCache) {
+                temp_cache = tempfile::tempdir()?;
+                gr_cmd.env("GRYPE_DB_CACHE_DIR", temp_cache.path());
+            }
+            gr_cmd.output()?
+        };
+        if output.status.success() {
+            std::fs::write(&gr_out, &output.stdout)?;
+            let gr_secs = gr_started.elapsed().as_secs_f64();
+            let gr_findings = count_grype_findings(&gr_out)?;
+            rows.push((
+                "grype".to_string(),
+                gr_secs,
+                gr_findings,
+                gr_out.to_string_lossy().to_string(),
+            ));
+        }
+    } else {
+        eprintln!("grype not found on PATH; skipping");
+    }
+
+    let summary = out_dir.join("summary.csv");
+    let mut csv = String::from("tool,duration_seconds,findings_count,output_path\n");
+    for (tool, secs, count, path) in &rows {
+        csv.push_str(&format!("{},{:.3},{},{}\n", tool, secs, count, path));
+    }
+    std::fs::write(&summary, csv)?;
+
+    println!("benchmark_profile={:?}", profile);
+    for (tool, secs, count, path) in &rows {
+        println!(
+            "tool={} duration_seconds={:.3} findings={} output={}",
+            tool, secs, count, path
+        );
+    }
+    println!("summary_csv={}", summary.display());
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ParsedIds {
+    tool: String,
+    ids: BTreeSet<String>,
+    id_packages: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn parse_report_ids(path: &str) -> anyhow::Result<ParsedIds> {
+    let text = std::fs::read_to_string(path)?;
+    let v: Value = serde_json::from_str(&text)?;
+    let mut out = ParsedIds::default();
+
+    if let Some(arr) = v.get("findings").and_then(|x| x.as_array()) {
+        out.tool = "scanrook".to_string();
+        for f in arr {
+            if let Some(id) = f.get("id").and_then(|x| x.as_str()) {
+                if id.starts_with("CVE-") {
+                    out.ids.insert(id.to_string());
+                    if let Some(pkg) = f
+                        .get("package")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|x| x.as_str())
+                    {
+                        out.id_packages
+                            .entry(id.to_string())
+                            .or_default()
+                            .insert(pkg.to_string());
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    if let Some(results) = v.get("Results").and_then(|x| x.as_array()) {
+        out.tool = "trivy".to_string();
+        for r in results {
+            if let Some(vulns) = r.get("Vulnerabilities").and_then(|x| x.as_array()) {
+                for vuln in vulns {
+                    if let Some(id) = vuln.get("VulnerabilityID").and_then(|x| x.as_str()) {
+                        if id.starts_with("CVE-") {
+                            out.ids.insert(id.to_string());
+                            if let Some(pkg) = vuln.get("PkgName").and_then(|x| x.as_str()) {
+                                out.id_packages
+                                    .entry(id.to_string())
+                                    .or_default()
+                                    .insert(pkg.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    if let Some(matches) = v.get("matches").and_then(|x| x.as_array()) {
+        out.tool = "grype".to_string();
+        for m in matches {
+            if let Some(id) = m
+                .get("vulnerability")
+                .and_then(|vv| vv.get("id"))
+                .and_then(|x| x.as_str())
+            {
+                if id.starts_with("CVE-") {
+                    out.ids.insert(id.to_string());
+                    if let Some(pkg) = m
+                        .get("artifact")
+                        .and_then(|a| a.get("name"))
+                        .and_then(|x| x.as_str())
+                    {
+                        out.id_packages
+                            .entry(id.to_string())
+                            .or_default()
+                            .insert(pkg.to_string());
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    Err(anyhow::anyhow!("unsupported report schema: {}", path))
+}
+
+fn run_diff(ours: &str, against: &str, out: Option<&str>) -> anyhow::Result<()> {
+    let ours_ids = parse_report_ids(ours)?;
+    let other_ids = parse_report_ids(against)?;
+
+    let missing: Vec<String> = other_ids.ids.difference(&ours_ids.ids).cloned().collect();
+    let extra: Vec<String> = ours_ids.ids.difference(&other_ids.ids).cloned().collect();
+
+    println!(
+        "ours_tool={} ours_cves={} against_tool={} against_cves={}",
+        ours_ids.tool,
+        ours_ids.ids.len(),
+        other_ids.tool,
+        other_ids.ids.len()
+    );
+    println!("missing_vs_against={}", missing.len());
+    println!("extra_vs_against={}", extra.len());
+
+    println!("missing_sample:");
+    for cve in missing.iter().take(25) {
+        println!("  {}", cve);
+    }
+    println!("extra_sample:");
+    for cve in extra.iter().take(25) {
+        println!("  {}", cve);
+    }
+
+    let mut miss_pkg_freq: BTreeMap<String, usize> = BTreeMap::new();
+    for cve in &missing {
+        if let Some(pkgs) = other_ids.id_packages.get(cve) {
+            for p in pkgs {
+                *miss_pkg_freq.entry(p.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    if !miss_pkg_freq.is_empty() {
+        println!("missing_package_frequency:");
+        let mut ranked: Vec<(String, usize)> = miss_pkg_freq.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (pkg, n) in ranked.into_iter().take(15) {
+            println!("  {} {}", pkg, n);
+        }
+    }
+
+    if let Some(path) = out {
+        let payload = serde_json::json!({
+            "ours_tool": ours_ids.tool,
+            "against_tool": other_ids.tool,
+            "ours_count": ours_ids.ids.len(),
+            "against_count": other_ids.ids.len(),
+            "missing_vs_against": missing,
+            "extra_vs_against": extra,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+    }
+    Ok(())
+}
+
+fn count_scanrook_findings(path: &PathBuf) -> anyhow::Result<usize> {
+    let text = std::fs::read_to_string(path)?;
+    let v: Value = serde_json::from_str(&text)?;
+    Ok(v.get("findings")
+        .and_then(|f| f.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0))
+}
+
+fn count_trivy_findings(path: &PathBuf) -> anyhow::Result<usize> {
+    let text = std::fs::read_to_string(path)?;
+    let v: Value = serde_json::from_str(&text)?;
+    let mut n = 0usize;
+    if let Some(results) = v.get("Results").and_then(|x| x.as_array()) {
+        for r in results {
+            n += r
+                .get("Vulnerabilities")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+        }
+    }
+    Ok(n)
+}
+
+fn count_grype_findings(path: &PathBuf) -> anyhow::Result<usize> {
+    let text = std::fs::read_to_string(path)?;
+    let v: Value = serde_json::from_str(&text)?;
+    Ok(v.get("matches")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0))
+}
+
+fn command_exists(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 fn looks_like_tar_input(path: &str) -> bool {
