@@ -47,6 +47,12 @@ struct Cli {
     /// Write progress events (NDJSON) to a file
     #[arg(long)]
     progress_file: Option<String>,
+    /// Log output format for --progress stderr stream (text uses bracketed Trivy-style)
+    #[arg(long, value_enum, default_value_t = ScannerLogFormat::Text)]
+    log_format: ScannerLogFormat,
+    /// Log verbosity threshold for --progress stderr stream
+    #[arg(long, value_enum, default_value_t = ScannerLogLevel::Info)]
+    log_level: ScannerLogLevel,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -59,6 +65,20 @@ pub enum OutputFormat {
 pub enum ScanMode {
     Light,
     Deep,
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+pub enum ScannerLogFormat {
+    Text,
+    Json,
+}
+
+#[derive(Clone, ValueEnum, Debug)]
+pub enum ScannerLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -317,6 +337,22 @@ fn main() {
     if let Some(p) = &cli.progress_file {
         std::env::set_var("SCANNER_PROGRESS_FILE", p);
     }
+    std::env::set_var(
+        "SCANNER_LOG_FORMAT",
+        match cli.log_format {
+            ScannerLogFormat::Text => "text",
+            ScannerLogFormat::Json => "json",
+        },
+    );
+    std::env::set_var(
+        "SCANNER_LOG_LEVEL",
+        match cli.log_level {
+            ScannerLogLevel::Error => "error",
+            ScannerLogLevel::Warn => "warn",
+            ScannerLogLevel::Info => "info",
+            ScannerLogLevel::Debug => "debug",
+        },
+    );
 
     match cli.command {
         Commands::Scan {

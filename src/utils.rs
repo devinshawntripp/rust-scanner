@@ -13,6 +13,71 @@ use walkdir::WalkDir;
 /// Initialized on first call to `progress()` when SCANNER_PROGRESS_FILE is set.
 static PROGRESS_FILE_HANDLE: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
 
+fn level_rank(level: &str) -> u8 {
+    match level {
+        "error" => 0,
+        "warn" => 1,
+        "info" => 2,
+        "debug" => 3,
+        _ => 2,
+    }
+}
+
+fn configured_level() -> String {
+    std::env::var("SCANNER_LOG_LEVEL")
+        .unwrap_or_else(|_| "info".to_string())
+        .to_lowercase()
+}
+
+fn configured_format() -> String {
+    std::env::var("SCANNER_LOG_FORMAT")
+        .unwrap_or_else(|_| "text".to_string())
+        .to_lowercase()
+}
+
+fn stage_level(stage: &str) -> &'static str {
+    let s = stage.to_lowercase();
+    if s.ends_with(".err") || s.ends_with(".error") {
+        return "error";
+    }
+    if s.ends_with(".warn") || s.contains(".warn.") {
+        return "warn";
+    }
+    if s.ends_with(".timing") {
+        return "debug";
+    }
+    "info"
+}
+
+fn stage_component(stage: &str) -> String {
+    stage
+        .split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("scanner")
+        .to_string()
+}
+
+fn sanitize_detail(detail: &str) -> String {
+    detail
+        .replace('\n', " ")
+        .replace('\r', " ")
+        .trim()
+        .to_string()
+}
+
+fn as_text_line(ts: &str, level: &str, component: &str, stage: &str, detail: &str) -> String {
+    let level_up = level.to_uppercase();
+    if detail.is_empty() {
+        format!("{}\t{}\t[{}]\t{}", ts, level_up, component, stage)
+    } else {
+        format!(
+            "{}\t{}\t[{}]\t{}\t{}",
+            ts, level_up, component, stage, detail
+        )
+    }
+}
+
 /// Compute SHA-256 hash of a file using a streaming reader
 pub fn hash_file_stream(path: &str) -> io::Result<String> {
     let mut file = File::open(path)?;
@@ -89,14 +154,36 @@ pub fn parse_name_version_from_filename(filename: &str) -> Option<(String, Strin
 }
 
 pub fn progress(stage: &str, detail: &str) {
+    let ts = chrono::Local::now().to_rfc3339();
+    let level = stage_level(stage).to_string();
+    let component = stage_component(stage);
+    let event_name = stage.to_string();
+    let detail_clean = sanitize_detail(detail);
     let event = serde_json::json!({
-        "ts": chrono::Utc::now().to_rfc3339(),
+        "ts": ts,
+        "level": level,
+        "component": component,
+        "event": event_name,
         "stage": stage,
-        "detail": detail,
+        "detail": detail_clean,
     });
-    let line = format!("{}\n", event.to_string());
+    let json_line = format!("{}\n", event);
     if std::env::var("SCANNER_PROGRESS_STDERR").ok().as_deref() == Some("1") {
-        let _ = std::io::stderr().write_all(line.as_bytes());
+        let desired = configured_level();
+        if level_rank(stage_level(stage)) <= level_rank(&desired) {
+            if configured_format() == "json" {
+                let _ = std::io::stderr().write_all(json_line.as_bytes());
+            } else {
+                let text_line = as_text_line(
+                    event["ts"].as_str().unwrap_or(""),
+                    event["level"].as_str().unwrap_or("info"),
+                    event["component"].as_str().unwrap_or("scanner"),
+                    event["stage"].as_str().unwrap_or(stage),
+                    event["detail"].as_str().unwrap_or(""),
+                );
+                let _ = std::io::stderr().write_all(format!("{}\n", text_line).as_bytes());
+            }
+        }
     }
     // Use cached file handle to avoid re-opening on every progress event.
     let handle = PROGRESS_FILE_HANDLE.get_or_init(|| {
@@ -109,7 +196,7 @@ pub fn progress(stage: &str, detail: &str) {
     });
     if let Some(mutex) = handle {
         if let Ok(mut writer) = mutex.lock() {
-            let _ = writer.write_all(line.as_bytes());
+            let _ = writer.write_all(json_line.as_bytes());
             let _ = writer.flush();
         }
     }

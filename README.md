@@ -122,6 +122,8 @@ brew uninstall trivy grype
 
 ```bash
 scanrook scan --file ./image.tar --format json --out report.json
+scanrook scan --file ./image.tar --mode deep --progress --log-format text --log-level info
+scanrook scan --file ./image.tar --mode deep --progress --log-format json --log-level debug
 scanrook benchmark --file ./image.tar --out-dir ./benchmark-out --profile warm
 scanrook diff --ours ./scanrook.json --against ./trivy.json --out ./diff.json
 scanrook db sources
@@ -152,6 +154,15 @@ Current active vulnerability sources in ScanRook:
 - Optional user-supplied Red Hat OVAL XML (`redhat_oval`)
 
 Roadmap sources are exposed via `scanrook db sources` and currently include Ubuntu CVE Tracker, Debian Security Tracker, and Alpine SecDB.
+
+## Logging
+
+Progress events are stage-driven and machine-readable (`stage`, `detail`, `ts`) for worker/UI ingestion.
+
+- `--progress` enables stderr log output.
+- `--log-format text|json` controls stderr style.
+- `--log-level error|warn|info|debug` controls stderr verbosity.
+- `--progress-file` always writes NDJSON event lines for workflow consumption.
 
 ## Release Artifacts
 
