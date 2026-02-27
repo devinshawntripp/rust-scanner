@@ -13,6 +13,7 @@ use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "scanrook", version = env!("CARGO_PKG_VERSION"))]
@@ -206,6 +207,12 @@ fn main() {
 
     if let Some(dir) = &cli.cache_dir {
         std::env::set_var("SCANNER_CACHE", dir);
+    } else if std::env::var("SCANNER_CACHE").is_err() {
+        if let Some(home) = std::env::var_os("HOME") {
+            let default_cache = PathBuf::from(home).join(".scanrook").join("cache");
+            let _ = std::fs::create_dir_all(&default_cache);
+            std::env::set_var("SCANNER_CACHE", default_cache);
+        }
     }
     if cli.progress {
         std::env::set_var("SCANNER_PROGRESS_STDERR", "1");

@@ -98,6 +98,33 @@ fn heuristic_fallback_allowed(mode: &ScanMode) -> bool {
     }
 }
 
+fn include_file_tree() -> bool {
+    std::env::var("SCANNER_INCLUDE_FILE_TREE")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn file_tree_limit() -> usize {
+    std::env::var("SCANNER_TREE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000)
+}
+
+fn collect_file_tree_if_enabled(root: &Path) -> Vec<crate::report::FileEntry> {
+    if !include_file_tree() {
+        progress("files.collect.skip", "disabled by SCANNER_INCLUDE_FILE_TREE");
+        return Vec::new();
+    }
+    let started = std::time::Instant::now();
+    let limit = file_tree_limit();
+    progress("files.collect.start", &format!("limit={}", limit));
+    let files = crate::utils::collect_file_tree(root, limit);
+    progress_timing("files.collect", started);
+    progress("files.collect.done", &format!("entries={}", files.len()));
+    files
+}
+
 pub fn scan_container(
     tar_path: &str,
     mode: ScanMode,
@@ -130,54 +157,86 @@ pub fn scan_container(
     progress_timing("container.extract", extract_started);
     progress("container.extract.done", tar_path);
 
+    let needs_full_rootfs = include_file_tree()
+        || sbom
+        || matches!(mode, ScanMode::Deep) && yara_rules.as_deref().is_some();
+
     // Try to merge layers from supported container layouts.
     let manifest_path = tmp.path().join("manifest.json");
     let oci_index_path = tmp.path().join("index.json");
-    let rootfs = if manifest_path.exists() {
-        progress("container.layers.merge.start", "layout=docker-save");
-        match merge_layers_docker_save(tmp.path()) {
-            Ok(p) => {
-                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
-                p
+    let mut rootfs = tmp.path().to_path_buf();
+    let mut packages = Vec::new();
+    if !needs_full_rootfs {
+        let fast_started = std::time::Instant::now();
+        progress("container.packages.detect.fast.start", "");
+        match try_detect_os_packages_from_layout(tmp.path()) {
+            Ok(pkgs) if !pkgs.is_empty() => {
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress(
+                    "container.packages.detect.fast.done",
+                    &format!("packages={}", pkgs.len()),
+                );
+                progress("container.layers.merge.skip", "reason=fast_inventory");
+                packages = pkgs;
+            }
+            Ok(_) => {
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress("container.packages.detect.fast.empty", "");
             }
             Err(e) => {
-                eprintln!("Failed to merge docker-save layers: {}", e);
-                progress("container.layers.merge.error", &format!("{}", e));
-                tmp.path().to_path_buf()
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress("container.packages.detect.fast.error", &format!("{}", e));
             }
         }
-    } else if oci_index_path.exists() {
-        progress("container.layers.merge.start", "layout=oci");
-        match merge_layers_oci_layout(tmp.path()) {
-            Ok(p) => {
-                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
-                p
-            }
-            Err(e) => {
-                eprintln!("Failed to merge OCI layers: {}", e);
-                progress("container.layers.merge.error", &format!("{}", e));
-                tmp.path().to_path_buf()
-            }
-        }
-    } else {
-        progress(
-            "container.layers.merge.skip",
-            &format!("layout=unknown; rootfs={}", tmp.path().display()),
-        );
-        tmp.path().to_path_buf()
-    };
+    }
 
-    progress(
-        "container.packages.detect.start",
-        rootfs.to_string_lossy().as_ref(),
-    );
-    let packages_started = std::time::Instant::now();
-    let packages = detect_os_packages(&rootfs);
-    progress_timing("container.packages.detect", packages_started);
-    progress(
-        "container.packages.detect.done",
-        &format!("packages={}", packages.len()),
-    );
+    if packages.is_empty() {
+        rootfs = if manifest_path.exists() {
+            progress("container.layers.merge.start", "layout=docker-save");
+            match merge_layers_docker_save(tmp.path()) {
+                Ok(p) => {
+                    progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                    p
+                }
+                Err(e) => {
+                    eprintln!("Failed to merge docker-save layers: {}", e);
+                    progress("container.layers.merge.error", &format!("{}", e));
+                    tmp.path().to_path_buf()
+                }
+            }
+        } else if oci_index_path.exists() {
+            progress("container.layers.merge.start", "layout=oci");
+            match merge_layers_oci_layout(tmp.path()) {
+                Ok(p) => {
+                    progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                    p
+                }
+                Err(e) => {
+                    eprintln!("Failed to merge OCI layers: {}", e);
+                    progress("container.layers.merge.error", &format!("{}", e));
+                    tmp.path().to_path_buf()
+                }
+            }
+        } else {
+            progress(
+                "container.layers.merge.skip",
+                &format!("layout=unknown; rootfs={}", tmp.path().display()),
+            );
+            tmp.path().to_path_buf()
+        };
+
+        progress(
+            "container.packages.detect.start",
+            rootfs.to_string_lossy().as_ref(),
+        );
+        let packages_started = std::time::Instant::now();
+        packages = detect_os_packages(&rootfs);
+        progress_timing("container.packages.detect", packages_started);
+        progress(
+            "container.packages.detect.done",
+            &format!("packages={}", packages.len()),
+        );
+    }
 
     // Light mode: only OSV lookups for packages; Deep mode: run YARA too
     progress(
@@ -420,10 +479,6 @@ pub fn scan_container(
             }
             let (scan_status, inventory_status, inventory_reason) =
                 report_state_for_inventory(packages.len(), &mode, heuristic_used);
-            let tree_limit: usize = std::env::var("SCANNER_TREE_MAX_ENTRIES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20_000);
             let mut report = Report {
                 scanner,
                 target,
@@ -432,7 +487,7 @@ pub fn scan_container(
                 inventory_reason,
                 sbom: sbom_info,
                 findings: findings_norm,
-                files: crate::utils::collect_file_tree(&rootfs, tree_limit),
+                files: collect_file_tree_if_enabled(&rootfs),
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);
@@ -468,49 +523,81 @@ pub fn build_container_report(
     let oci_index_path = tmp.path().join("index.json");
     let has_manifest = manifest_path.exists();
     let has_oci_index = oci_index_path.exists();
-    let rootfs = if has_manifest {
-        progress("container.layers.merge.start", "layout=docker-save");
-        match merge_layers_docker_save(tmp.path()) {
-            Ok(p) => {
-                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
-                p
-            }
-            Err(e) => {
-                progress("container.layers.merge.error", &format!("{}", e));
-                tmp.path().to_path_buf()
-            }
-        }
-    } else if has_oci_index {
-        progress("container.layers.merge.start", "layout=oci");
-        match merge_layers_oci_layout(tmp.path()) {
-            Ok(p) => {
-                progress("container.layers.merge.done", p.to_string_lossy().as_ref());
-                p
-            }
-            Err(e) => {
-                progress("container.layers.merge.error", &format!("{}", e));
-                tmp.path().to_path_buf()
-            }
-        }
-    } else {
-        progress(
-            "container.layers.merge.skip",
-            &format!("layout=unknown; rootfs={}", tmp.path().display()),
-        );
-        tmp.path().to_path_buf()
-    };
+    let needs_full_rootfs = include_file_tree()
+        || sbom
+        || matches!(mode, ScanMode::Deep) && yara_rules.as_deref().is_some();
 
-    progress(
-        "container.packages.detect.start",
-        rootfs.to_string_lossy().as_ref(),
-    );
-    let packages_started = std::time::Instant::now();
-    let packages = detect_os_packages(&rootfs);
-    progress_timing("container.packages.detect", packages_started);
-    progress(
-        "container.packages.detect.done",
-        &format!("packages={}", packages.len()),
-    );
+    let mut rootfs = tmp.path().to_path_buf();
+    let mut packages = Vec::new();
+    if !needs_full_rootfs {
+        let fast_started = std::time::Instant::now();
+        progress("container.packages.detect.fast.start", "");
+        match try_detect_os_packages_from_layout(tmp.path()) {
+            Ok(pkgs) if !pkgs.is_empty() => {
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress(
+                    "container.packages.detect.fast.done",
+                    &format!("packages={}", pkgs.len()),
+                );
+                progress("container.layers.merge.skip", "reason=fast_inventory");
+                packages = pkgs;
+            }
+            Ok(_) => {
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress("container.packages.detect.fast.empty", "");
+            }
+            Err(e) => {
+                progress_timing("container.packages.detect.fast", fast_started);
+                progress("container.packages.detect.fast.error", &format!("{}", e));
+            }
+        }
+    }
+
+    if packages.is_empty() {
+        rootfs = if has_manifest {
+            progress("container.layers.merge.start", "layout=docker-save");
+            match merge_layers_docker_save(tmp.path()) {
+                Ok(p) => {
+                    progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                    p
+                }
+                Err(e) => {
+                    progress("container.layers.merge.error", &format!("{}", e));
+                    tmp.path().to_path_buf()
+                }
+            }
+        } else if has_oci_index {
+            progress("container.layers.merge.start", "layout=oci");
+            match merge_layers_oci_layout(tmp.path()) {
+                Ok(p) => {
+                    progress("container.layers.merge.done", p.to_string_lossy().as_ref());
+                    p
+                }
+                Err(e) => {
+                    progress("container.layers.merge.error", &format!("{}", e));
+                    tmp.path().to_path_buf()
+                }
+            }
+        } else {
+            progress(
+                "container.layers.merge.skip",
+                &format!("layout=unknown; rootfs={}", tmp.path().display()),
+            );
+            tmp.path().to_path_buf()
+        };
+
+        progress(
+            "container.packages.detect.start",
+            rootfs.to_string_lossy().as_ref(),
+        );
+        let packages_started = std::time::Instant::now();
+        packages = detect_os_packages(&rootfs);
+        progress_timing("container.packages.detect", packages_started);
+        progress(
+            "container.packages.detect.done",
+            &format!("packages={}", packages.len()),
+        );
+    }
     progress(
         "container.osv.query.start",
         &format!("packages={}", packages.len()),
@@ -753,10 +840,6 @@ pub fn build_container_report(
 
     let (scan_status, inventory_status, inventory_reason) =
         report_state_for_inventory(packages.len(), &mode, heuristic_used);
-    let tree_limit: usize = std::env::var("SCANNER_TREE_MAX_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20_000);
     let mut report = Report {
         scanner,
         target,
@@ -765,7 +848,7 @@ pub fn build_container_report(
         inventory_reason,
         sbom: sbom_info,
         findings: findings_norm,
-        files: crate::utils::collect_file_tree(&rootfs, tree_limit),
+        files: collect_file_tree_if_enabled(&rootfs),
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
@@ -833,7 +916,7 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
         inventory_reason: None,
         sbom: None,
         findings,
-        files: crate::utils::collect_file_tree(tmp.path(), 20_000),
+        files: collect_file_tree_if_enabled(tmp.path()),
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
@@ -949,7 +1032,7 @@ pub fn scan_source_tarball(
                 inventory_reason: None,
                 sbom: None,
                 findings,
-                files: crate::utils::collect_file_tree(tmp.path(), 20_000),
+                files: collect_file_tree_if_enabled(tmp.path()),
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);
@@ -960,8 +1043,22 @@ pub fn scan_source_tarball(
     }
 }
 
-fn merge_layers_docker_save(extracted: &Path) -> anyhow::Result<PathBuf> {
-    // docker save layout: manifest.json + layer tarballs and config
+fn try_detect_os_packages_from_layout(extracted: &Path) -> anyhow::Result<Vec<PackageCoordinate>> {
+    let manifest_path = extracted.join("manifest.json");
+    let oci_index_path = extracted.join("index.json");
+
+    let layer_paths = if manifest_path.exists() {
+        docker_save_layer_paths(extracted)?
+    } else if oci_index_path.exists() {
+        oci_layer_paths(extracted)?
+    } else {
+        return Ok(Vec::new());
+    };
+
+    detect_os_packages_from_layers(&layer_paths)
+}
+
+fn docker_save_layer_paths(extracted: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let manifest_path = extracted.join("manifest.json");
     let mut manifest_str = String::new();
     File::open(&manifest_path)?.read_to_string(&mut manifest_str)?;
@@ -971,22 +1068,17 @@ fn merge_layers_docker_save(extracted: &Path) -> anyhow::Result<PathBuf> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("No Layers"))?;
 
-    let rootfs_dir = extracted.join("rootfs");
-    fs::create_dir_all(&rootfs_dir)?;
-
+    let mut out = Vec::with_capacity(layers.len());
     for layer_rel in layers {
         let layer_rel = layer_rel
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Layer not string"))?;
-        let layer_path = extracted.join(layer_rel);
-        apply_layer_tar(&layer_path, &rootfs_dir)?;
+        out.push(extracted.join(layer_rel));
     }
-
-    Ok(rootfs_dir)
+    Ok(out)
 }
 
-fn merge_layers_oci_layout(extracted: &Path) -> anyhow::Result<PathBuf> {
-    // OCI image layout: index.json -> manifest blob -> layer blobs
+fn oci_layer_paths(extracted: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let index_path = extracted.join("index.json");
     let index_str = fs::read_to_string(&index_path)?;
     let index_json: serde_json::Value = serde_json::from_str(&index_str)?;
@@ -1007,15 +1099,143 @@ fn merge_layers_oci_layout(extracted: &Path) -> anyhow::Result<PathBuf> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("OCI manifest missing layers"))?;
 
-    let rootfs_dir = extracted.join("rootfs");
-    fs::create_dir_all(&rootfs_dir)?;
-
+    let mut out = Vec::with_capacity(layers.len());
     for layer in layers {
         let digest = layer["digest"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("OCI layer missing digest"))?;
-        let layer_path = blob_path_from_digest(extracted, digest)?;
+        out.push(blob_path_from_digest(extracted, digest)?);
+    }
+    Ok(out)
+}
+
+fn detect_os_packages_from_layers(layer_paths: &[PathBuf]) -> anyhow::Result<Vec<PackageCoordinate>> {
+    let mut dpkg_status: Option<Vec<u8>> = None;
+    let mut apk_installed: Option<Vec<u8>> = None;
+
+    for layer_path in layer_paths {
+        apply_layer_file_overrides(layer_path, &mut dpkg_status, &mut apk_installed)?;
+    }
+
+    let mut packages = Vec::new();
+    if let Some(bytes) = dpkg_status {
+        if let Ok(s) = String::from_utf8(bytes) {
+            parse_dpkg_status(&s, &mut packages);
+        }
+    }
+    if let Some(bytes) = apk_installed {
+        if let Ok(s) = String::from_utf8(bytes) {
+            parse_apk_installed(&s, &mut packages);
+        }
+    }
+    Ok(packages)
+}
+
+fn apply_layer_file_overrides(
+    layer_tar: &Path,
+    dpkg_status: &mut Option<Vec<u8>>,
+    apk_installed: &mut Option<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut file = File::open(layer_tar)?;
+    let mut head = [0u8; 3];
+    let n = file.read(&mut head)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    let is_gz = n >= 2 && head[0] == 0x1f && head[1] == 0x8b;
+    let is_bz2 = n >= 3 && head[0] == b'B' && head[1] == b'Z' && head[2] == b'h';
+
+    let mut archive: Archive<Box<dyn Read>> = if is_gz {
+        Archive::new(Box::new(GzDecoder::new(file)))
+    } else if is_bz2 {
+        Archive::new(Box::new(BzDecoder::new(file)))
+    } else {
+        Archive::new(Box::new(file))
+    };
+
+    for entry in archive.entries()? {
+        let mut entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = match entry.path() {
+            Ok(v) => v.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if path.is_empty() {
+            continue;
+        }
+
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let base = std::path::Path::new(&path)
+            .file_name()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // overlayfs whiteout for whole directory content
+        if base == ".wh..wh..opq" {
+            if parent == "var/lib/dpkg" {
+                *dpkg_status = None;
+            }
+            if parent == "lib/apk/db" {
+                *apk_installed = None;
+            }
+            continue;
+        }
+        // overlayfs whiteout for single file
+        if let Some(stripped) = base.strip_prefix(".wh.") {
+            let target = if parent.is_empty() {
+                stripped.to_string()
+            } else {
+                format!("{}/{}", parent, stripped)
+            };
+            if target == "var/lib/dpkg/status" {
+                *dpkg_status = None;
+            } else if target == "lib/apk/db/installed" {
+                *apk_installed = None;
+            }
+            continue;
+        }
+
+        if path == "var/lib/dpkg/status" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            *dpkg_status = Some(buf);
+        } else if path == "lib/apk/db/installed" {
+            let mut buf = Vec::new();
+            entry.read_to_end(&mut buf)?;
+            *apk_installed = Some(buf);
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_layers_docker_save(extracted: &Path) -> anyhow::Result<PathBuf> {
+    // docker save layout: manifest.json + layer tarballs and config
+    let layers = docker_save_layer_paths(extracted)?;
+
+    let rootfs_dir = extracted.join("rootfs");
+    fs::create_dir_all(&rootfs_dir)?;
+
+    for layer_path in layers {
         apply_layer_tar(&layer_path, &rootfs_dir)?;
+    }
+
+    Ok(rootfs_dir)
+}
+
+fn merge_layers_oci_layout(extracted: &Path) -> anyhow::Result<PathBuf> {
+    // OCI image layout: index.json -> manifest blob -> layer blobs
+    let layers = oci_layer_paths(extracted)?;
+
+    let rootfs_dir = extracted.join("rootfs");
+    fs::create_dir_all(&rootfs_dir)?;
+
+    for layer in layers {
+        apply_layer_tar(&layer, &rootfs_dir)?;
     }
 
     Ok(rootfs_dir)

@@ -39,11 +39,24 @@ run_and_record() {
   local outfile="$2"
   shift 2
 
-  local start end elapsed findings
-  start="$(date +%s)"
+  local start_s end_s elapsed findings
+  start_s="$(python3 - <<'PY'
+import time
+print(time.time())
+PY
+)"
   "$@" >/dev/null
-  end="$(date +%s)"
-  elapsed="$((end - start))"
+  end_s="$(python3 - <<'PY'
+import time
+print(time.time())
+PY
+)"
+  elapsed="$(python3 - <<PY
+start = float("${start_s}")
+end = float("${end_s}")
+print(f"{(end - start):.3f}")
+PY
+)"
 
   case "${tool}" in
     scanrook)

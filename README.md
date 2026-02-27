@@ -58,17 +58,20 @@ Artifact:
 
 Environment:
 - macOS (darwin/amd64)
-- `scanrook 1.3.1`
+- `scanrook 1.3.2`
 - `trivy 0.69.1`
 - `grype 0.109.0`
 
-Results (single run, local):
+Results (warm-cache local run):
 
 | Tool | Duration (s) | Total Findings |
 |---|---:|---:|
-| ScanRook | 4 | 29 |
-| Trivy | 1 | 28 |
-| Grype | 1 | 34 |
+| ScanRook | 0.510 | 29 |
+| Trivy | 0.524 | 28 |
+| Grype | 1.133 | 34 |
+
+Note:
+- ScanRook now defaults to `~/.scanrook/cache` for repeatable warm-cache performance.
 
 Findings graph (relative count):
 
@@ -81,9 +84,9 @@ Grype     34 | █████████████████████�
 Duration graph (seconds):
 
 ```text
-ScanRook   4s | ████
-Trivy      1s | █
-Grype      1s | █
+ScanRook  0.510s | ██████████
+Trivy     0.524s | ██████████
+Grype     1.133s | ███████████████████████
 ```
 
 Data source:
@@ -95,7 +98,7 @@ Data source:
 Reproduce:
 
 ```bash
-./scripts/benchmark-compare.sh ./benchmark-artifacts/ubuntu-22.04.tar ./benchmark-out
+SCANROOK_BIN=./target/release/scanner ./scripts/benchmark-compare.sh ./benchmark-artifacts/ubuntu-22.04.tar ./benchmark-out
 ```
 
 Cleanup benchmark tools after run:

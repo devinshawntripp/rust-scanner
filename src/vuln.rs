@@ -900,9 +900,8 @@ fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Find
     }
     findings.extend(to_append);
 
-    // Deduplicate by id after upgrades
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    findings.retain(|f| seen_ids.insert(f.id.clone()));
+    // Keep one row per (id, package) pair after advisory upgrades.
+    dedupe_findings_by_id_and_package(findings);
 
     // Log upgrade count by counting CVEs that reference this advisory in source_ids
     let upgraded_cve_count = findings
@@ -946,9 +945,7 @@ fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Find
                     }
                 }
                 findings.extend(to_append2);
-                let mut seen_ids2: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                findings.retain(|f| seen_ids2.insert(f.id.clone()));
+                dedupe_findings_by_id_and_package(findings);
                 progress(
                     "osv.debian.map.ok",
                     &format!("{} -> {} CVEs", id, mapped.len()),
@@ -1049,6 +1046,26 @@ fn drop_fixed_findings(findings: &mut Vec<Finding>) -> usize {
     before.saturating_sub(findings.len())
 }
 
+fn osv_fetch_cve_details() -> bool {
+    env_bool("SCANNER_OSV_FETCH_CVE_DETAILS", false)
+}
+
+fn finding_dedupe_key(f: &Finding) -> String {
+    if let Some(pkg) = f.package.as_ref() {
+        format!(
+            "{}|{}|{}|{}",
+            f.id, pkg.ecosystem, pkg.name, pkg.version
+        )
+    } else {
+        format!("{}|||", f.id)
+    }
+}
+
+fn dedupe_findings_by_id_and_package(findings: &mut Vec<Finding>) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    findings.retain(|f| seen.insert(finding_dedupe_key(f)));
+}
+
 /// Enrich findings with details from OSV /v1/vulns/{id} (fills description, severity, references)
 pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
     if !env_bool("SCANNER_OSV_ENRICH", true) {
@@ -1066,7 +1083,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     let mut unique_ids: Vec<String> = unique_ids_set.into_iter().collect();
     unique_ids.sort();
     let client = build_http_client(15);
-    let total = unique_ids.len();
+    let fetch_cve_details = osv_fetch_cve_details();
 
     if let Some(c) = pg.as_mut() {
         pg_init_schema(c);
@@ -1077,7 +1094,12 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     let mut pg_cache_hits: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
     let mut needs_fetch: Vec<String> = Vec::new();
+    let mut skipped_cve_fetch = 0usize;
     for id in &unique_ids {
+        if id.starts_with("CVE-") && !fetch_cve_details {
+            skipped_cve_fetch += 1;
+            continue;
+        }
         let mut pg_hit = false;
         if let Some(client_pg) = pg.as_mut() {
             if let Some((payload, last_checked, last_mod)) = pg_get_osv(client_pg, id) {
@@ -1091,6 +1113,12 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
         if !pg_hit {
             needs_fetch.push(id.clone());
         }
+    }
+    if skipped_cve_fetch > 0 {
+        progress(
+            "osv.enrich.cve_fetch.skip",
+            &format!("count={} reason=SCANNER_OSV_FETCH_CVE_DETAILS=0", skipped_cve_fetch),
+        );
     }
     progress_timing("osv.enrich.pg_cache_lookup", phase_pg_started);
 
@@ -1124,13 +1152,16 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     // Phase 5: Apply payloads to findings sequentially
     // (advisory->CVE upgrades require sequential mutation of the shared findings vec)
     let phase_apply_started = std::time::Instant::now();
-    for (idx, id) in unique_ids.into_iter().enumerate() {
-        progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
+    let ids_to_apply: Vec<String> = unique_ids
+        .into_iter()
+        .filter(|id| all_payloads.contains_key(id))
+        .collect();
+    let total_apply = ids_to_apply.len();
+    for (idx, id) in ids_to_apply.into_iter().enumerate() {
+        progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total_apply, id));
         if let Some(json) = all_payloads.get(&id) {
             osv_apply_payload_to_findings(&id, json, findings);
             progress("osv.fetch.ok", &id);
-        } else {
-            progress("osv.fetch.err", &id);
         }
     }
     progress_timing("osv.enrich.apply", phase_apply_started);
@@ -1145,9 +1176,8 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
         progress("osv.fixed.drop", &format!("count={}", dropped_fixed));
     }
 
-    // Deduplicate by id after any upgrades from advisory -> CVE
-    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    findings.retain(|f| seen_ids.insert(f.id.clone()));
+    // Keep one row per (id, package) pair.
+    dedupe_findings_by_id_and_package(findings);
 
     // Final pass: drop any remaining Debian advisories (DLA/DSA) to drive non-CVE count to zero
     let before_len_final = findings.len();
