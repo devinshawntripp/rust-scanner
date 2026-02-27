@@ -1,7 +1,13 @@
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+fn cache_disabled() -> bool {
+    std::env::var("SCANNER_SKIP_CACHE")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
 
 pub fn cache_key(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
@@ -13,6 +19,9 @@ pub fn cache_key(parts: &[&str]) -> String {
 }
 
 pub fn cache_get(cache_dir: Option<&Path>, key: &str) -> Option<Vec<u8>> {
+    if cache_disabled() {
+        return None;
+    }
     let dir = cache_dir?;
     let path = dir.join(key);
     match fs::File::open(&path) {
@@ -29,6 +38,9 @@ pub fn cache_get(cache_dir: Option<&Path>, key: &str) -> Option<Vec<u8>> {
 }
 
 pub fn cache_put(cache_dir: Option<&Path>, key: &str, data: &[u8]) {
+    if cache_disabled() {
+        return;
+    }
     if let Some(dir) = cache_dir {
         let _ = fs::create_dir_all(dir);
         let path = dir.join(key);

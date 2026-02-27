@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::thread::sleep;
 use std::time::Duration;
@@ -7,14 +7,16 @@ use crate::cache::{cache_get, cache_key, cache_put};
 use crate::container::PackageCoordinate;
 use crate::redhat::{compare_evr, is_rpm_ecosystem};
 use crate::report::{
-    severity_from_score, CvssInfo, EvidenceItem, Finding, PackageInfo, ReferenceInfo,
+    severity_from_score, ConfidenceTier, CvssInfo, EvidenceItem, EvidenceSource, Finding,
+    PackageInfo, ReferenceInfo,
 };
-use crate::utils::progress;
+use crate::utils::{progress, progress_timing};
 use rand::Rng;
 use rayon::prelude::*;
 use reqwest::blocking::{Client, Response};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 // --- Postgres cache ---
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Utc};
@@ -61,13 +63,133 @@ fn parse_cvss_score(score_raw: &str) -> Option<(f32, String)> {
 }
 
 fn build_http_client(timeout_secs: u64) -> Client {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .user_agent(format!("scanrook/{}", env!("CARGO_PKG_VERSION")));
     if scanner_force_ipv4() {
         // Worker pods on many homelab clusters have no usable IPv6 egress.
         // Pin outbound sockets to IPv4 to avoid long OSV/NVD timeouts.
         builder = builder.local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
     builder.build().unwrap()
+}
+
+static NVD_HTTP_CLIENT: OnceLock<Client> = OnceLock::new();
+static REDIS_CLIENT: OnceLock<Option<redis::Client>> = OnceLock::new();
+
+fn nvd_timeout_secs() -> u64 {
+    std::env::var("SCANNER_NVD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
+}
+
+fn nvd_retry_max() -> usize {
+    std::env::var("SCANNER_NVD_RETRY_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+fn nvd_retry_base_ms() -> u64 {
+    std::env::var("SCANNER_NVD_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+}
+
+fn nvd_http_client() -> &'static Client {
+    NVD_HTTP_CLIENT.get_or_init(|| build_http_client(nvd_timeout_secs()))
+}
+
+fn redis_client() -> Option<&'static redis::Client> {
+    REDIS_CLIENT
+        .get_or_init(|| {
+            let url = std::env::var("SCANNER_REDIS_URL")
+                .ok()
+                .or_else(|| std::env::var("REDIS_URL").ok())
+                .unwrap_or_default();
+            if url.trim().is_empty() {
+                return None;
+            }
+            redis::Client::open(url).ok()
+        })
+        .as_ref()
+}
+
+fn nvd_scope_key(api_key: Option<&str>) -> String {
+    if let Some(key) = api_key {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        let full = format!("key:{:x}", digest);
+        return full.chars().take(20).collect();
+    }
+    "anon".to_string()
+}
+
+fn wait_for_global_nvd_rate_slot(api_key: Option<&str>) {
+    let per_minute: i64 = std::env::var("SCANNER_NVD_GLOBAL_RATE_PER_MINUTE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if per_minute <= 0 {
+        return;
+    }
+    let Some(client) = redis_client() else {
+        return;
+    };
+
+    loop {
+        let now = Utc::now();
+        let minute = now.timestamp() / 60;
+        let scope = nvd_scope_key(api_key);
+        let key = format!("scanner:nvd:rate:{}:{}", scope, minute);
+        let mut conn = match client.get_connection() {
+            Ok(c) => c,
+            Err(e) => {
+                progress("nvd.rate.redis.err", &format!("{}", e));
+                return;
+            }
+        };
+
+        let count: i64 = redis::cmd("INCR").arg(&key).query(&mut conn).unwrap_or(1);
+        let _: redis::RedisResult<()> = redis::cmd("EXPIRE").arg(&key).arg(70).query(&mut conn);
+        if count <= per_minute {
+            return;
+        }
+
+        let sec = now.timestamp().rem_euclid(60);
+        let wait_ms = ((60 - sec).max(1) as u64) * 1000;
+        progress(
+            "nvd.rate.wait",
+            &format!(
+                "scope={} count={} limit={} wait_ms={}",
+                scope, count, per_minute, wait_ms
+            ),
+        );
+        sleep(Duration::from_millis(wait_ms));
+    }
+}
+
+fn parse_retry_after_ms(resp: &Response) -> Option<u64> {
+    let value = resp.headers().get("Retry-After")?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    None
+}
+
+fn retry_backoff_with_jitter_ms(attempt: usize) -> u64 {
+    let capped_exp = (attempt.saturating_sub(1)).min(7);
+    let exp = 1u64 << capped_exp;
+    let max_backoff = nvd_retry_base_ms().saturating_mul(exp);
+    if max_backoff == 0 {
+        return 0;
+    }
+    rand::thread_rng().gen_range(0..=max_backoff)
 }
 
 /// Queries the NVD API for a given component + version
@@ -142,14 +264,18 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
     }
 
     // Build per-package queries and remember original indices
-    let mut ecosystem_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ecosystem_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let indexed: Vec<(usize, Value)> = packages.iter().enumerate().map(|(i, p)| {
         let (ecosystem, name, version) = map_ecosystem_name_version(p);
         *ecosystem_counts.entry(ecosystem.clone()).or_insert(0) += 1;
         let q = serde_json::json!({ "package": {"ecosystem": ecosystem, "name": name}, "version": version });
         (i, q)
     }).collect();
-    let mut eco_summary: Vec<String> = ecosystem_counts.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+    let mut eco_summary: Vec<String> = ecosystem_counts
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
     eco_summary.sort();
     progress("osv.query.ecosystems", &eco_summary.join(" "));
 
@@ -249,59 +375,58 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                     } else {
                         // Capture raw body first so we can log it on failure
                         match r.text() {
-                            Ok(text) => {
-                                match serde_json::from_str::<Value>(&text) {
-                                    Ok(v) => {
-                                        if let Some(arr) = v["results"].as_array() {
-                                            for (idx_in_chunk, item) in arr.iter().enumerate() {
-                                                let orig_idx = chunk[idx_in_chunk].0;
-                                                results[orig_idx] = item.clone();
-                                            }
-                                            cache_put(
-                                                std::env::var_os("SCANNER_CACHE")
-                                                    .as_deref()
-                                                    .map(PathBuf::from)
-                                                    .as_deref(),
-                                                &cache_tag,
-                                                v.to_string().as_bytes(),
-                                            );
-                                            progress(
-                                                "osv.query.chunk.done",
-                                                &format!(
-                                                    "offset={} size={} attempts={}",
-                                                    offset,
-                                                    chunk.len(),
-                                                    attempt
-                                                ),
-                                            );
-                                            done = true;
-                                            break;
-                                        } else {
-                                            let keys = v.as_object()
-                                                .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                                                .unwrap_or_default();
-                                            let preview = text.chars().take(200).collect::<String>();
-                                            progress(
+                            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                                Ok(v) => {
+                                    if let Some(arr) = v["results"].as_array() {
+                                        for (idx_in_chunk, item) in arr.iter().enumerate() {
+                                            let orig_idx = chunk[idx_in_chunk].0;
+                                            results[orig_idx] = item.clone();
+                                        }
+                                        cache_put(
+                                            std::env::var_os("SCANNER_CACHE")
+                                                .as_deref()
+                                                .map(PathBuf::from)
+                                                .as_deref(),
+                                            &cache_tag,
+                                            v.to_string().as_bytes(),
+                                        );
+                                        progress(
+                                            "osv.query.chunk.done",
+                                            &format!(
+                                                "offset={} size={} attempts={}",
+                                                offset,
+                                                chunk.len(),
+                                                attempt
+                                            ),
+                                        );
+                                        done = true;
+                                        break;
+                                    } else {
+                                        let keys = v
+                                            .as_object()
+                                            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                                            .unwrap_or_default();
+                                        let preview = text.chars().take(200).collect::<String>();
+                                        progress(
                                                 "osv.query.error",
                                                 &format!(
                                                     "chunk_parse offset={} attempt={} keys={:?} body={}",
                                                     offset, attempt, keys, preview
                                                 ),
                                             );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let preview = text.chars().take(200).collect::<String>();
-                                        progress(
-                                            "osv.query.error",
-                                            &format!(
-                                                "chunk_json offset={} attempt={} err={} body={}",
-                                                offset, attempt, e, preview
-                                            ),
-                                        );
                                     }
                                 }
-                            }
+                                Err(e) => {
+                                    let preview = text.chars().take(200).collect::<String>();
+                                    progress(
+                                        "osv.query.error",
+                                        &format!(
+                                            "chunk_json offset={} attempt={} err={} body={}",
+                                            offset, attempt, e, preview
+                                        ),
+                                    );
+                                }
+                            },
                             Err(e) => {
                                 progress(
                                     "osv.query.error",
@@ -495,7 +620,10 @@ pub fn map_osv_results_to_findings(
                 let mut severity_str: Option<String> = None;
                 if let Some(severities) = v["severity"].as_array() {
                     for sev in severities {
-                        if sev["type"] == "CVSS_V3" || sev["type"] == "CVSS_V2" || sev["type"] == "CVSS_V4" {
+                        if sev["type"] == "CVSS_V3"
+                            || sev["type"] == "CVSS_V2"
+                            || sev["type"] == "CVSS_V4"
+                        {
                             if let Some(score_str) = sev["score"].as_str() {
                                 if let Some((score, vector)) = parse_cvss_score(score_str) {
                                     cvss = Some(CvssInfo {
@@ -551,8 +679,11 @@ pub fn map_osv_results_to_findings(
                 if let Some(aff) = v["affected"].as_array() {
                     // OSV affected entries may include ranges with introduced/fixed
                     for a in aff {
-                        if let Some(p) = a["package"].get("ecosystem").and_then(|e| e.as_str()) {
-                            let eco = p.to_string();
+                        if a["package"]
+                            .get("ecosystem")
+                            .and_then(|e| e.as_str())
+                            .is_some()
+                        {
                             let name_match = a["package"]
                                 .get("name")
                                 .and_then(|n| n.as_str())
@@ -596,6 +727,9 @@ pub fn map_osv_results_to_findings(
                             id: cid.trim().to_string(),
                             source_ids: source_ids.clone(),
                             package: package.clone(),
+                            confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                            evidence_source: EvidenceSource::InstalledDb,
+                            accuracy_note: None,
                             fixed,
                             fixed_in: None,
                             recommendation: None,
@@ -613,6 +747,9 @@ pub fn map_osv_results_to_findings(
                         id: osv_id,
                         source_ids,
                         package,
+                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: EvidenceSource::InstalledDb,
+                        accuracy_note: None,
                         fixed,
                         fixed_in: None,
                         recommendation: None,
@@ -830,7 +967,7 @@ fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Find
     }
 }
 
-/// Fetch OSV `/v1/vulns/{id}` payloads in parallel (max 5 concurrent).
+/// Fetch OSV `/v1/vulns/{id}` payloads in parallel (bounded concurrency).
 ///
 /// For each id in `ids`:
 ///   1. Check the file cache first.
@@ -846,9 +983,17 @@ fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::Hash
     }
 
     let cache_dir = std::env::var_os("SCANNER_CACHE").map(PathBuf::from);
+    let max_concurrent: usize = std::env::var("SCANNER_OSV_ENRICH_CONC")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5);
 
-    // Semaphore: Arc<(Mutex<count>, Condvar)>, initialised to 5 permits.
-    let sem = std::sync::Arc::new((std::sync::Mutex::new(5usize), std::sync::Condvar::new()));
+    // Semaphore: Arc<(Mutex<count>, Condvar)>, initialised to max_concurrent permits.
+    let sem = std::sync::Arc::new((
+        std::sync::Mutex::new(max_concurrent),
+        std::sync::Condvar::new(),
+    ));
 
     let results: std::collections::HashMap<String, Value> = ids
         .par_iter()
@@ -898,6 +1043,12 @@ fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::Hash
     results
 }
 
+fn drop_fixed_findings(findings: &mut Vec<Finding>) -> usize {
+    let before = findings.len();
+    findings.retain(|f| !matches!(f.fixed, Some(true)));
+    before.saturating_sub(findings.len())
+}
+
 /// Enrich findings with details from OSV /v1/vulns/{id} (fills description, severity, references)
 pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
     if !env_bool("SCANNER_OSV_ENRICH", true) {
@@ -922,6 +1073,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     }
 
     // Phase 1: PG cache lookup (sequential — PgClient is not Send)
+    let phase_pg_started = std::time::Instant::now();
     let mut pg_cache_hits: std::collections::HashMap<String, Value> =
         std::collections::HashMap::new();
     let mut needs_fetch: Vec<String> = Vec::new();
@@ -940,9 +1092,12 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
             needs_fetch.push(id.clone());
         }
     }
+    progress_timing("osv.enrich.pg_cache_lookup", phase_pg_started);
 
-    // Phase 2: Parallel fetch for PG-cache misses (max 5 concurrent)
+    // Phase 2: Parallel fetch for PG-cache misses (bounded concurrency)
+    let phase_fetch_started = std::time::Instant::now();
     let fetched = osv_fetch_parallel(&needs_fetch, &client);
+    progress_timing("osv.enrich.fetch_parallel", phase_fetch_started);
     progress(
         "osv.fetch.parallel.done",
         &format!(
@@ -953,12 +1108,14 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     );
 
     // Phase 3: Store newly fetched payloads to PG (sequential)
+    let phase_pg_store_started = std::time::Instant::now();
     for (id, json) in &fetched {
         if let Some(c) = pg.as_mut() {
             let lm = parse_osv_last_modified(json);
             pg_put_osv(c, id, json, lm);
         }
     }
+    progress_timing("osv.enrich.pg_cache_store", phase_pg_store_started);
 
     // Phase 4: Build combined payloads map (PG hits + freshly fetched)
     let all_payloads: std::collections::HashMap<String, Value> =
@@ -966,6 +1123,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
 
     // Phase 5: Apply payloads to findings sequentially
     // (advisory->CVE upgrades require sequential mutation of the shared findings vec)
+    let phase_apply_started = std::time::Instant::now();
     for (idx, id) in unique_ids.into_iter().enumerate() {
         progress("osv.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
         if let Some(json) = all_payloads.get(&id) {
@@ -975,12 +1133,17 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
             progress("osv.fetch.err", &id);
         }
     }
+    progress_timing("osv.enrich.apply", phase_apply_started);
 
     // Advisory-level enrichment for Red Hat errata IDs (RHSA/RHBA/RHEA).
     // This fills severity/cvss/description/references so they don't stay as empty "Other" rows.
     redhat_enrich_findings(findings, pg);
     // CVE-level Red Hat enrichment computes package applicability and fixed package versions.
     redhat_enrich_cve_findings(findings, pg);
+    let dropped_fixed = drop_fixed_findings(findings);
+    if dropped_fixed > 0 {
+        progress("osv.fixed.drop", &format!("count={}", dropped_fixed));
+    }
 
     // Deduplicate by id after any upgrades from advisory -> CVE
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1020,6 +1183,58 @@ fn normalize_redhat_errata_id(id: &str) -> String {
         .to_ascii_uppercase()
         .replace("%3A", ":")
         .replace("%3a", ":")
+}
+
+fn retain_relevant_redhat_source_ids(source_ids: &mut Vec<String>, keep: Option<&str>) {
+    source_ids.retain(|sid| {
+        let norm = normalize_redhat_errata_id(sid);
+        if is_redhat_errata_id(&norm) {
+            return keep.map(|k| norm.eq_ignore_ascii_case(k)).unwrap_or(false);
+        }
+        true
+    });
+}
+
+fn extract_redhat_errata_from_url(url: &str) -> Option<String> {
+    let normalized = normalize_reference_url(url);
+    let lower = normalized.to_ascii_lowercase();
+    let marker = "/errata/";
+    let idx = lower.find(marker)?;
+    let tail = &normalized[idx + marker.len()..];
+    let raw = tail
+        .split(|c| matches!(c, '/' | '?' | '#'))
+        .next()
+        .unwrap_or("")
+        .trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let norm = normalize_redhat_errata_id(raw);
+    if is_redhat_errata_id(&norm) {
+        Some(norm)
+    } else {
+        None
+    }
+}
+
+fn retain_relevant_redhat_references(refs: &mut Vec<ReferenceInfo>, keep: Option<&str>) {
+    refs.retain(|r| {
+        if !r.reference_type.eq_ignore_ascii_case("redhat") {
+            return true;
+        }
+        let Some(errata) = extract_redhat_errata_from_url(&r.url) else {
+            return true;
+        };
+        keep.map(|k| errata.eq_ignore_ascii_case(k))
+            .unwrap_or(false)
+    });
+}
+
+fn is_redhat_family_ecosystem(ecosystem: &str) -> bool {
+    matches!(
+        ecosystem,
+        "redhat" | "rpm" | "centos" | "rocky" | "almalinux"
+    )
 }
 
 fn normalize_reference_url(raw: &str) -> String {
@@ -1148,6 +1363,13 @@ struct RedHatFixedRelease {
     fixed_evr: String,
 }
 
+#[derive(Debug, Clone)]
+struct RedHatPackageState {
+    package_name: String,
+    fix_state: String,
+    cpe: Option<String>,
+}
+
 fn parse_redhat_release_package(raw: &str) -> Option<(String, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1167,6 +1389,37 @@ fn parse_redhat_release_package(raw: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name.to_string(), format!("{}-{}", version, release)))
+}
+
+fn parse_redhat_package_states(json: &Value) -> Vec<RedHatPackageState> {
+    let mut states = Vec::new();
+    if let Some(arr) = json.get("package_state").and_then(|v| v.as_array()) {
+        for item in arr {
+            let package_name = item
+                .get("package_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let fix_state = item
+                .get("fix_state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if package_name.is_empty() || fix_state.is_empty() {
+                continue;
+            }
+            let cpe = item
+                .get("cpe")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            states.push(RedHatPackageState {
+                package_name: package_name.to_string(),
+                fix_state: fix_state.to_string(),
+                cpe,
+            });
+        }
+    }
+    states
 }
 
 fn parse_redhat_cve_cvss(json: &Value) -> Option<CvssInfo> {
@@ -1198,20 +1451,6 @@ fn redhat_cve_references(json: &Value) -> Vec<ReferenceInfo> {
             }
         }
     }
-    if let Some(arr) = json.get("affected_release").and_then(|v| v.as_array()) {
-        for advisory in arr
-            .iter()
-            .filter_map(|x| x.get("advisory").and_then(|v| v.as_str()))
-        {
-            let aid = normalize_redhat_errata_id(advisory);
-            if is_redhat_errata_id(&aid) {
-                refs.push(ReferenceInfo {
-                    reference_type: "redhat".into(),
-                    url: format!("https://access.redhat.com/errata/{}", aid),
-                });
-            }
-        }
-    }
     refs
 }
 
@@ -1236,6 +1475,39 @@ fn extract_el_tag(text: &str) -> Option<String> {
     None
 }
 
+fn extract_rhel_major_from_cpe(cpe: &str) -> Option<String> {
+    let lower = cpe.to_ascii_lowercase();
+    if let Some(idx) = lower.find("enterprise_linux:") {
+        let rest = &lower[idx + "enterprise_linux:".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    if let Some(idx) = lower.find("rhel_eus:") {
+        let rest = &lower[idx + "rhel_eus:".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Some(digits);
+        }
+    }
+    None
+}
+
+fn extract_rhel_major_from_version(version: &str) -> Option<String> {
+    let tag = extract_el_tag(version)?;
+    let digits: String = tag
+        .trim_start_matches("el")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(digits)
+    }
+}
+
 fn strip_rpm_arch_suffix(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let suffixes = [
@@ -1251,7 +1523,24 @@ fn strip_rpm_arch_suffix(name: &str) -> String {
 }
 
 fn package_name_matches(installed: &str, candidate: &str) -> bool {
-    strip_rpm_arch_suffix(installed) == strip_rpm_arch_suffix(candidate)
+    let installed_norm = strip_rpm_arch_suffix(installed);
+    let candidate_norm = strip_rpm_arch_suffix(candidate);
+    if installed_norm == candidate_norm {
+        return true;
+    }
+
+    // Red Hat affected_release.package usually carries the base SRPM-ish name
+    // (e.g. "bind"), while installed RPMs are often subpackages
+    // (e.g. "bind-license", "bind-libs", "bind-utils").
+    // Treat that as a match when the installed package is a strict subpackage.
+    if installed_norm
+        .strip_prefix(&candidate_norm)
+        .is_some_and(|rest| rest.starts_with('-'))
+    {
+        return true;
+    }
+
+    false
 }
 
 fn parse_redhat_fixed_releases(json: &Value) -> Vec<RedHatFixedRelease> {
@@ -1277,7 +1566,10 @@ fn parse_redhat_fixed_releases(json: &Value) -> Vec<RedHatFixedRelease> {
     releases
 }
 
-fn best_redhat_fixed_release(pkg: &PackageInfo, all: &[RedHatFixedRelease]) -> Option<RedHatFixedRelease> {
+fn best_redhat_fixed_release(
+    pkg: &PackageInfo,
+    all: &[RedHatFixedRelease],
+) -> Option<RedHatFixedRelease> {
     let mut candidates: Vec<RedHatFixedRelease> = all
         .iter()
         .filter(|r| package_name_matches(&pkg.name, &r.package_name))
@@ -1293,9 +1585,11 @@ fn best_redhat_fixed_release(pkg: &PackageInfo, all: &[RedHatFixedRelease]) -> O
             .filter(|r| extract_el_tag(&r.fixed_evr).as_deref() == Some(installed_tag.as_str()))
             .cloned()
             .collect();
-        if !tagged.is_empty() {
-            candidates = tagged;
+        if tagged.is_empty() {
+            // Prevent cross-stream matches (e.g. el7 package matched to el8 advisory).
+            return None;
         }
+        candidates = tagged;
     }
 
     let installed_epoch = rpm_epoch(&pkg.version);
@@ -1309,6 +1603,47 @@ fn best_redhat_fixed_release(pkg: &PackageInfo, all: &[RedHatFixedRelease]) -> O
     }
 
     candidates.sort_by(|a, b| compare_evr(&a.fixed_evr, &b.fixed_evr));
+    candidates.into_iter().next()
+}
+
+fn best_redhat_package_state(
+    pkg: &PackageInfo,
+    all: &[RedHatPackageState],
+) -> Option<RedHatPackageState> {
+    let mut candidates: Vec<RedHatPackageState> = all
+        .iter()
+        .filter(|s| package_name_matches(&pkg.name, &s.package_name))
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(installed_major) = extract_rhel_major_from_version(&pkg.version) {
+        let stream_matches: Vec<RedHatPackageState> = candidates
+            .iter()
+            .filter(|s| {
+                s.cpe
+                    .as_deref()
+                    .and_then(extract_rhel_major_from_cpe)
+                    .as_deref()
+                    == Some(installed_major.as_str())
+            })
+            .cloned()
+            .collect();
+        if !stream_matches.is_empty() {
+            candidates = stream_matches;
+        }
+    }
+
+    // Prefer "Not affected" if present for this package/stream.
+    if let Some(not_affected) = candidates
+        .iter()
+        .find(|s| s.fix_state.eq_ignore_ascii_case("Not affected"))
+        .cloned()
+    {
+        return Some(not_affected);
+    }
     candidates.into_iter().next()
 }
 
@@ -1337,7 +1672,10 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
         .into_iter()
         .collect();
     if ids.is_empty() {
-        progress("redhat.cve.fetch.skip", "no rpm-ecosystem CVE findings to enrich");
+        progress(
+            "redhat.cve.fetch.skip",
+            "no rpm-ecosystem CVE findings to enrich",
+        );
         return;
     }
     ids.sort();
@@ -1355,6 +1693,13 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let max_concurrent: usize = std::env::var("SCANNER_REDHAT_CVE_CONC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .max(1);
+    let skip_cache = env_bool("SCANNER_SKIP_CACHE", false);
+    let require_redhat_applicability = env_bool("SCANNER_REDHAT_REQUIRE_APPLICABILITY", true);
 
     let client = build_http_client(timeout_secs);
     let total = ids.len();
@@ -1365,28 +1710,34 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
     let mut enriched_count = 0usize;
     let mut fixed_count = 0usize;
     let mut vulnerable_count = 0usize;
+    let mut not_applicable_count = 0usize;
+    let mut no_data_count = 0usize;
+    let mut drop_not_applicable: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut id_to_json: HashMap<String, Value> = HashMap::new();
+    let mut to_fetch: Vec<String> = Vec::new();
 
-    for (idx, cve_id) in ids.into_iter().enumerate() {
+    let redhat_cve_started = std::time::Instant::now();
+    for (idx, cve_id) in ids.iter().enumerate() {
         progress(
             "redhat.cve.lookup",
             &format!("{}/{} {}", idx + 1, total, cve_id),
         );
 
-        let cache_tag = cache_key(&["redhat_cve", &cve_id]);
+        let cache_tag = cache_key(&["redhat_cve", cve_id]);
         let mut json: Option<Value> = None;
 
         if let Some(client_pg) = pg.as_mut() {
-            if let Some((payload, last_checked, last_mod)) = pg_get_redhat_cve(client_pg, &cve_id)
-            {
+            if let Some((payload, last_checked, last_mod)) = pg_get_redhat_cve(client_pg, cve_id) {
                 let ttl_dyn_days = compute_dynamic_ttl_days(last_mod, ttl_days);
                 if Utc::now() - last_checked < ChronoDuration::days(ttl_dyn_days) {
                     json = Some(payload);
-                    progress("redhat.cve.cache.pg.hit", &cve_id);
+                    progress("redhat.cve.cache.pg.hit", cve_id);
                 }
             }
         }
 
-        if json.is_none() {
+        if json.is_none() && !skip_cache {
             if let Some(bytes) = cache_get(
                 std::env::var_os("SCANNER_CACHE")
                     .as_deref()
@@ -1396,52 +1747,177 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
             ) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     json = Some(v);
-                    progress("redhat.cve.cache.hit", &cve_id);
+                    progress("redhat.cve.cache.hit", cve_id);
                 }
             }
         }
 
-        if json.is_none() {
-            if sleep_ms > 0 {
-                sleep(Duration::from_millis(sleep_ms));
-            }
-            let url = format!(
-                "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
-                cve_id
-            );
-            match client.get(&url).send() {
-                Ok(r) if r.status().is_success() => match r.json::<Value>() {
-                    Ok(v) => {
-                        cache_put(
-                            std::env::var_os("SCANNER_CACHE")
-                                .as_deref()
-                                .map(PathBuf::from)
-                                .as_deref(),
-                            &cache_tag,
-                            v.to_string().as_bytes(),
+        if let Some(v) = json {
+            id_to_json.insert(cve_id.clone(), v);
+        } else {
+            to_fetch.push(cve_id.clone());
+        }
+    }
+
+    if !to_fetch.is_empty() {
+        let fetch_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(max_concurrent)
+            .build()
+            .ok();
+        let fetched: Vec<(String, Value, Option<DateTime<Utc>>)> = if let Some(pool) = fetch_pool {
+            pool.install(|| {
+                to_fetch
+                    .par_iter()
+                    .filter_map(|cve_id| {
+                        if sleep_ms > 0 {
+                            sleep(Duration::from_millis(sleep_ms));
+                        }
+                        let cache_tag = cache_key(&["redhat_cve", cve_id]);
+                        let url = format!(
+                            "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
+                            cve_id
                         );
-                        json = Some(v);
+                        match client.get(&url).send() {
+                            Ok(r) if r.status().is_success() => match r.json::<Value>() {
+                                Ok(v) => {
+                                    if !skip_cache {
+                                        cache_put(
+                                            std::env::var_os("SCANNER_CACHE")
+                                                .as_deref()
+                                                .map(PathBuf::from)
+                                                .as_deref(),
+                                            &cache_tag,
+                                            v.to_string().as_bytes(),
+                                        );
+                                    }
+                                    let lm = parse_redhat_cve_last_modified(&v);
+                                    Some((cve_id.clone(), v, lm))
+                                }
+                                Err(e) => {
+                                    progress(
+                                        "redhat.cve.fetch.err",
+                                        &format!("{} json {}", cve_id, e),
+                                    );
+                                    None
+                                }
+                            },
+                            Ok(r) => {
+                                progress(
+                                    "redhat.cve.fetch.err",
+                                    &format!("{} status={}", cve_id, r.status()),
+                                );
+                                None
+                            }
+                            Err(e) => {
+                                progress("redhat.cve.fetch.err", &format!("{} {}", cve_id, e));
+                                None
+                            }
+                        }
+                    })
+                    .collect()
+            })
+        } else {
+            to_fetch
+                .into_iter()
+                .filter_map(|cve_id| {
+                    if sleep_ms > 0 {
+                        sleep(Duration::from_millis(sleep_ms));
                     }
-                    Err(e) => progress("redhat.cve.fetch.err", &format!("{} json {}", cve_id, e)),
-                },
-                Ok(r) => {
+                    let cache_tag = cache_key(&["redhat_cve", &cve_id]);
+                    let url = format!(
+                        "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
+                        cve_id
+                    );
+                    match client.get(&url).send() {
+                        Ok(r) if r.status().is_success() => match r.json::<Value>() {
+                            Ok(v) => {
+                                if !skip_cache {
+                                    cache_put(
+                                        std::env::var_os("SCANNER_CACHE")
+                                            .as_deref()
+                                            .map(PathBuf::from)
+                                            .as_deref(),
+                                        &cache_tag,
+                                        v.to_string().as_bytes(),
+                                    );
+                                }
+                                let lm = parse_redhat_cve_last_modified(&v);
+                                Some((cve_id, v, lm))
+                            }
+                            Err(e) => {
+                                progress("redhat.cve.fetch.err", &format!("{} json {}", cve_id, e));
+                                None
+                            }
+                        },
+                        Ok(r) => {
+                            progress(
+                                "redhat.cve.fetch.err",
+                                &format!("{} status={}", cve_id, r.status()),
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            progress("redhat.cve.fetch.err", &format!("{} {}", cve_id, e));
+                            None
+                        }
+                    }
+                })
+                .collect()
+        };
+
+        for (cve_id, cve_json, lm) in fetched {
+            if let Some(client_pg) = pg.as_mut() {
+                pg_put_redhat_cve(client_pg, &cve_id, &cve_json, lm);
+            }
+            progress("redhat.cve.fetch.ok", &cve_id);
+            id_to_json.insert(cve_id, cve_json);
+        }
+    }
+
+    for cve_id in ids {
+        let Some(cve_json) = id_to_json.get(&cve_id) else {
+            for idx in 0..findings.len() {
+                if !findings[idx].id.eq_ignore_ascii_case(&cve_id) {
+                    continue;
+                }
+                let f = &mut findings[idx];
+                let pkg = match f.package.clone() {
+                    Some(p) if is_rpm_ecosystem(&p.ecosystem) => p,
+                    _ => continue,
+                };
+                if !is_redhat_family_ecosystem(&pkg.ecosystem) {
+                    continue;
+                }
+                no_data_count += 1;
+                retain_relevant_redhat_source_ids(&mut f.source_ids, None);
+                retain_relevant_redhat_references(&mut f.references, None);
+                if require_redhat_applicability {
+                    drop_not_applicable.insert(idx);
                     progress(
-                        "redhat.cve.fetch.err",
-                        &format!("{} status={}", cve_id, r.status()),
+                        "redhat.cve.no_data.drop",
+                        &format!(
+                            "{} pkg={} installed={} ecosystem={}",
+                            cve_id, pkg.name, pkg.version, pkg.ecosystem
+                        ),
+                    );
+                } else {
+                    if f.accuracy_note.is_none() {
+                        f.accuracy_note = Some(
+                            "Red Hat applicability metadata unavailable for this CVE; finding may be over-inclusive."
+                                .into(),
+                        );
+                    }
+                    progress(
+                        "redhat.cve.no_data",
+                        &format!(
+                            "{} pkg={} installed={} ecosystem={}",
+                            cve_id, pkg.name, pkg.version, pkg.ecosystem
+                        ),
                     );
                 }
-                Err(e) => progress("redhat.cve.fetch.err", &format!("{} {}", cve_id, e)),
             }
-        }
-
-        let Some(cve_json) = json else {
             continue;
         };
-        if let Some(client_pg) = pg.as_mut() {
-            let lm = parse_redhat_cve_last_modified(&cve_json);
-            pg_put_redhat_cve(client_pg, &cve_id, &cve_json, lm);
-        }
-        progress("redhat.cve.fetch.ok", &cve_id);
 
         let severity = cve_json
             .get("threat_severity")
@@ -1455,35 +1931,59 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
         let cvss = parse_redhat_cve_cvss(&cve_json);
         let refs = redhat_cve_references(&cve_json);
         let fixed_releases = parse_redhat_fixed_releases(&cve_json);
+        let package_states = parse_redhat_package_states(&cve_json);
 
         let mut applied = false;
-        for f in findings
-            .iter_mut()
-            .filter(|f| f.id.eq_ignore_ascii_case(&cve_id))
-        {
+        for idx in 0..findings.len() {
+            if !findings[idx].id.eq_ignore_ascii_case(&cve_id) {
+                continue;
+            }
+            let f = &mut findings[idx];
             let pkg = match f.package.clone() {
                 Some(p) if is_rpm_ecosystem(&p.ecosystem) => p,
                 _ => continue,
             };
 
-            if f.severity.is_none() {
-                f.severity = severity.clone();
-            }
-            if f.cvss.is_none() {
-                f.cvss = cvss.clone();
-            }
-            if f.description.is_none() {
-                f.description = description.clone();
+            let redhat_family = is_redhat_family_ecosystem(&pkg.ecosystem);
+            if redhat_family {
+                // Drop stale/advisory aliases until we can prove applicability for this package.
+                retain_relevant_redhat_source_ids(&mut f.source_ids, None);
+                retain_relevant_redhat_references(&mut f.references, None);
+                if severity.is_some() {
+                    f.severity = severity.clone();
+                }
+                if cvss.is_some() {
+                    f.cvss = cvss.clone();
+                }
+                if description.is_some() {
+                    f.description = description.clone();
+                }
+            } else {
+                if f.severity.is_none() {
+                    f.severity = severity.clone();
+                }
+                if f.cvss.is_none() {
+                    f.cvss = cvss.clone();
+                }
+                if f.description.is_none() {
+                    f.description = description.clone();
+                }
             }
             append_unique_references(&mut f.references, refs.clone());
             applied = true;
 
             if let Some(best) = best_redhat_fixed_release(&pkg, &fixed_releases) {
+                retain_relevant_redhat_source_ids(&mut f.source_ids, best.advisory.as_deref());
+                retain_relevant_redhat_references(&mut f.references, best.advisory.as_deref());
                 if f.fixed_in.is_none() {
                     f.fixed_in = Some(best.fixed_evr.clone());
                 }
                 if let Some(advisory) = best.advisory.as_ref() {
-                    if !f.source_ids.iter().any(|s| s.eq_ignore_ascii_case(advisory)) {
+                    if !f
+                        .source_ids
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(advisory))
+                    {
                         f.source_ids.push(advisory.clone());
                     }
                     append_unique_references(
@@ -1500,7 +2000,10 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
                     vulnerable_count += 1;
                     progress(
                         "redhat.cve.vulnerable",
-                        &format!("{} pkg={} installed={} fixed_in={}", cve_id, pkg.name, pkg.version, best.fixed_evr),
+                        &format!(
+                            "{} pkg={} installed={} fixed_in={}",
+                            cve_id, pkg.name, pkg.version, best.fixed_evr
+                        ),
                     );
                     f.recommendation = Some(format!(
                         "Upgrade {} to {} or later{}.",
@@ -1516,7 +2019,10 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
                     fixed_count += 1;
                     progress(
                         "redhat.cve.fixed",
-                        &format!("{} pkg={} installed={} fixed_in={}", cve_id, pkg.name, pkg.version, best.fixed_evr),
+                        &format!(
+                            "{} pkg={} installed={} fixed_in={}",
+                            cve_id, pkg.name, pkg.version, best.fixed_evr
+                        ),
                     );
                     if f.recommendation.is_none() {
                         f.recommendation = Some(format!(
@@ -1525,15 +2031,110 @@ fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgCli
                         ));
                     }
                 }
+            } else if let Some(state) = best_redhat_package_state(&pkg, &package_states) {
+                retain_relevant_redhat_source_ids(&mut f.source_ids, None);
+                retain_relevant_redhat_references(&mut f.references, None);
+                let state_lc = state.fix_state.to_ascii_lowercase();
+                if state_lc == "not affected" {
+                    f.fixed = Some(true);
+                    fixed_count += 1;
+                    progress(
+                        "redhat.cve.not_affected",
+                        &format!("{} pkg={} state={}", cve_id, pkg.name, state.fix_state),
+                    );
+                    if f.recommendation.is_none() {
+                        f.recommendation = Some(format!(
+                            "Red Hat marks {} as '{}' for this stream.",
+                            pkg.name, state.fix_state
+                        ));
+                    }
+                } else if state_lc.contains("will not fix") || state_lc.contains("out of support") {
+                    f.fixed = Some(false);
+                    vulnerable_count += 1;
+                    progress(
+                        "redhat.cve.unfixed",
+                        &format!("{} pkg={} state={}", cve_id, pkg.name, state.fix_state),
+                    );
+                    if f.recommendation.is_none() {
+                        f.recommendation = Some(format!(
+                            "No Red Hat fixed build is available for {} on this stream (state: {}).",
+                            pkg.name, state.fix_state
+                        ));
+                    }
+                } else {
+                    // Treat any other explicit Red Hat package state as unresolved/unfixed
+                    // for this stream unless we already matched a fixed release above.
+                    f.fixed = Some(false);
+                    vulnerable_count += 1;
+                    progress(
+                        "redhat.cve.state",
+                        &format!("{} pkg={} state={}", cve_id, pkg.name, state.fix_state),
+                    );
+                    if f.recommendation.is_none() {
+                        f.recommendation = Some(format!(
+                            "Red Hat marks {} as '{}' for this stream; no fixed build is currently published.",
+                            pkg.name, state.fix_state
+                        ));
+                    }
+                }
+            } else if redhat_family {
+                not_applicable_count += 1;
+                retain_relevant_redhat_source_ids(&mut f.source_ids, None);
+                retain_relevant_redhat_references(&mut f.references, None);
+                if require_redhat_applicability {
+                    drop_not_applicable.insert(idx);
+                    progress(
+                        "redhat.cve.not_applicable",
+                        &format!(
+                            "{} pkg={} installed={} ecosystem={}",
+                            cve_id, pkg.name, pkg.version, pkg.ecosystem
+                        ),
+                    );
+                } else {
+                    if f.accuracy_note.is_none() {
+                        f.accuracy_note = Some(
+                            "Red Hat did not mark this package/stream as applicable for the CVE."
+                                .into(),
+                        );
+                    }
+                    progress(
+                        "redhat.cve.not_applicable.keep",
+                        &format!(
+                            "{} pkg={} installed={} ecosystem={}",
+                            cve_id, pkg.name, pkg.version, pkg.ecosystem
+                        ),
+                    );
+                }
             }
         }
         if applied {
             enriched_count += 1;
         }
     }
+    if !drop_not_applicable.is_empty() {
+        let mut idx = 0usize;
+        findings.retain(|_| {
+            let keep = !drop_not_applicable.contains(&idx);
+            idx += 1;
+            keep
+        });
+        progress(
+            "redhat.cve.not_applicable.drop",
+            &format!("count={}", drop_not_applicable.len()),
+        );
+    }
+    progress_timing("redhat.cve.fetch", redhat_cve_started);
     progress(
         "redhat.cve.enrich.done",
-        &format!("cves_enriched={} vulnerable={} fixed={}", enriched_count, vulnerable_count, fixed_count),
+        &format!(
+            "cves_enriched={} vulnerable={} fixed={} not_applicable={} no_data={} require_applicability={}",
+            enriched_count,
+            vulnerable_count,
+            fixed_count,
+            not_applicable_count,
+            no_data_count,
+            require_redhat_applicability
+        ),
     );
 }
 
@@ -1598,6 +2199,7 @@ fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>
         pg_init_schema(c);
     }
 
+    let redhat_started = std::time::Instant::now();
     for (idx, id) in ids.into_iter().enumerate() {
         progress(
             "redhat.fetch.start",
@@ -1746,6 +2348,7 @@ fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>
             }
         }
     }
+    progress_timing("redhat.fetch", redhat_started);
 }
 
 pub fn enrich_findings_with_nvd(
@@ -1801,7 +2404,6 @@ pub fn enrich_findings_with_nvd(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_ms);
-    let jitter_max = (sleep_ms / 4).max(50);
     let ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1817,6 +2419,7 @@ pub fn enrich_findings_with_nvd(
     }
 
     // Determine which IDs to fetch from network after consulting PG cache
+    let cache_lookup_started = std::time::Instant::now();
     let mut to_fetch: Vec<(usize, String)> = Vec::new();
     for (idx, id) in unique_ids.into_iter().enumerate() {
         let mut served_from_cache = false;
@@ -1835,8 +2438,10 @@ pub fn enrich_findings_with_nvd(
             to_fetch.push((idx, id));
         }
     }
+    progress_timing("nvd.enrich.cache_lookup", cache_lookup_started);
 
     // Concurrency with politeness via a small threadpool
+    let fetch_started = std::time::Instant::now();
     let max_concurrent: usize = std::env::var("SCANNER_NVD_CONC")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1851,16 +2456,11 @@ pub fn enrich_findings_with_nvd(
                 .par_iter()
                 .filter_map(|(idx, id)| {
                     progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
-                    // jittered sleep per task
-                    let jitter = rand::thread_rng().gen_range(0..=jitter_max);
-                    if sleep_ms + jitter > 0 {
-                        sleep(Duration::from_millis(sleep_ms + jitter));
-                    }
                     let url = format!(
                         "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
                         id
                     );
-                    match nvd_get_json(&url, api_key, &format!("cveId:{}", id), 0) {
+                    match nvd_get_json(&url, api_key, &format!("cveId:{}", id), sleep_ms) {
                         Some(json) => {
                             let lm = parse_nvd_last_modified(&json);
                             Some((id.clone(), json, lm))
@@ -1887,15 +2487,11 @@ pub fn enrich_findings_with_nvd(
         // Fallback sequential loop
         for (idx, id) in to_fetch.into_iter() {
             progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
-            let jitter = rand::thread_rng().gen_range(0..=jitter_max);
-            if sleep_ms + jitter > 0 {
-                sleep(Duration::from_millis(sleep_ms + jitter));
-            }
             let url = format!(
                 "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
                 id
             );
-            match nvd_get_json(&url, api_key, &format!("cveId:{}", id), 0) {
+            match nvd_get_json(&url, api_key, &format!("cveId:{}", id), sleep_ms) {
                 Some(json) => {
                     let lm = parse_nvd_last_modified(&json);
                     if let Some(client) = pg.as_mut() {
@@ -1910,8 +2506,10 @@ pub fn enrich_findings_with_nvd(
             }
         }
     }
+    progress_timing("nvd.enrich.fetch", fetch_started);
 
     // Apply enrichment
+    let apply_started = std::time::Instant::now();
     for f in findings.iter_mut() {
         // If not in memory map and PG is configured, try PG (from parallel fetch path)
         if !id_to_json.contains_key(&f.id) {
@@ -2007,6 +2605,7 @@ pub fn enrich_findings_with_nvd(
             }
         }
     }
+    progress_timing("nvd.enrich.apply", apply_started);
 }
 
 /// Query NVD by keyword (component + version) and map to findings. Useful fallback when OSV has no package context.
@@ -2100,6 +2699,12 @@ pub fn nvd_keyword_findings(
                     ecosystem: "nvd".into(),
                     version: version.to_string(),
                 }),
+                confidence_tier: ConfidenceTier::HeuristicUnverified,
+                evidence_source: EvidenceSource::BinaryHeuristic,
+                accuracy_note: Some(
+                    "Derived via keyword heuristic; installed package inventory was not proven."
+                        .into(),
+                ),
                 fixed: None,
                 fixed_in: None,
                 recommendation: None,
@@ -2207,6 +2812,11 @@ pub fn nvd_cpe_findings(
                     ecosystem: "nvd".into(),
                     version: version.to_string(),
                 }),
+                confidence_tier: ConfidenceTier::HeuristicUnverified,
+                evidence_source: EvidenceSource::BinaryHeuristic,
+                accuracy_note: Some(
+                    "Derived via CPE heuristic; installed package inventory was not proven.".into(),
+                ),
                 fixed: None,
                 fixed_in: None,
                 recommendation: None,
@@ -2310,6 +2920,12 @@ pub fn nvd_keyword_findings_name(
                     ecosystem: "nvd".into(),
                     version: "unknown".into(),
                 }),
+                confidence_tier: ConfidenceTier::HeuristicUnverified,
+                evidence_source: EvidenceSource::BinaryHeuristic,
+                accuracy_note: Some(
+                    "Derived via keyword heuristic; installed package inventory was not proven."
+                        .into(),
+                ),
                 fixed: None,
                 fixed_in: None,
                 recommendation: None,
@@ -2539,6 +3155,12 @@ pub fn nvd_findings_by_product_version(
                                             ecosystem: "nvd".into(),
                                             version: version.to_string(),
                                         }),
+                                        confidence_tier: ConfidenceTier::HeuristicUnverified,
+                                        evidence_source: EvidenceSource::BinaryHeuristic,
+                                        accuracy_note: Some(
+                                            "Derived via product/version heuristic; installed package inventory was not proven."
+                                                .into(),
+                                        ),
                                         fixed: None,
                                         fixed_in: None,
                                         recommendation: None,
@@ -2563,84 +3185,127 @@ pub fn nvd_findings_by_product_version(
 }
 
 fn nvd_get_json(url: &str, api_key: Option<&str>, cache_tag: &str, sleep_ms: u64) -> Option<Value> {
-    // Cache by URL
+    let skip_cache = env_bool("SCANNER_SKIP_CACHE", false);
     let key = cache_key(&["nvd", cache_tag, url]);
-    if let Some(bytes) = cache_get(
-        std::env::var_os("SCANNER_CACHE")
-            .as_deref()
-            .map(PathBuf::from)
-            .as_deref(),
-        &key,
-    ) {
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-            return Some(v);
+    if !skip_cache {
+        if let Some(bytes) = cache_get(
+            std::env::var_os("SCANNER_CACHE")
+                .as_deref()
+                .map(PathBuf::from)
+                .as_deref(),
+            &key,
+        ) {
+            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                return Some(v);
+            }
         }
     }
-    // Rate limiting sleep
-    if sleep_ms > 0 {
-        sleep(Duration::from_millis(sleep_ms));
-    }
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("scanner/0.1 (+https://github.com/devintripp/rust_scanner)")
-        .build();
-    let client = match client {
-        Ok(c) => c,
-        Err(e) => {
-            progress("nvd.http.err", &format!("client_build: {}", e));
+
+    let client = nvd_http_client();
+    let attempts = nvd_retry_max().max(1);
+    for attempt in 1..=attempts {
+        if sleep_ms > 0 {
+            sleep(Duration::from_millis(sleep_ms));
+        }
+        wait_for_global_nvd_rate_slot(api_key);
+
+        let mut req = client.get(url).header("Accept", "application/json");
+        if let Some(k) = api_key {
+            req = req.header("apiKey", k).header("X-Api-Key", k);
+        }
+
+        let resp = match req.send() {
+            Ok(r) => r,
+            Err(e) => {
+                let retry_ms = retry_backoff_with_jitter_ms(attempt);
+                progress(
+                    "nvd.http.err",
+                    &format!(
+                        "attempt={} err={} retry_ms={} url={}",
+                        attempt, e, retry_ms, url
+                    ),
+                );
+                if attempt >= attempts {
+                    return None;
+                }
+                if retry_ms > 0 {
+                    sleep(Duration::from_millis(retry_ms));
+                }
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let rem = resp
+                .headers()
+                .get("X-RateLimit-Remaining")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let lim = resp
+                .headers()
+                .get("X-RateLimit-Limit")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+
+            let retryable =
+                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+            let retry_after_ms = parse_retry_after_ms(&resp).unwrap_or(0);
+            let jitter_ms = retry_backoff_with_jitter_ms(attempt);
+            let wait_ms = retry_after_ms.max(jitter_ms);
+            progress(
+                "nvd.http.err",
+                &format!(
+                    "attempt={} status={} remaining={} limit={} retryable={} wait_ms={} url={}",
+                    attempt, status, rem, lim, retryable, wait_ms, url
+                ),
+            );
+
+            if retryable && attempt < attempts {
+                if wait_ms > 0 {
+                    sleep(Duration::from_millis(wait_ms));
+                }
+                continue;
+            }
             return None;
         }
-    };
-    let mut req = client.get(url).header("Accept", "application/json");
-    if let Some(k) = api_key {
-        req = req.header("apiKey", k).header("X-Api-Key", k);
-    }
-    let resp = match req.send() {
-        Ok(r) => r,
-        Err(e) => {
-            progress("nvd.http.err", &format!("send: {}", e));
-            return None;
+
+        adjust_rate_limits(&resp);
+        let v: Value = match resp.json() {
+            Ok(j) => j,
+            Err(e) => {
+                let retry_ms = retry_backoff_with_jitter_ms(attempt);
+                progress(
+                    "nvd.json.err",
+                    &format!(
+                        "attempt={} err={} retry_ms={} url={}",
+                        attempt, e, retry_ms, url
+                    ),
+                );
+                if attempt >= attempts {
+                    return None;
+                }
+                if retry_ms > 0 {
+                    sleep(Duration::from_millis(retry_ms));
+                }
+                continue;
+            }
+        };
+
+        if !skip_cache {
+            cache_put(
+                std::env::var_os("SCANNER_CACHE")
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .as_deref(),
+                &key,
+                v.to_string().as_bytes(),
+            );
         }
-    };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let rem = resp
-            .headers()
-            .get("X-RateLimit-Remaining")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let lim = resp
-            .headers()
-            .get("X-RateLimit-Limit")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        progress(
-            "nvd.http.err",
-            &format!(
-                "status={} remaining={} limit={} url={}",
-                status, rem, lim, url
-            ),
-        );
-        return None;
+        return Some(v);
     }
-    // Adjust pacing based on headers if provided
-    adjust_rate_limits(&resp);
-    let v: Value = match resp.json() {
-        Ok(j) => j,
-        Err(e) => {
-            progress("nvd.json.err", &format!("{}", e));
-            return None;
-        }
-    };
-    cache_put(
-        std::env::var_os("SCANNER_CACHE")
-            .as_deref()
-            .map(PathBuf::from)
-            .as_deref(),
-        &key,
-        v.to_string().as_bytes(),
-    );
-    Some(v)
+
+    None
 }
 
 fn adjust_rate_limits(resp: &Response) {
@@ -2684,25 +3349,12 @@ pub fn pg_connect() -> Option<PgClient> {
 
 pub fn pg_init_schema(client: &mut PgClient) {
     let res = client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );"
+        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE INDEX IF NOT EXISTS idx_nvd_cve_cache_last_checked ON nvd_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_osv_vuln_cache_last_checked ON osv_vuln_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_csaf_cache_last_checked ON redhat_csaf_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_cve_cache_last_checked ON redhat_cve_cache (last_checked_at);"
     );
     match res {
         Ok(_) => progress("nvd.cache.pg.init.ok", ""),
         Err(e) => progress("nvd.cache.pg.init.err", &format!("{}", e)),
     }
-}
-
-fn extract_schema_from_url(url: &str) -> Option<String> {
-    let q = url.split('?').nth(1)?;
-    for pair in q.split('&') {
-        let mut it = pair.splitn(2, '=');
-        let k = it.next()?;
-        let v = it.next().unwrap_or("");
-        if k == "schema" && !v.is_empty() {
-            return Some(v.to_string());
-        }
-    }
-    None
 }
 
 fn strip_param_from_url(url: &str, key: &str) -> (String, Option<String>) {
@@ -2820,7 +3472,11 @@ fn parse_redhat_cve_last_modified(json: &Value) -> Option<DateTime<Utc>> {
         .or_else(|| {
             json.get("affected_release")
                 .and_then(|v| v.as_array())
-                .and_then(|arr| arr.iter().filter_map(|x| x.get("release_date").and_then(|v| v.as_str())).max())
+                .and_then(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.get("release_date").and_then(|v| v.as_str()))
+                        .max()
+                })
         })?;
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return Some(dt.with_timezone(&Utc));
@@ -3021,6 +3677,7 @@ fn pg_put_redhat_cve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::{ConfidenceTier, EvidenceSource, Finding, PackageInfo};
 
     #[test]
     fn parse_redhat_release_package_handles_name_with_dash() {
@@ -3055,9 +3712,106 @@ mod tests {
     }
 
     #[test]
+    fn best_redhat_fixed_release_rejects_cross_stream_only_match() {
+        let pkg = PackageInfo {
+            name: "bind-license".into(),
+            ecosystem: "redhat".into(),
+            version: "32:9.11.4-26.P2.el7".into(),
+        };
+        let all = vec![RedHatFixedRelease {
+            advisory: Some("RHSA-2023:7177".into()),
+            package_name: "bind".into(),
+            fixed_evr: "32:9.11.36-11.el8_9".into(),
+        }];
+        assert!(best_redhat_fixed_release(&pkg, &all).is_none());
+    }
+
+    #[test]
     fn extract_el_tag_detects_rhel_tag() {
-        assert_eq!(extract_el_tag("3:10.3.27-3.module+el8.2.0+9158"), Some("el8".into()));
+        assert_eq!(
+            extract_el_tag("3:10.3.27-3.module+el8.2.0+9158"),
+            Some("el8".into())
+        );
         assert_eq!(extract_el_tag("1:5.5.68-1.el7"), Some("el7".into()));
         assert_eq!(extract_el_tag("1.2.3"), None);
+    }
+
+    #[test]
+    fn package_name_matches_rpm_subpackage_to_base_package() {
+        assert!(package_name_matches("bind-license", "bind"));
+        assert!(package_name_matches("bind-libs.x86_64", "bind"));
+        assert!(!package_name_matches("openssl-libs", "bind"));
+    }
+
+    #[test]
+    fn extract_redhat_errata_from_url_decodes_colon() {
+        let url = "https://access.redhat.com/errata/RHSA-2022%3A8162";
+        assert_eq!(
+            extract_redhat_errata_from_url(url).as_deref(),
+            Some("RHSA-2022:8162")
+        );
+    }
+
+    #[test]
+    fn retain_relevant_redhat_references_filters_errata_links() {
+        let mut refs = vec![
+            ReferenceInfo {
+                reference_type: "redhat".into(),
+                url: "https://access.redhat.com/errata/RHSA-2022%3A8162".into(),
+            },
+            ReferenceInfo {
+                reference_type: "redhat".into(),
+                url: "https://access.redhat.com/security/cve/CVE-2022-0001".into(),
+            },
+            ReferenceInfo {
+                reference_type: "nvd".into(),
+                url: "https://nvd.nist.gov/vuln/detail/CVE-2022-0001".into(),
+            },
+        ];
+        retain_relevant_redhat_references(&mut refs, Some("RHSA-2022:8162"));
+        assert_eq!(refs.len(), 3);
+
+        retain_relevant_redhat_references(&mut refs, None);
+        assert_eq!(refs.len(), 2);
+        assert!(refs
+            .iter()
+            .all(|r| !r.url.contains("/errata/RHSA-2022%3A8162")));
+    }
+
+    fn mk_finding(id: &str, pkg_name: &str, fixed: Option<bool>) -> Finding {
+        Finding {
+            id: id.to_string(),
+            source_ids: Vec::new(),
+            package: Some(PackageInfo {
+                name: pkg_name.to_string(),
+                ecosystem: "redhat".to_string(),
+                version: "1:1.2.3-1.el8".to_string(),
+            }),
+            confidence_tier: ConfidenceTier::ConfirmedInstalled,
+            evidence_source: EvidenceSource::InstalledDb,
+            accuracy_note: None,
+            fixed,
+            fixed_in: None,
+            recommendation: None,
+            severity: Some("HIGH".to_string()),
+            cvss: None,
+            description: None,
+            evidence: Vec::new(),
+            references: Vec::new(),
+            confidence: Some("HIGH".to_string()),
+        }
+    }
+
+    #[test]
+    fn drop_fixed_findings_removes_resolved_rows() {
+        let mut findings = vec![
+            mk_finding("CVE-2021-0001", "pkg-a", Some(true)),
+            mk_finding("CVE-2021-0002", "pkg-b", Some(false)),
+            mk_finding("CVE-2021-0003", "pkg-c", None),
+        ];
+        let dropped = drop_fixed_findings(&mut findings);
+        assert_eq!(dropped, 1);
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.fixed != Some(true)));
     }
 }

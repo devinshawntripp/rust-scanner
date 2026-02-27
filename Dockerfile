@@ -14,7 +14,8 @@ ENV SCANNER_NVD_CONC=5
 # scanner --progress --progress-file /tmp/scan.ndjson scan --file /Users/devintripp/Downloads/ubuntu-14.04.tar --format json --out /tmp/report.json
 
 # Build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
     pkg-config libssl-dev ca-certificates build-essential curl && \
     rm -rf /var/lib/apt/lists/*
 
@@ -32,17 +33,19 @@ FROM node:20-bookworm-slim
 WORKDIR /app
 
 # Minimal runtime deps for scanner
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 rpm && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy scanner binary installed in builder
 COPY --from=builder /usr/local/bin/scanner /usr/local/bin/scanner
+RUN ln -sf /usr/local/bin/scanner /usr/local/bin/scanrook
 ENV PATH="/usr/local/bin:${PATH}"
 
 # Reasonable defaults; override at runtime
 ENV SCANNER_NVD_TTL_DAYS=7 \
     SCANNER_NVD_CONC=5
 
-# Default command runs scanner; downstream images can override CMD easily
-CMD ["scanner"]
+# Default command runs scanrook (scanner remains available as alias)
+CMD ["scanrook"]

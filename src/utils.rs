@@ -1,18 +1,17 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
 use std::io::{self, Read};
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+use walkdir::WalkDir;
 
 /// Global cached file handle for progress output.
 /// Initialized on first call to `progress()` when SCANNER_PROGRESS_FILE is set.
 static PROGRESS_FILE_HANDLE: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
-
-pub fn run() {
-    println!("Module running...");
-}
 
 /// Compute SHA-256 hash of a file using a streaming reader
 pub fn hash_file_stream(path: &str) -> io::Result<String> {
@@ -114,4 +113,95 @@ pub fn progress(stage: &str, detail: &str) {
             let _ = writer.flush();
         }
     }
+}
+
+pub fn progress_timing(stage: &str, started: Instant) {
+    progress(
+        &format!("{}.timing", stage),
+        &format!("ms={}", started.elapsed().as_millis()),
+    );
+}
+
+pub fn collect_file_tree(root: &Path, limit: usize) -> Vec<crate::report::FileEntry> {
+    let cap = if limit == 0 { 20_000 } else { limit };
+    let hash_max_bytes: u64 = std::env::var("SCANNER_TREE_HASH_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let mut out: Vec<crate::report::FileEntry> = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if out.len() >= cap {
+            break;
+        }
+        if entry.path() == root {
+            continue;
+        }
+        let rel = match entry.path().strip_prefix(root) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str.is_empty() {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let file_type = entry.file_type();
+        let entry_type = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+
+        let size_bytes = if file_type.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        };
+
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            Some(format!("{:o}", metadata.permissions().mode() & 0o7777))
+        };
+        #[cfg(not(unix))]
+        let mode = None;
+
+        let mtime = metadata
+            .modified()
+            .ok()
+            .map(|m| chrono::DateTime::<chrono::Utc>::from(m).to_rfc3339());
+
+        let sha256 =
+            if file_type.is_file() && hash_max_bytes > 0 && metadata.len() <= hash_max_bytes {
+                hash_file_stream(entry.path().to_string_lossy().as_ref()).ok()
+            } else {
+                None
+            };
+
+        let parent_path = rel
+            .parent()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty());
+
+        out.push(crate::report::FileEntry {
+            path: rel_str,
+            entry_type: entry_type.to_string(),
+            size_bytes,
+            mode,
+            mtime,
+            sha256,
+            parent_path,
+        });
+    }
+
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
 }

@@ -5,18 +5,18 @@ mod iso;
 mod license;
 mod redhat;
 mod report;
+mod usercli;
 mod utils;
 mod vuln;
 
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 #[derive(Parser)]
-#[command(name = "scanner", version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "A Rust-powered security scanner", long_about = None)]
+#[command(name = "scanrook", version = env!("CARGO_PKG_VERSION"))]
+#[command(about = "ScanRook installed-state-first security scanner", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -29,6 +29,12 @@ struct Cli {
     /// Optional NVD API key for enrichment
     #[arg(long)]
     nvd_api_key: Option<String>,
+    /// ScanRook API base URL for CLI auth/limits
+    #[arg(long)]
+    api_base: Option<String>,
+    /// ScanRook API key (overrides saved config)
+    #[arg(long)]
+    api_key: Option<String>,
     /// Emit progress events to stderr
     #[arg(long, default_value_t = false)]
     progress: bool,
@@ -138,18 +144,59 @@ enum Commands {
         #[arg(short, long)]
         oval: String,
     },
+    /// Authentication and local CLI credential management
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+    /// Show current caller identity against ScanRook API
+    Whoami {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Show cloud-enrichment limit status
+    Limits {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// CLI config management
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
 }
 
-#[derive(Serialize)]
-struct BinReport {
-    scanner: &'static str,
-    version: &'static str,
-    target_path: String,
-    file_type: String,
-    sha256: String,
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Login by saving API key or starting device flow
+    Login {
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long)]
+        api_base: Option<String>,
+    },
+    /// Remove stored API key
+    Logout,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set config values. Example: scanrook config set telemetry.opt_in true
+    Set {
+        key: String,
+        value: String,
+    },
 }
 
 fn main() {
+    if let Some(argv0) = std::env::args().next() {
+        if argv0.ends_with("scanner") {
+            eprintln!(
+                "warning: `scanner` binary name is deprecated and will be removed after the compatibility window. use `scanrook`."
+            );
+        }
+    }
+
     let cli = Cli::parse();
     let nvd_api_key = cli
         .nvd_api_key
@@ -189,10 +236,30 @@ fn main() {
                     std::env::set_var("SCANNER_NVD_ENRICH", nvd_on);
                 }
             }
+
+            let osv_enabled = std::env::var("SCANNER_OSV_ENRICH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            let nvd_enabled = std::env::var("SCANNER_NVD_ENRICH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if osv_enabled || nvd_enabled {
+                let cloud_allowed =
+                    usercli::consume_cloud_enrich_token(cli.api_base.clone(), cli.api_key.clone());
+                if !cloud_allowed {
+                    std::env::set_var("SCANNER_OSV_ENRICH", "0");
+                    std::env::set_var("SCANNER_NVD_ENRICH", "0");
+                    progress(
+                        "cli.cloud_enrich.skip",
+                        "disabled by /api/cli/enrich rate limit; continuing local scan",
+                    );
+                }
+            }
+
             progress("scan.start", &file);
             // Smart detection:
-            // - tar-like input: container -> source -> binary fallback
-            // - iso-like input: ISO metadata scan -> binary fallback
+            // - tar-like input: container -> source fallback
+            // - iso-like input: ISO scanner only
             // - non-tar, non-iso input: binary
             let tar_like = looks_like_tar_input(&file);
             let iso_like = looks_like_iso_input(&file);
@@ -212,13 +279,6 @@ fn main() {
                     report_json = Some(serde_json::to_value(r).unwrap());
                 } else if let Some(r) = container::build_source_report(&file, nvd_api_key.clone()) {
                     report_json = Some(serde_json::to_value(r).unwrap());
-                } else if let Some(r) = binary::build_binary_report(
-                    &file,
-                    mode.clone(),
-                    cli.yara.clone(),
-                    nvd_api_key.clone(),
-                ) {
-                    report_json = Some(serde_json::to_value(r).unwrap());
                 }
             } else if iso_like {
                 if let Some(r) = iso::build_iso_report(
@@ -227,13 +287,6 @@ fn main() {
                     cli.yara.clone(),
                     nvd_api_key.clone(),
                     oval_redhat.clone(),
-                ) {
-                    report_json = Some(serde_json::to_value(r).unwrap());
-                } else if let Some(r) = binary::build_binary_report(
-                    &file,
-                    mode.clone(),
-                    cli.yara.clone(),
-                    nvd_api_key.clone(),
                 ) {
                     report_json = Some(serde_json::to_value(r).unwrap());
                 }
@@ -324,6 +377,40 @@ fn main() {
         Commands::Redhat { cve, oval } => {
             redhat::check_redhat_cve(&cve, &oval);
         }
+        Commands::Auth { command } => match command {
+            AuthCommands::Login { api_key, api_base } => {
+                if let Err(e) = usercli::login(api_base.or(cli.api_base.clone()), api_key.or(cli.api_key.clone())) {
+                    eprintln!("login failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            AuthCommands::Logout => {
+                if let Err(e) = usercli::logout() {
+                    eprintln!("logout failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
+        Commands::Whoami { json } => {
+            if let Err(e) = usercli::whoami(cli.api_base.clone(), cli.api_key.clone(), json) {
+                eprintln!("whoami failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Limits { json } => {
+            if let Err(e) = usercli::show_limits(cli.api_base.clone(), cli.api_key.clone(), json) {
+                eprintln!("limits failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Config { command } => match command {
+            ConfigCommands::Set { key, value } => {
+                if let Err(e) = usercli::set_config_value(&key, &value) {
+                    eprintln!("config set failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 

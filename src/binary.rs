@@ -1,12 +1,15 @@
+use crate::container::PackageCoordinate;
+use crate::report::{
+    compute_summary, FileEntry, Finding, InventoryStatus, Report, ScanStatus, ScannerInfo,
+    TargetInfo,
+};
 #[cfg(feature = "yara")]
-use crate::report::EvidenceItem;
-use crate::report::{compute_summary, Finding, Report, ScannerInfo, TargetInfo};
-use crate::utils::{hash_file_stream, progress};
+use crate::report::{ConfidenceTier, EvidenceItem, EvidenceSource};
+use crate::utils::{hash_file_stream, progress, progress_timing};
 use crate::vuln::{
     map_osv_results_to_findings, nvd_cpe_findings, nvd_findings_by_product_version,
     nvd_keyword_findings, osv_batch_query,
 };
-use crate::container::PackageCoordinate;
 use crate::ScanMode;
 use goblin::pe::PE;
 use goblin::Object;
@@ -15,6 +18,7 @@ use std::cmp::{max, min};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
@@ -160,6 +164,9 @@ pub fn build_binary_report(
     nvd_api_key: Option<String>,
 ) -> Option<Report> {
     progress("binary.hash.start", path);
+    #[cfg(not(feature = "yara"))]
+    let _ = &yara_rules;
+
     let (file_type, sha256) = scan_binary_report(path)?;
     progress(
         "binary.hash.ready",
@@ -167,7 +174,7 @@ pub fn build_binary_report(
     );
 
     let scanner = ScannerInfo {
-        name: "scanner",
+        name: "scanrook",
         version: env!("CARGO_PKG_VERSION"),
     };
     let target = TargetInfo {
@@ -177,6 +184,7 @@ pub fn build_binary_report(
     };
     let mut findings: Vec<Finding> = Vec::new();
 
+    let parse_started = std::time::Instant::now();
     progress("binary.parse.start", path);
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     progress(
@@ -322,7 +330,10 @@ pub fn build_binary_report(
     {
         let go_modules = parse_go_buildinfo(&bytes);
         if !go_modules.is_empty() {
-            progress("binary.go.buildinfo.found", &format!("modules={}", go_modules.len()));
+            progress(
+                "binary.go.buildinfo.found",
+                &format!("modules={}", go_modules.len()),
+            );
             let coords: Vec<PackageCoordinate> = go_modules
                 .iter()
                 .map(|(path, ver)| PackageCoordinate {
@@ -333,11 +344,15 @@ pub fn build_binary_report(
                 .collect();
             let osv_results = osv_batch_query(&coords);
             let go_findings = map_osv_results_to_findings(&coords, &osv_results);
-            progress("binary.go.osv.done", &format!("findings={}", go_findings.len()));
+            progress(
+                "binary.go.osv.done",
+                &format!("findings={}", go_findings.len()),
+            );
             findings.extend(go_findings);
         }
     }
 
+    progress_timing("binary.parse", parse_started);
     progress("binary.parse.done", path);
 
     // Optional YARA in deep mode
@@ -353,6 +368,12 @@ pub fn build_binary_report(
                                 id: format!("YARA:{}", m.identifier),
                                 source_ids: Vec::new(),
                                 package: None,
+                                confidence_tier: ConfidenceTier::HeuristicUnverified,
+                                evidence_source: EvidenceSource::BinaryHeuristic,
+                                accuracy_note: Some(
+                                    "Derived from binary pattern matching; package inventory is not available."
+                                        .into(),
+                                ),
                                 fixed: None,
                                 fixed_in: None,
                                 recommendation: None,
@@ -376,18 +397,39 @@ pub fn build_binary_report(
 
     // Enrich with NVD using Postgres cache (single connection per binary report)
     {
+        let nvd_started = std::time::Instant::now();
         let mut pg = crate::vuln::pg_connect();
         if let Some(c) = pg.as_mut() {
             crate::vuln::pg_init_schema(c);
         }
         crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
+        progress_timing("binary.enrich.nvd", nvd_started);
     }
 
     let mut report = Report {
         scanner,
         target,
+        scan_status: ScanStatus::Complete,
+        inventory_status: InventoryStatus::Complete,
+        inventory_reason: None,
         sbom: None,
         findings,
+        files: vec![FileEntry {
+            path: Path::new(path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path)
+                .to_string(),
+            entry_type: "file".into(),
+            size_bytes: std::fs::metadata(path).ok().map(|m| m.len()),
+            mode: None,
+            mtime: std::fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|ts| chrono::DateTime::<chrono::Utc>::from(ts).to_rfc3339()),
+            sha256: hash_file_stream(path).ok(),
+            parent_path: None,
+        }],
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
@@ -491,10 +533,7 @@ fn find_go_version(bytes: &[u8], scan_limit: usize) -> Option<String> {
 fn parse_go_buildinfo(bytes: &[u8]) -> Vec<(String, String)> {
     const MAGIC: &[u8] = b"\xff Go build info:";
     // Find the magic header
-    let start = match bytes
-        .windows(MAGIC.len())
-        .position(|w| w == MAGIC)
-    {
+    let start = match bytes.windows(MAGIC.len()).position(|w| w == MAGIC) {
         Some(pos) => pos + MAGIC.len(),
         None => return Vec::new(),
     };
@@ -510,9 +549,21 @@ fn parse_go_buildinfo(bytes: &[u8]) -> Vec<(String, String)> {
     };
     let mut seen = std::collections::HashSet::new();
     for cap in re.captures_iter(&text) {
-        let path = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim().to_string();
-        let version = cap.get(3).map(|m| m.as_str()).unwrap_or("")
-            .split('\t').next().unwrap_or("").trim().to_string();
+        let path = cap
+            .get(2)
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let version = cap
+            .get(3)
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .split('\t')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if path.is_empty() || version.is_empty() || !version.starts_with('v') {
             continue;
         }
