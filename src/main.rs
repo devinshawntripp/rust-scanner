@@ -13,6 +13,10 @@ mod vuln;
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::blocking::Client;
+
+/// Default YARA rules bundled with the scanner binary.
+#[cfg(feature = "yara")]
+const DEFAULT_YARA_RULES: &str = include_str!("../rules/default.yar");
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -151,8 +155,11 @@ enum Commands {
     /// Smart scan: detect type (container tar, source tar, or binary) and report
     Scan {
         /// Path to file (tar/tar.gz/tar.bz2/iso/bin)
-        #[arg(short, long)]
-        file: String,
+        #[arg(short, long, required_unless_present = "image")]
+        file: Option<String>,
+        /// Docker/OCI image reference to scan (e.g., alpine:3.20, ubuntu:latest)
+        #[arg(long, conflicts_with = "file")]
+        image: Option<String>,
         /// Output format: json or text
         #[arg(long, value_enum, default_value_t = OutputFormat::Json)]
         format: OutputFormat,
@@ -359,6 +366,33 @@ enum DbCommands {
         #[arg(long, value_enum, default_value_t = ScanMode::Deep)]
         mode: ScanMode,
     },
+    /// Pre-populate local cache from PostgreSQL CVE data or by downloading key feeds
+    Seed {
+        /// Seed from PostgreSQL DATABASE_URL (copies cached CVE data to local file cache)
+        #[arg(long, default_value_t = false)]
+        from_pg: bool,
+        /// Download Debian Security Tracker JSON to local cache
+        #[arg(long, default_value_t = false)]
+        debian: bool,
+        /// Download Red Hat OVAL XML for a specific RHEL version (e.g. 9)
+        #[arg(long)]
+        rhel: Option<u32>,
+        /// Download EPSS and KEV data
+        #[arg(long, default_value_t = false)]
+        epss: bool,
+        /// Pre-warm NVD cache with a sample CVE query
+        #[arg(long, default_value_t = false)]
+        nvd: bool,
+        /// Pre-warm OSV cache with a sample ecosystem query
+        #[arg(long, default_value_t = false)]
+        osv: bool,
+        /// Download Ubuntu USN and Alpine SecDB advisory feeds
+        #[arg(long, default_value_t = false)]
+        distro: bool,
+        /// Download all available feeds (debian, rhel7-9, epss, kev, nvd, osv, ubuntu, alpine)
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
 }
 
 fn main() {
@@ -387,6 +421,14 @@ fn main() {
             std::env::set_var("SCANNER_CACHE", default_cache);
         }
     }
+    // Nudge user to run `db seed` if cache is empty on first scan.
+    if matches!(
+        &cli.command,
+        Commands::Scan { .. } | Commands::Container { .. }
+    ) {
+        nudge_seed_if_empty();
+    }
+
     if cli.progress {
         std::env::set_var("SCANNER_PROGRESS_STDERR", "1");
     }
@@ -421,6 +463,7 @@ fn main() {
     match cli.command {
         Commands::Scan {
             file,
+            image,
             format,
             out,
             refs,
@@ -460,11 +503,37 @@ fn main() {
                 }
             }
 
+            // Resolve actual file path: either --file directly or --image via docker/podman save
+            let (_image_tmpdir, file) = if let Some(image_ref) = image {
+                progress("scan.image.pull", &image_ref);
+                match container::pull_and_save_image(&image_ref) {
+                    Ok((tmpdir, tar_path)) => {
+                        progress("scan.image.saved", &tar_path);
+                        (Some(tmpdir), tar_path)
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to pull/save image '{}': {}", image_ref, e);
+                        progress(
+                            "scan.image.error",
+                            &format!("image={} err={}", image_ref, e),
+                        );
+                        utils::progress_panel_finish("scan failed");
+                        std::process::exit(1);
+                    }
+                }
+            } else if let Some(f) = file {
+                (None, f)
+            } else {
+                eprintln!("Either --file or --image must be provided");
+                std::process::exit(1);
+            };
+
             progress("scan.start", &file);
+            let yara_rules = resolve_yara_rules(&cli.yara, &mode);
             let report_json = build_scan_report_value(
                 &file,
                 mode.clone(),
-                cli.yara.clone(),
+                yara_rules,
                 nvd_api_key.clone(),
                 oval_redhat
                     .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
@@ -743,6 +812,127 @@ fn strip_references_in_findings(v: &mut Value) {
             f.as_object_mut().map(|o| o.remove("references"));
         }
     }
+}
+
+/// Print a hint if the vulnerability cache is empty (e.g. fresh install without `make install`).
+fn nudge_seed_if_empty() {
+    let cache_dir = resolve_cache_dir();
+    let sentinel = cache_dir.join(".seed_done");
+    if sentinel.exists() {
+        return;
+    }
+    let is_empty = match std::fs::read_dir(&cache_dir) {
+        Ok(entries) => entries.count() <= 1, // allow the dir itself
+        Err(_) => true,
+    };
+    if is_empty {
+        progress(
+            "cache.empty",
+            "run `scanrook db seed --all` to pre-warm the vulnerability cache for faster scans",
+        );
+    }
+}
+
+/// Resolve YARA rules path: use user-specified file, or write bundled defaults for deep mode.
+fn resolve_yara_rules(user_yara: &Option<String>, mode: &ScanMode) -> Option<String> {
+    // If user specified a YARA rules file, use that
+    if user_yara.is_some() {
+        return user_yara.clone();
+    }
+    // In deep mode, write bundled defaults to a temp file
+    #[cfg(feature = "yara")]
+    if matches!(mode, ScanMode::Deep) {
+        match write_default_yara_to_temp() {
+            Ok(path) => {
+                progress("yara.defaults.loaded", &path);
+                return Some(path);
+            }
+            Err(e) => {
+                progress("yara.defaults.error", &format!("{}", e));
+            }
+        }
+    }
+    #[cfg(not(feature = "yara"))]
+    let _ = mode;
+    None
+}
+
+#[cfg(feature = "yara")]
+fn write_default_yara_to_temp() -> anyhow::Result<String> {
+    // Write to cache dir so it persists across scans in the same session
+    let cache_dir = resolve_cache_dir();
+    let yara_path = cache_dir.join("default_rules.yar");
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::write(&yara_path, DEFAULT_YARA_RULES)?;
+    Ok(yara_path.to_string_lossy().to_string())
+}
+
+/// Seed local file cache by copying CVE data from PostgreSQL.
+///
+/// Handles multiple table shapes gracefully — if a table doesn't exist,
+/// it's skipped rather than failing the whole seed operation.
+fn seed_cache_from_pg(cache_dir: &std::path::Path) -> anyhow::Result<usize> {
+    let mut pg = vuln::pg_connect()
+        .ok_or_else(|| anyhow::anyhow!("DATABASE_URL not set or connection failed"))?;
+    vuln::pg_init_schema(&mut pg);
+
+    let mut count = 0usize;
+
+    // Try cve_cache table (NVD/OSV/Red Hat enrichment data)
+    match pg.query(
+        "SELECT cve_id, source, response_json FROM cve_cache ORDER BY cve_id",
+        &[],
+    ) {
+        Ok(rows) => {
+            for row in &rows {
+                let cve_id: String = row.get(0);
+                let source: String = row.get(1);
+                let json: serde_json::Value = row.get(2);
+                let key_hash = cache::cache_key(&["pg_seed", &source, &cve_id]);
+                let cache_path = cache_dir.join(&key_hash);
+                if cache_path.exists() {
+                    continue;
+                }
+                let data = serde_json::to_vec(&json)?;
+                std::fs::write(&cache_path, &data)?;
+                count += 1;
+            }
+            progress("db.seed.pg.cve_cache", &format!("entries={}", rows.len()));
+        }
+        Err(e) => {
+            progress(
+                "db.seed.pg.cve_cache.skip",
+                &format!("table may not exist: {}", e),
+            );
+        }
+    }
+
+    // Try osv_cache table if it exists
+    match pg.query(
+        "SELECT advisory_id, response_json FROM osv_cache ORDER BY advisory_id",
+        &[],
+    ) {
+        Ok(rows) => {
+            for row in &rows {
+                let id: String = row.get(0);
+                let json: serde_json::Value = row.get(1);
+                let key_hash = cache::cache_key(&["pg_seed_osv", &id]);
+                let cache_path = cache_dir.join(&key_hash);
+                if cache_path.exists() {
+                    continue;
+                }
+                let data = serde_json::to_vec(&json)?;
+                std::fs::write(&cache_path, &data)?;
+                count += 1;
+            }
+            progress("db.seed.pg.osv_cache", &format!("entries={}", rows.len()));
+        }
+        Err(_) => {
+            // Table doesn't exist, that's fine
+        }
+    }
+
+    Ok(count)
 }
 
 fn build_scan_report_value(
@@ -1371,6 +1561,158 @@ fn run_db(
         }
         DbCommands::Download { file, mode } | DbCommands::Warm { file, mode } => {
             run_scan_warm(&file, mode, yara, nvd_api_key)?;
+        }
+        DbCommands::Seed {
+            from_pg,
+            debian,
+            rhel,
+            epss,
+            nvd,
+            osv,
+            distro,
+            all,
+        } => {
+            let cache_dir = resolve_cache_dir();
+            std::fs::create_dir_all(&cache_dir)?;
+            set_dir_permissions_0700(&cache_dir);
+            let mut seeded = 0usize;
+
+            // Seed from PostgreSQL
+            if from_pg || all {
+                progress("db.seed.pg.start", "");
+                match seed_cache_from_pg(&cache_dir) {
+                    Ok(n) => {
+                        progress("db.seed.pg.done", &format!("entries={}", n));
+                        seeded += n;
+                    }
+                    Err(e) => {
+                        progress("db.seed.pg.error", &format!("{}", e));
+                        eprintln!("PostgreSQL seed failed: {}", e);
+                    }
+                }
+            }
+
+            // Debian Security Tracker
+            if debian || all {
+                progress("db.seed.debian.start", "");
+                match vuln::debian_tracker_enrich_seed(&cache_dir) {
+                    Ok(()) => {
+                        progress("db.seed.debian.done", "ok");
+                        seeded += 1;
+                    }
+                    Err(e) => {
+                        progress("db.seed.debian.error", &format!("{}", e));
+                        eprintln!("Debian tracker seed failed: {}", e);
+                    }
+                }
+            }
+
+            // Red Hat OVAL
+            if rhel.is_some() || all {
+                let versions: Vec<u32> = if let Some(v) = rhel {
+                    vec![v]
+                } else {
+                    vec![7, 8, 9]
+                };
+                for v in versions {
+                    progress("db.seed.oval.start", &format!("rhel{}", v));
+                    let pkgs = vec![container::PackageCoordinate {
+                        ecosystem: "redhat".into(),
+                        name: "seed".into(),
+                        version: format!("0-0.el{}", v),
+                    }];
+                    match redhat::fetch_redhat_oval(&pkgs, Some(&cache_dir)) {
+                        Some(path) => {
+                            progress("db.seed.oval.done", &path);
+                            seeded += 1;
+                        }
+                        None => {
+                            eprintln!("OVAL download failed for RHEL {}", v);
+                        }
+                    }
+                }
+            }
+
+            // EPSS and KEV
+            if epss || all {
+                progress("db.seed.epss.start", "");
+                let mut dummy_findings = Vec::new();
+                vuln::epss_enrich_findings(&mut dummy_findings, Some(&cache_dir));
+                vuln::kev_enrich_findings(&mut dummy_findings, Some(&cache_dir));
+                progress("db.seed.epss.done", "ok");
+                seeded += 1;
+            }
+
+            // NVD warm-up with sample CVE
+            if nvd || all {
+                progress("db.seed.nvd.start", "");
+                let sample_cves = ["CVE-2021-44228", "CVE-2023-44487", "CVE-2024-3094"];
+                for cve in &sample_cves {
+                    let mut findings = vec![report::Finding {
+                        id: cve.to_string(),
+                        source_ids: vec![],
+                        package: None,
+                        confidence_tier: report::ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: report::EvidenceSource::InstalledDb,
+                        accuracy_note: None,
+                        fixed: None,
+                        fixed_in: None,
+                        recommendation: None,
+                        severity: None,
+                        cvss: None,
+                        description: None,
+                        evidence: vec![],
+                        references: vec![],
+                        confidence: None,
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
+                    }];
+                    let mut pg = vuln::pg_connect();
+                    vuln::enrich_findings_with_nvd(
+                        &mut findings,
+                        nvd_api_key.as_deref(),
+                        &mut pg,
+                    );
+                }
+                progress("db.seed.nvd.done", "ok");
+                seeded += sample_cves.len();
+            }
+
+            // OSV warm-up with sample packages
+            if osv || all {
+                progress("db.seed.osv.start", "");
+                let sample_pkgs = vec![
+                    container::PackageCoordinate {
+                        ecosystem: "deb".into(),
+                        name: "openssl".into(),
+                        version: "3.0.0".into(),
+                    },
+                    container::PackageCoordinate {
+                        ecosystem: "npm".into(),
+                        name: "lodash".into(),
+                        version: "4.17.0".into(),
+                    },
+                    container::PackageCoordinate {
+                        ecosystem: "PyPI".into(),
+                        name: "requests".into(),
+                        version: "2.25.0".into(),
+                    },
+                ];
+                let _results = vuln::osv_batch_query(&sample_pkgs);
+                progress("db.seed.osv.done", "ok");
+                seeded += sample_pkgs.len();
+            }
+
+            // Ubuntu USN + Alpine SecDB advisory feeds
+            if distro || all {
+                progress("db.seed.distro.start", "");
+                vuln::seed_distro_feeds();
+                progress("db.seed.distro.done", "ok");
+                seeded += 1;
+            }
+
+            println!("seed_complete items_seeded={}", seeded);
         }
     }
     Ok(())

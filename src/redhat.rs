@@ -656,6 +656,133 @@ fn append_text(el: &Element, out: &mut String) {
     }
 }
 
+/// Detect the Red Hat OVAL major version from an RPM ecosystem string and/or package metadata.
+fn detect_rhel_major_version(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
+    // Look at release tags in package versions: e.g. "5.1.8-6.el9" → 9
+    let re = regex::Regex::new(r"\.el(\d+)").ok()?;
+    for pkg in packages {
+        if let Some(caps) = re.captures(&pkg.version) {
+            if let Some(m) = caps.get(1) {
+                if let Ok(n) = m.as_str().parse::<u32>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Auto-download and cache Red Hat OVAL data for the given RHEL major version.
+///
+/// Returns the path to the cached XML file, or None if download failed.
+pub fn fetch_redhat_oval(
+    packages: &[crate::container::PackageCoordinate],
+    cache_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    let version = detect_rhel_major_version(packages)?;
+    if version < 6 || version > 10 {
+        crate::utils::progress(
+            "oval.auto.skip",
+            &format!("unsupported RHEL version {}", version),
+        );
+        return None;
+    }
+
+    let cache_dir = cache_dir.or_else(|| {
+        std::env::var("SCANNER_CACHE")
+            .ok()
+            .map(|_| std::path::Path::new(""))
+    });
+    let cache_base = if let Some(dir) = cache_dir {
+        dir.to_path_buf()
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home)
+            .join(".scanrook")
+            .join("cache")
+    } else {
+        return None;
+    };
+
+    let oval_dir = cache_base.join("oval");
+    let _ = std::fs::create_dir_all(&oval_dir);
+    let oval_xml_path = oval_dir.join(format!("rhel-{}.oval.xml", version));
+
+    // Check cache freshness (7 days)
+    if oval_xml_path.exists() {
+        if let Ok(meta) = std::fs::metadata(&oval_xml_path) {
+            if let Ok(modified) = meta.modified() {
+                let age = std::time::SystemTime::now()
+                    .duration_since(modified)
+                    .unwrap_or_default();
+                if age < std::time::Duration::from_secs(7 * 24 * 3600) {
+                    crate::utils::progress(
+                        "oval.auto.cache_hit",
+                        &oval_xml_path.to_string_lossy(),
+                    );
+                    return Some(oval_xml_path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    let url = format!(
+        "https://www.redhat.com/security/data/oval/v2/RHEL{}/rhel-{}.oval.xml.bz2",
+        version, version
+    );
+    crate::utils::progress("oval.auto.download", &url);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .ok()?;
+    let resp = match client.get(&url).send() {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            crate::utils::progress(
+                "oval.auto.download.error",
+                &format!("HTTP {}", r.status()),
+            );
+            return None;
+        }
+        Err(e) => {
+            crate::utils::progress("oval.auto.download.error", &format!("{}", e));
+            return None;
+        }
+    };
+
+    let bz2_bytes = match resp.bytes() {
+        Ok(b) => b,
+        Err(e) => {
+            crate::utils::progress("oval.auto.download.error", &format!("{}", e));
+            return None;
+        }
+    };
+
+    // Decompress bzip2
+    let mut decoder = bzip2::read::BzDecoder::new(bz2_bytes.as_ref());
+    let mut xml_data = Vec::new();
+    if let Err(e) = std::io::Read::read_to_end(&mut decoder, &mut xml_data) {
+        crate::utils::progress("oval.auto.decompress.error", &format!("{}", e));
+        return None;
+    }
+
+    if let Err(e) = std::fs::write(&oval_xml_path, &xml_data) {
+        crate::utils::progress("oval.auto.write.error", &format!("{}", e));
+        return None;
+    }
+
+    crate::utils::progress(
+        "oval.auto.done",
+        &format!(
+            "version={} size={}KB path={}",
+            version,
+            xml_data.len() / 1024,
+            oval_xml_path.display()
+        ),
+    );
+    Some(oval_xml_path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

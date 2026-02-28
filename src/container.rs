@@ -18,13 +18,106 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tar::Archive;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
 use walkdir::WalkDir;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
 /// Maximum decompressed size per tar entry (2 GB) to guard against decompression bombs
 const MAX_ENTRY_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Pull and save a container image to a temporary tar file using docker or podman.
+///
+/// Returns (TempDir, path_string) — the TempDir must be kept alive for the duration
+/// of scanning; it is cleaned up when dropped.
+pub fn pull_and_save_image(image_ref: &str) -> anyhow::Result<(TempDir, String)> {
+    use std::process::Command;
+
+    let tmpdir = tempdir()?;
+    let tar_path = tmpdir.path().join("image.tar");
+    let tar_str = tar_path.to_string_lossy().to_string();
+
+    // Try docker first, then podman
+    for runtime in &["docker", "podman"] {
+        // Check if runtime exists
+        let exists = Command::new(runtime)
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if exists.is_err() || !exists.unwrap().success() {
+            continue;
+        }
+
+        progress("image.runtime", runtime);
+
+        // Try to save directly (image may already be pulled)
+        let save = Command::new(runtime)
+            .arg("save")
+            .arg(image_ref)
+            .arg("-o")
+            .arg(&tar_str)
+            .output()?;
+
+        if save.status.success() && tar_path.exists() {
+            let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+            if size > 0 {
+                progress(
+                    "image.saved",
+                    &format!("runtime={} size={}", runtime, size),
+                );
+                return Ok((tmpdir, tar_str));
+            }
+        }
+
+        // Image not pulled yet — pull first, then save
+        progress("image.pull.start", &format!("{} pull {}", runtime, image_ref));
+        let pull = Command::new(runtime)
+            .arg("pull")
+            .arg(image_ref)
+            .output()?;
+
+        if !pull.status.success() {
+            let stderr = String::from_utf8_lossy(&pull.stderr);
+            progress(
+                "image.pull.error",
+                &format!("{}: {}", runtime, stderr.trim()),
+            );
+            continue;
+        }
+
+        // Now save
+        let save = Command::new(runtime)
+            .arg("save")
+            .arg(image_ref)
+            .arg("-o")
+            .arg(&tar_str)
+            .output()?;
+
+        if save.status.success() && tar_path.exists() {
+            let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
+            if size > 0 {
+                progress(
+                    "image.saved",
+                    &format!("runtime={} size={}", runtime, size),
+                );
+                return Ok((tmpdir, tar_str));
+            }
+        }
+
+        let stderr = String::from_utf8_lossy(&save.stderr);
+        progress(
+            "image.save.error",
+            &format!("{}: {}", runtime, stderr.trim()),
+        );
+    }
+
+    Err(anyhow::anyhow!(
+        "No container runtime (docker/podman) available or failed to save image '{}'. \
+         Install docker or podman, or use --file with a pre-saved tar.",
+        image_ref
+    ))
+}
 
 /// Extracts a tar archive (optionally gzipped) to dest with path-traversal protection.
 ///
@@ -359,6 +452,19 @@ pub fn scan_container(
         "container.enrich.osv.done",
         &format!("findings={}", findings_norm.len()),
     );
+
+    // Debian Security Tracker enrichment (for deb/dpkg packages)
+    {
+        let has_deb = packages.iter().any(|p| p.ecosystem == "deb");
+        if has_deb {
+            progress("container.enrich.debian_tracker.start", "");
+            let dst_started = std::time::Instant::now();
+            let dst_cache = crate::vuln::resolve_enrich_cache_dir();
+            crate::vuln::debian_tracker_enrich(&packages, &mut findings_norm, dst_cache.as_deref());
+            progress_timing("container.enrich.debian_tracker", dst_started);
+        }
+    }
+
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
@@ -463,7 +569,17 @@ pub fn scan_container(
 
     let oval_redhat = oval_redhat
         .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-        .filter(|v| !v.trim().is_empty());
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            // Auto-download OVAL for RPM-based images when not explicitly provided
+            let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+            if has_rpm {
+                let cache = crate::vuln::resolve_enrich_cache_dir();
+                crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
+            } else {
+                None
+            }
+        });
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
@@ -720,6 +836,17 @@ pub fn build_container_report(
         "container.enrich.osv.done",
         &format!("findings={}", findings_norm.len()),
     );
+
+    // Debian Security Tracker enrichment (for deb/dpkg packages)
+    let has_deb_packages = packages.iter().any(|p| p.ecosystem == "deb");
+    if has_deb_packages {
+        progress("container.enrich.debian_tracker.start", "");
+        let dst_started = std::time::Instant::now();
+        let dst_cache_dir = crate::vuln::resolve_enrich_cache_dir();
+        crate::vuln::debian_tracker_enrich(&packages, &mut findings_norm, dst_cache_dir.as_deref());
+        progress_timing("container.enrich.debian_tracker", dst_started);
+    }
+
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
@@ -820,7 +947,17 @@ pub fn build_container_report(
 
     let oval_redhat = oval_redhat
         .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-        .filter(|v| !v.trim().is_empty());
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            // Auto-download OVAL for RPM-based images when not explicitly provided
+            let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+            if has_rpm {
+                let cache = crate::vuln::resolve_enrich_cache_dir();
+                crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
+            } else {
+                None
+            }
+        });
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
@@ -1410,7 +1547,7 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
         }
     }
 
-    // RPM: try host rpm CLI as a fallback (if available)
+    // RPM: try native parsing first (SQLite/BDB), then fall back to rpm CLI.
     // RHEL-like images may use /var/lib/rpm, newer distros may use /usr/lib/sysimage/rpm.
     let rpmdb_legacy = rootfs.join("var/lib/rpm");
     let rpmdb_modern = rootfs.join("usr/lib/sysimage/rpm");
@@ -1420,7 +1557,7 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
             "container.rpm.ecosystem",
             &format!("detected={}", rpm_ecosystem),
         );
-        match detect_rpm_packages_cli(rootfs) {
+        match detect_rpm_packages_native(rootfs) {
             Ok(list) => {
                 if list.is_empty() {
                     progress("container.rpm.detect.warn", "rpm CLI returned 0 packages");
@@ -1614,6 +1751,280 @@ fn parse_apk_installed_with_ecosystem(
     }
 }
 
+/// Detect RPM packages using native parsing (SQLite + BerkeleyDB), falling back to rpm CLI.
+fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let db_candidates = [
+        rootfs.join("var/lib/rpm/rpmdb.sqlite"),
+        rootfs.join("usr/lib/sysimage/rpm/rpmdb.sqlite"),
+    ];
+
+    // 1. Try SQLite databases first (modern RPM: RHEL 9+, Fedora 33+, Rocky 9+)
+    for sqlite_path in &db_candidates {
+        if !sqlite_path.exists() {
+            continue;
+        }
+        progress("container.rpm.native.sqlite", &sqlite_path.to_string_lossy());
+        match parse_rpm_sqlite(sqlite_path) {
+            Ok(pkgs) if !pkgs.is_empty() => {
+                progress(
+                    "container.rpm.native.sqlite.done",
+                    &format!("packages={}", pkgs.len()),
+                );
+                return Ok(pkgs);
+            }
+            Ok(_) => {
+                progress("container.rpm.native.sqlite.empty", &sqlite_path.to_string_lossy());
+            }
+            Err(e) => {
+                progress(
+                    "container.rpm.native.sqlite.error",
+                    &format!("{}: {}", sqlite_path.display(), e),
+                );
+            }
+        }
+    }
+
+    // 2. Try BerkeleyDB Packages file (legacy RPM: RHEL 7/8, CentOS, older Fedora)
+    let bdb_candidates = [
+        rootfs.join("var/lib/rpm/Packages"),
+        rootfs.join("var/lib/rpm/Packages.db"),
+        rootfs.join("usr/lib/sysimage/rpm/Packages"),
+        rootfs.join("usr/lib/sysimage/rpm/Packages.db"),
+    ];
+    for bdb_path in &bdb_candidates {
+        if !bdb_path.exists() {
+            continue;
+        }
+        progress("container.rpm.native.bdb", &bdb_path.to_string_lossy());
+        match parse_rpm_bdb(bdb_path) {
+            Ok(pkgs) if !pkgs.is_empty() => {
+                progress(
+                    "container.rpm.native.bdb.done",
+                    &format!("packages={}", pkgs.len()),
+                );
+                return Ok(pkgs);
+            }
+            Ok(_) => {
+                progress("container.rpm.native.bdb.empty", &bdb_path.to_string_lossy());
+            }
+            Err(e) => {
+                progress(
+                    "container.rpm.native.bdb.error",
+                    &format!("{}: {}", bdb_path.display(), e),
+                );
+            }
+        }
+    }
+
+    // 3. Fall back to rpm CLI as last resort
+    progress("container.rpm.native.fallback", "trying rpm CLI");
+    detect_rpm_packages_cli(rootfs)
+}
+
+/// Parse RPM packages from a SQLite rpmdb.
+pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    use rusqlite::Connection;
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare("SELECT hnum, blob FROM Packages")?;
+    let mut results = Vec::new();
+    let rows = stmt.query_map([], |row| {
+        let _hnum: i64 = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok(blob)
+    })?;
+    for row in rows {
+        let blob = match row {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Some((name, version)) = parse_rpm_header_blob(&blob) {
+            results.push((name, version));
+        }
+    }
+    Ok(results)
+}
+
+/// Parse RPM packages from a BerkeleyDB hash-format Packages file.
+pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let data = fs::read(path)?;
+    if data.len() < 512 {
+        return Err(anyhow::anyhow!("file too small for BerkeleyDB"));
+    }
+
+    // BerkeleyDB hash magic: 0x00061561 (little-endian) at offset 12
+    // Or btree magic: 0x00053162 at offset 12
+    let magic = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let is_hash = magic == 0x00061561;
+    let is_btree = magic == 0x00053162;
+    if !is_hash && !is_btree {
+        return Err(anyhow::anyhow!(
+            "not a BerkeleyDB hash/btree file (magic=0x{:08x})",
+            magic
+        ));
+    }
+
+    // Page size at offset 20 (4 bytes LE)
+    let page_size = u32::from_le_bytes([data[20], data[21], data[22], data[23]]) as usize;
+    if page_size == 0 || page_size > 65536 || data.len() % page_size != 0 {
+        // Try common page sizes
+        return parse_rpm_bdb_scan(&data);
+    }
+
+    parse_rpm_bdb_scan(&data)
+}
+
+/// Scan BerkeleyDB data for RPM header blobs by looking for the RPM header magic.
+fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String)>> {
+    let mut results = Vec::new();
+    let rpm_magic: [u8; 4] = [0x8e, 0xad, 0xe8, 0x01];
+
+    // Scan for RPM header magic bytes throughout the file
+    let mut offset = 0;
+    while offset + 16 < data.len() {
+        if data[offset..offset + 4] == rpm_magic {
+            // Found an RPM header; try to parse it
+            if let Some((name, version)) = parse_rpm_header_blob(&data[offset..]) {
+                results.push((name, version));
+            }
+        }
+        offset += 1;
+    }
+
+    if results.is_empty() {
+        return Err(anyhow::anyhow!("no RPM headers found in BerkeleyDB file"));
+    }
+    Ok(results)
+}
+
+/// RPM header tag constants
+const RPM_TAG_NAME: u32 = 1000;
+const RPM_TAG_VERSION: u32 = 1001;
+const RPM_TAG_RELEASE: u32 = 1002;
+const RPM_TAG_EPOCH: u32 = 1003;
+/// RPM tag type: STRING
+const RPM_TYPE_STRING: u32 = 6;
+/// RPM tag type: INT32
+const RPM_TYPE_INT32: u32 = 4;
+
+/// Parse NAME, VERSION, RELEASE, EPOCH from an RPM header binary blob.
+///
+/// RPM header format:
+///   Bytes 0-3:   magic (8e ad e8 01)
+///   Bytes 4-7:   reserved (4 bytes)
+///   Bytes 8-11:  nindex — number of tag entries (big-endian u32)
+///   Bytes 12-15: hsize — size of the data section in bytes (big-endian u32)
+///   Bytes 16..:  nindex * 16-byte tag entries, then hsize bytes of data
+///
+/// Each tag entry (16 bytes):
+///   Bytes 0-3: tag id (big-endian u32)
+///   Bytes 4-7: type (big-endian u32)
+///   Bytes 8-11: offset into data section (big-endian u32)
+///   Bytes 12-15: count (big-endian u32)
+fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
+    if blob.len() < 16 {
+        return None;
+    }
+    // Verify magic
+    if blob[0..4] != [0x8e, 0xad, 0xe8, 0x01] {
+        return None;
+    }
+    let nindex = u32::from_be_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
+    let hsize = u32::from_be_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+
+    // Sanity check: nindex and hsize shouldn't be unreasonably large
+    if nindex > 10000 || hsize > 64 * 1024 * 1024 {
+        return None;
+    }
+
+    let entries_start = 16;
+    let entries_size = nindex * 16;
+    let data_start = entries_start + entries_size;
+    let total_needed = data_start + hsize;
+    if blob.len() < total_needed {
+        // If the blob is smaller, try with available data
+        if blob.len() < data_start {
+            return None;
+        }
+    }
+
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+    let mut release: Option<String> = None;
+    let mut epoch: Option<u32> = None;
+
+    for i in 0..nindex {
+        let e = entries_start + i * 16;
+        if e + 16 > blob.len() {
+            break;
+        }
+        let tag = u32::from_be_bytes([blob[e], blob[e + 1], blob[e + 2], blob[e + 3]]);
+        let ttype = u32::from_be_bytes([blob[e + 4], blob[e + 5], blob[e + 6], blob[e + 7]]);
+        let toffset =
+            u32::from_be_bytes([blob[e + 8], blob[e + 9], blob[e + 10], blob[e + 11]]) as usize;
+
+        let abs_offset = data_start + toffset;
+
+        match tag {
+            RPM_TAG_NAME | RPM_TAG_VERSION | RPM_TAG_RELEASE if ttype == RPM_TYPE_STRING => {
+                if abs_offset < blob.len() {
+                    let end = blob[abs_offset..]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(blob.len() - abs_offset);
+                    if let Ok(s) = std::str::from_utf8(&blob[abs_offset..abs_offset + end]) {
+                        match tag {
+                            RPM_TAG_NAME => name = Some(s.to_string()),
+                            RPM_TAG_VERSION => version = Some(s.to_string()),
+                            RPM_TAG_RELEASE => release = Some(s.to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            RPM_TAG_EPOCH if ttype == RPM_TYPE_INT32 => {
+                if abs_offset + 4 <= blob.len() {
+                    epoch = Some(u32::from_be_bytes([
+                        blob[abs_offset],
+                        blob[abs_offset + 1],
+                        blob[abs_offset + 2],
+                        blob[abs_offset + 3],
+                    ]));
+                }
+            }
+            _ => {}
+        }
+
+        // Short-circuit if we found everything
+        if name.is_some() && version.is_some() && release.is_some() {
+            // epoch is optional, but check if there could be more entries with it
+            if epoch.is_some() || i > nindex / 2 {
+                break;
+            }
+        }
+    }
+
+    let n = name?;
+    let v = version?;
+    let r = release.unwrap_or_default();
+
+    let full_version = if let Some(e) = epoch {
+        if e > 0 {
+            format!("{}:{}-{}", e, v, r)
+        } else if r.is_empty() {
+            v
+        } else {
+            format!("{}-{}", v, r)
+        }
+    } else if r.is_empty() {
+        v
+    } else {
+        format!("{}-{}", v, r)
+    };
+
+    Some((n, full_version))
+}
+
+/// Fallback: detect RPM packages using the system rpm CLI.
 fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)>> {
     use std::process::Command;
     let dbpaths = [
@@ -1675,4 +2086,139 @@ fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no rpm database found in rootfs")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal RPM header blob with NAME, VERSION, RELEASE tags.
+    fn make_rpm_header(name: &str, version: &str, release: &str, epoch: Option<u32>) -> Vec<u8> {
+        let mut tag_count: u32 = 3; // NAME, VERSION, RELEASE
+        if epoch.is_some() {
+            tag_count += 1;
+        }
+
+        // Data section: strings laid out sequentially with NUL terminators, then optional epoch
+        let mut data = Vec::new();
+        let name_offset = data.len() as u32;
+        data.extend_from_slice(name.as_bytes());
+        data.push(0);
+        let version_offset = data.len() as u32;
+        data.extend_from_slice(version.as_bytes());
+        data.push(0);
+        let release_offset = data.len() as u32;
+        data.extend_from_slice(release.as_bytes());
+        data.push(0);
+        // Align to 4-byte boundary for INT32 if needed
+        let epoch_offset = if epoch.is_some() {
+            while data.len() % 4 != 0 {
+                data.push(0);
+            }
+            let off = data.len() as u32;
+            let e = epoch.unwrap();
+            data.extend_from_slice(&e.to_be_bytes());
+            off
+        } else {
+            0
+        };
+
+        let hsize = data.len() as u32;
+        let nindex = tag_count;
+
+        let mut blob = Vec::new();
+        // Header magic
+        blob.extend_from_slice(&[0x8e, 0xad, 0xe8, 0x01]);
+        // Reserved
+        blob.extend_from_slice(&[0, 0, 0, 0]);
+        // nindex
+        blob.extend_from_slice(&nindex.to_be_bytes());
+        // hsize
+        blob.extend_from_slice(&hsize.to_be_bytes());
+        // Tag entries (16 bytes each): tag, type, offset, count
+        // NAME
+        blob.extend_from_slice(&RPM_TAG_NAME.to_be_bytes());
+        blob.extend_from_slice(&RPM_TYPE_STRING.to_be_bytes());
+        blob.extend_from_slice(&name_offset.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        // VERSION
+        blob.extend_from_slice(&RPM_TAG_VERSION.to_be_bytes());
+        blob.extend_from_slice(&RPM_TYPE_STRING.to_be_bytes());
+        blob.extend_from_slice(&version_offset.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        // RELEASE
+        blob.extend_from_slice(&RPM_TAG_RELEASE.to_be_bytes());
+        blob.extend_from_slice(&RPM_TYPE_STRING.to_be_bytes());
+        blob.extend_from_slice(&release_offset.to_be_bytes());
+        blob.extend_from_slice(&1u32.to_be_bytes());
+        // EPOCH (optional)
+        if epoch.is_some() {
+            blob.extend_from_slice(&RPM_TAG_EPOCH.to_be_bytes());
+            blob.extend_from_slice(&RPM_TYPE_INT32.to_be_bytes());
+            blob.extend_from_slice(&epoch_offset.to_be_bytes());
+            blob.extend_from_slice(&1u32.to_be_bytes());
+        }
+        // Data section
+        blob.extend_from_slice(&data);
+
+        blob
+    }
+
+    #[test]
+    fn test_parse_rpm_header_blob_basic() {
+        let blob = make_rpm_header("bash", "5.1.8", "6.el9", None);
+        let result = parse_rpm_header_blob(&blob);
+        assert_eq!(
+            result,
+            Some(("bash".to_string(), "5.1.8-6.el9".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_rpm_header_blob_with_epoch() {
+        let blob = make_rpm_header("openssl", "3.0.7", "20.el9", Some(1));
+        let result = parse_rpm_header_blob(&blob);
+        assert_eq!(
+            result,
+            Some(("openssl".to_string(), "1:3.0.7-20.el9".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_rpm_header_blob_epoch_zero() {
+        let blob = make_rpm_header("glibc", "2.34", "60.el9", Some(0));
+        let result = parse_rpm_header_blob(&blob);
+        assert_eq!(
+            result,
+            Some(("glibc".to_string(), "2.34-60.el9".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_rpm_header_blob_bad_magic() {
+        let blob = vec![0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(parse_rpm_header_blob(&blob), None);
+    }
+
+    #[test]
+    fn test_parse_rpm_header_blob_too_short() {
+        let blob = vec![0x8e, 0xad, 0xe8, 0x01];
+        assert_eq!(parse_rpm_header_blob(&blob), None);
+    }
+
+    #[test]
+    fn test_parse_rpm_sqlite_nonexistent() {
+        let result = parse_rpm_sqlite(Path::new("/nonexistent/rpmdb.sqlite"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_dpkg_status_basic() {
+        let status = "Package: libc6\nStatus: install ok installed\nVersion: 2.36-9\n\nPackage: removed-pkg\nStatus: deinstall ok config-files\nVersion: 1.0\n\n";
+        let mut out = Vec::new();
+        parse_dpkg_status(status, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "libc6");
+        assert_eq!(out[0].version, "2.36-9");
+    }
 }
