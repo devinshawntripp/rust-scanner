@@ -615,7 +615,9 @@ fn query_rpm_db(dbpath: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let sqlite_path = dbpath.join("rpmdb.sqlite");
     if sqlite_path.exists() {
         match crate::container::parse_rpm_sqlite(&sqlite_path) {
-            Ok(pkgs) if !pkgs.is_empty() => return Ok(pkgs),
+            Ok(pkgs) if !pkgs.is_empty() => {
+                return Ok(pkgs.into_iter().map(|(n, v, _)| (n, v)).collect());
+            }
             Ok(_) => {}
             Err(e) => {
                 crate::utils::progress(
@@ -631,7 +633,9 @@ fn query_rpm_db(dbpath: &Path) -> anyhow::Result<Vec<(String, String)>> {
         let bdb_path = dbpath.join(bdb_name);
         if bdb_path.exists() {
             match crate::container::parse_rpm_bdb(&bdb_path) {
-                Ok(pkgs) if !pkgs.is_empty() => return Ok(pkgs),
+                Ok(pkgs) if !pkgs.is_empty() => {
+                    return Ok(pkgs.into_iter().map(|(n, v, _)| (n, v)).collect());
+                }
                 Ok(_) => {}
                 Err(e) => {
                     crate::utils::progress(

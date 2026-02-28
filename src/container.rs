@@ -519,17 +519,10 @@ pub fn scan_container(
         &format!("findings={}", findings_norm.len()),
     );
 
-    // Debian Security Tracker enrichment (for deb/dpkg packages)
-    {
-        let has_deb = packages.iter().any(|p| p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb");
-        if has_deb {
-            progress("container.enrich.debian_tracker.start", "");
-            let dst_started = std::time::Instant::now();
-            let dst_cache = crate::vuln::resolve_enrich_cache_dir();
-            crate::vuln::debian_tracker_enrich(&packages, &mut findings_norm, dst_cache.as_deref());
-            progress_timing("container.enrich.debian_tracker", dst_started);
-        }
-    }
+    // NOTE: Debian Security Tracker enrichment is already handled inside osv_enrich_findings
+    // via load_debian_tracker_data() + build_debian_candidate_index(). The separate
+    // debian_tracker_enrich() call was removed because it loaded the same 65MB JSON a second
+    // time and always found 0 new findings (it iterated the wrong JSON structure).
 
     // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
     // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
@@ -982,15 +975,7 @@ pub fn build_container_report(
         &format!("findings={}", findings_norm.len()),
     );
 
-    // Debian Security Tracker enrichment (for deb/dpkg packages)
-    let has_deb_packages = packages.iter().any(|p| p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb");
-    if has_deb_packages {
-        progress("container.enrich.debian_tracker.start", "");
-        let dst_started = std::time::Instant::now();
-        let dst_cache_dir = crate::vuln::resolve_enrich_cache_dir();
-        crate::vuln::debian_tracker_enrich(&packages, &mut findings_norm, dst_cache_dir.as_deref());
-        progress_timing("container.enrich.debian_tracker", dst_started);
-    }
+    // NOTE: Debian tracker enrichment already handled in osv_enrich_findings — see scan_container.
 
     // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
     // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
@@ -1720,12 +1705,12 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
                         &format!("ecosystem={} packages={}", rpm_ecosystem, list.len()),
                     );
                 }
-                for (name, version) in list {
+                for (name, version, source_name) in list {
                     packages.push(PackageCoordinate {
                         ecosystem: rpm_ecosystem.clone(),
                         name,
                         version,
-                        source_name: None,
+                        source_name,
                     });
                 }
             }
@@ -1974,7 +1959,7 @@ fn parse_apk_installed_with_ecosystem(
 }
 
 /// Detect RPM packages using native parsing (SQLite + BerkeleyDB), falling back to rpm CLI.
-fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(String, String)>> {
+fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     let db_candidates = [
         rootfs.join("var/lib/rpm/rpmdb.sqlite"),
         rootfs.join("usr/lib/sysimage/rpm/rpmdb.sqlite"),
@@ -2044,7 +2029,7 @@ fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(String, Stri
 }
 
 /// Parse RPM packages from a SQLite rpmdb.
-pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     use rusqlite::Connection;
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut stmt = conn.prepare("SELECT hnum, blob FROM Packages")?;
@@ -2059,15 +2044,15 @@ pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Some((name, version)) = parse_rpm_header_blob(&blob) {
-            results.push((name, version));
+        if let Some((name, version, source_name)) = parse_rpm_header_blob(&blob) {
+            results.push((name, version, source_name));
         }
     }
     Ok(results)
 }
 
 /// Parse RPM packages from a BerkeleyDB hash-format Packages file.
-pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
+pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     let data = fs::read(path)?;
     if data.len() < 512 {
         return Err(anyhow::anyhow!("file too small for BerkeleyDB"));
@@ -2096,7 +2081,7 @@ pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String)>> {
 }
 
 /// Scan BerkeleyDB data for RPM header blobs by looking for the RPM header magic.
-fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String)>> {
+fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     let mut results = Vec::new();
     let rpm_magic: [u8; 4] = [0x8e, 0xad, 0xe8, 0x01];
 
@@ -2105,8 +2090,8 @@ fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String)>> {
     while offset + 16 < data.len() {
         if data[offset..offset + 4] == rpm_magic {
             // Found an RPM header; try to parse it
-            if let Some((name, version)) = parse_rpm_header_blob(&data[offset..]) {
-                results.push((name, version));
+            if let Some((name, version, source_name)) = parse_rpm_header_blob(&data[offset..]) {
+                results.push((name, version, source_name));
             }
         }
         offset += 1;
@@ -2123,6 +2108,8 @@ const RPM_TAG_NAME: u32 = 1000;
 const RPM_TAG_VERSION: u32 = 1001;
 const RPM_TAG_RELEASE: u32 = 1002;
 const RPM_TAG_EPOCH: u32 = 1003;
+/// RPM tag 1044: SOURCERPM — filename of the source RPM (e.g. "openssl-3.0.7-27.el9.src.rpm")
+const RPM_TAG_SOURCERPM: u32 = 1044;
 /// RPM tag type: STRING
 const RPM_TYPE_STRING: u32 = 6;
 /// RPM tag type: INT32
@@ -2142,7 +2129,8 @@ const RPM_TYPE_INT32: u32 = 4;
 ///   Bytes 4-7: type (big-endian u32)
 ///   Bytes 8-11: offset into data section (big-endian u32)
 ///   Bytes 12-15: count (big-endian u32)
-fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
+/// Returns (name, version, source_name) where source_name is derived from SOURCERPM tag.
+fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Option<String>)> {
     if blob.len() < 16 {
         return None;
     }
@@ -2181,6 +2169,7 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
     let mut version: Option<String> = None;
     let mut release: Option<String> = None;
     let mut epoch: Option<u32> = None;
+    let mut source_rpm: Option<String> = None;
 
     for i in 0..nindex {
         let e = entries_start + i * 16;
@@ -2195,7 +2184,9 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
         let abs_offset = data_start + toffset;
 
         match tag {
-            RPM_TAG_NAME | RPM_TAG_VERSION | RPM_TAG_RELEASE if ttype == RPM_TYPE_STRING => {
+            RPM_TAG_NAME | RPM_TAG_VERSION | RPM_TAG_RELEASE | RPM_TAG_SOURCERPM
+                if ttype == RPM_TYPE_STRING =>
+            {
                 if abs_offset < blob.len() {
                     let end = blob[abs_offset..]
                         .iter()
@@ -2206,6 +2197,7 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
                             RPM_TAG_NAME => name = Some(s.to_string()),
                             RPM_TAG_VERSION => version = Some(s.to_string()),
                             RPM_TAG_RELEASE => release = Some(s.to_string()),
+                            RPM_TAG_SOURCERPM => source_rpm = Some(s.to_string()),
                             _ => {}
                         }
                     }
@@ -2224,9 +2216,8 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
             _ => {}
         }
 
-        // Short-circuit if we found everything
-        if name.is_some() && version.is_some() && release.is_some() {
-            // epoch is optional, but check if there could be more entries with it
+        // Short-circuit if we found everything (name+version+release+epoch+sourcerpm)
+        if name.is_some() && version.is_some() && release.is_some() && source_rpm.is_some() {
             if epoch.is_some() || i > nindex / 2 {
                 break;
             }
@@ -2251,11 +2242,31 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
         format!("{}-{}", v, r)
     };
 
-    Some((n, full_version))
+    // Parse source package name from SOURCERPM (e.g. "openssl-3.0.7-27.el9.src.rpm" → "openssl")
+    let source_name = source_rpm.and_then(|srpm| {
+        // Format: name-version-release.arch.src.rpm
+        // Strip ".src.rpm" suffix, then find the last two "-" to get the name
+        let stripped = srpm.strip_suffix(".src.rpm").unwrap_or(&srpm);
+        // Find the second-to-last "-" (separates name from version)
+        let mut last_dash = None;
+        let mut second_last_dash = None;
+        for (i, c) in stripped.char_indices() {
+            if c == '-' {
+                second_last_dash = last_dash;
+                last_dash = Some(i);
+            }
+        }
+        second_last_dash.map(|i| {
+            let src_name = stripped[..i].to_string();
+            if src_name == n { None } else { Some(src_name) }
+        }).flatten()
+    });
+
+    Some((n, full_version, source_name))
 }
 
 /// Fallback: detect RPM packages using the system rpm CLI.
-fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)>> {
+fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     use std::process::Command;
     let dbpaths = [
         rootfs.join("var/lib/rpm"),
@@ -2273,7 +2284,7 @@ fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)
             .arg("--dbpath")
             .arg(dbpath)
             .arg("--qf")
-            .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\n")
+            .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE} %{SOURCERPM}\n")
             .output();
 
         match output {
@@ -2283,9 +2294,22 @@ fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String)
                 for line in s.lines() {
                     let mut parts = line.split_whitespace();
                     if let (Some(name), Some(ver)) = (parts.next(), parts.next()) {
-                        // Strip "(none):" epoch prefix that rpm outputs when epoch is unset
                         let ver = ver.trim_start_matches("(none):");
-                        results.push((name.to_string(), ver.to_string()));
+                        let srpm = parts.next().unwrap_or("(none)");
+                        let source_name = if srpm == "(none)" {
+                            None
+                        } else {
+                            // Parse source name from SOURCERPM filename
+                            let stripped = srpm.strip_suffix(".src.rpm").unwrap_or(srpm);
+                            let mut last_dash = None;
+                            let mut second_last = None;
+                            for (i, c) in stripped.char_indices() {
+                                if c == '-' { second_last = last_dash; last_dash = Some(i); }
+                            }
+                            second_last.map(|i| stripped[..i].to_string())
+                                .filter(|s| s != name)
+                        };
+                        results.push((name.to_string(), ver.to_string(), source_name));
                     }
                 }
                 if !results.is_empty() {
@@ -2400,7 +2424,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("bash".to_string(), "5.1.8-6.el9".to_string()))
+            Some(("bash".to_string(), "5.1.8-6.el9".to_string(), None))
         );
     }
 
@@ -2410,7 +2434,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("openssl".to_string(), "1:3.0.7-20.el9".to_string()))
+            Some(("openssl".to_string(), "1:3.0.7-20.el9".to_string(), None))
         );
     }
 
@@ -2420,7 +2444,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("glibc".to_string(), "2.34-60.el9".to_string()))
+            Some(("glibc".to_string(), "2.34-60.el9".to_string(), None))
         );
     }
 
