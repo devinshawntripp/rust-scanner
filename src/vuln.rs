@@ -4844,13 +4844,16 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
         progress("epss.enrich.skip", "disabled by SCANNER_EPSS_ENRICH");
         return;
     }
-    let cve_ids: Vec<String> = findings
+    let mut cve_ids: Vec<String> = findings
         .iter()
         .filter(|f| f.id.starts_with("CVE-"))
         .map(|f| f.id.clone())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
+    // Sort for stable chunking — without this the HashSet iteration order is random each run,
+    // producing different chunk boundaries and non-matching cache keys on every scan.
+    cve_ids.sort_unstable();
     if cve_ids.is_empty() {
         return;
     }
