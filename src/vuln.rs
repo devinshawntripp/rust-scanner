@@ -3071,68 +3071,79 @@ pub fn redhat_inject_unfixed_cves(
 
     // Step 1: Collect new candidate CVE IDs from per-package list (cached).
     // Each CVE ID is mapped to the set of installed package names it may affect.
-    let mut cve_to_packages: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    // Load all per-package CVE lists in parallel (cache reads + any network fetches).
+    let pkg_list_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(max_concurrent)
+        .build()
+        .ok();
 
-    for (idx, qname) in query_names.iter().enumerate() {
-        progress(
-            "redhat.pkg.cve.list",
-            &format!("{}/{} package={}", idx + 1, total_queries, qname),
-        );
+    let loaded_lists: Vec<(String, Vec<String>)> = if let Some(pool) = pkg_list_pool {
+        pool.install(|| {
+            query_names
+                .par_iter()
+                .filter_map(|qname| {
+                    let cache_tag = cache_key(&["redhat_pkg_cves", qname]);
+                    let mut cve_list: Option<Vec<String>> = None;
 
-        let cache_tag = cache_key(&["redhat_pkg_cves", qname]);
-        let mut cve_list: Option<Vec<String>> = None;
-
-        if !skip_cache {
-            if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
-                if let Ok(v) = serde_json::from_slice::<Vec<String>>(&bytes) {
-                    cve_list = Some(v);
-                }
-            }
-        }
-
-        if cve_list.is_none() {
-            let url = format!(
-                "https://access.redhat.com/hydra/rest/securitydata/cve.json?package={}&per_page=10000",
-                qname
-            );
-            match client.get(&url).send() {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<Value>() {
-                        Ok(json) => {
-                            let ids: Vec<String> = json
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|item| {
-                                            item.get("CVE")
-                                                .and_then(|v| v.as_str())
-                                                .map(|s| s.to_ascii_uppercase())
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            if let Ok(bytes) = serde_json::to_vec(&ids) {
-                                cache_put(cache_dir.as_deref(), &cache_tag, &bytes);
+                    if !skip_cache {
+                        if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
+                            if let Ok(v) = serde_json::from_slice::<Vec<String>>(&bytes) {
+                                cve_list = Some(v);
                             }
-                            cve_list = Some(ids);
-                        }
-                        Err(e) => {
-                            progress("redhat.pkg.cve.parse.err", &format!("{} {}", qname, e));
                         }
                     }
-                }
-                Ok(resp) => {
-                    progress("redhat.pkg.cve.http.err", &format!("{} HTTP {}", qname, resp.status()));
-                }
-                Err(e) => {
-                    progress("redhat.pkg.cve.fetch.err", &format!("{} {}", qname, e));
-                }
-            }
-        }
 
-        let Some(pkg_attribs) = query_to_packages.get(qname) else { continue };
-        let Some(cve_ids) = cve_list else { continue };
+                    if cve_list.is_none() {
+                        let url = format!(
+                            "https://access.redhat.com/hydra/rest/securitydata/cve.json?package={}&per_page=10000",
+                            qname
+                        );
+                        let local_client = build_http_client(timeout_secs);
+                        match local_client.get(&url).send() {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<Value>() {
+                                    Ok(json) => {
+                                        let ids: Vec<String> = json
+                                            .as_array()
+                                            .map(|arr| {
+                                                arr.iter()
+                                                    .filter_map(|item| {
+                                                        item.get("CVE")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_ascii_uppercase())
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        if let Ok(bytes) = serde_json::to_vec(&ids) {
+                                            let cd = resolve_enrich_cache_dir();
+                                            cache_put(cd.as_deref(), &cache_tag, &bytes);
+                                        }
+                                        cve_list = Some(ids);
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
 
+                    cve_list.map(|ids| (qname.clone(), ids))
+                })
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+
+    progress(
+        "redhat.pkg.cve.lists",
+        &format!("loaded={}/{}", loaded_lists.len(), total_queries),
+    );
+
+    let mut cve_to_packages: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for (qname, cve_ids) in loaded_lists {
+        let Some(pkg_attribs) = query_to_packages.get(&qname) else { continue };
         for cve_id in cve_ids {
             if !cve_id.starts_with("CVE-") {
                 continue;
@@ -3172,33 +3183,64 @@ pub fn redhat_inject_unfixed_cves(
 
     // Check PG cache first (sequential since PgClient is !Send).
     let mut id_to_json: HashMap<String, Value> = HashMap::new();
-    let mut to_fetch: Vec<String> = Vec::new();
+    let mut pg_misses: Vec<String> = Vec::new();
     let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
 
     for cve_id in &new_cve_ids {
-        let mut served = false;
+        let mut pg_hit = false;
         if let Some(c) = pg.as_mut() {
             if let Some((payload, last_checked, last_mod)) = pg_get_redhat_cve(c, cve_id) {
                 let ttl = compute_dynamic_ttl_days(last_mod, ttl_days);
                 if Utc::now() - last_checked < ChronoDuration::days(ttl) {
                     id_to_json.insert(cve_id.clone(), payload);
-                    served = true;
+                    pg_hit = true;
                 }
             }
         }
-        if !served && !skip_cache {
-            let cache_tag = cache_key(&["redhat_cve", cve_id]);
-            if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
-                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                    id_to_json.insert(cve_id.clone(), v);
-                    served = true;
-                }
-            }
+        if !pg_hit {
+            pg_misses.push(cve_id.clone());
         }
-        if !served {
+    }
+
+    // Check file cache in parallel for PG misses — per-CVE JSONs can be large,
+    // so parallel deserialization meaningfully reduces wall-clock time.
+    let file_cache_results: Vec<(String, Value)> = if !skip_cache && !pg_misses.is_empty() {
+        let file_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(max_concurrent)
+            .build()
+            .ok();
+        if let Some(pool) = file_pool {
+            pool.install(|| {
+                pg_misses
+                    .par_iter()
+                    .filter_map(|cve_id| {
+                        let cache_tag = cache_key(&["redhat_cve", cve_id]);
+                        if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                                return Some((cve_id.clone(), v));
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut to_fetch: Vec<String> = Vec::new();
+    let file_hit_ids: HashSet<String> = file_cache_results.iter().map(|(k, _)| k.clone()).collect();
+    for (id, v) in file_cache_results {
+        id_to_json.insert(id, v);
+    }
+    for cve_id in &pg_misses {
+        if !file_hit_ids.contains(cve_id) {
             to_fetch.push(cve_id.clone());
         }
     }
