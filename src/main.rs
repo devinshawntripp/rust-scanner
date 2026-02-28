@@ -422,14 +422,13 @@ fn main() {
             std::env::set_var("SCANNER_CACHE", default_cache);
         }
     }
-    // Nudge user to run `db seed` if cache is empty on first scan.
-    if matches!(
-        &cli.command,
-        Commands::Scan { .. } | Commands::Container { .. }
-    ) {
-        nudge_seed_if_empty();
+    // Set up progress file BEFORE anything that calls progress() — nudge_seed_if_empty()
+    // triggers OnceLock initialization of PROGRESS_FILE_HANDLE via progress(). If the env
+    // var isn't set yet, the OnceLock permanently resolves to None and the file stays empty.
+    if let Some(p) = &cli.progress_file {
+        std::env::set_var("SCANNER_PROGRESS_FILE", p);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(p);
     }
-
     if cli.progress {
         std::env::set_var("SCANNER_PROGRESS_STDERR", "1");
     }
@@ -441,11 +440,17 @@ fn main() {
     if is_interactive_scan && std::env::var("SCANNER_PROGRESS_COMPACT").is_err() {
         std::env::set_var("SCANNER_PROGRESS_COMPACT", "1");
     }
-    if let Some(p) = &cli.progress_file {
-        std::env::set_var("SCANNER_PROGRESS_FILE", p);
-        // Eagerly create the file so the worker's tail loop can open it immediately
-        // rather than waiting for the first progress() call.
-        let _ = std::fs::OpenOptions::new().create(true).append(true).open(p);
+
+    // Nudge user to run `db seed` if cache is empty on first scan.
+    // Must come AFTER progress file setup so events are written to the file.
+    if matches!(
+        &cli.command,
+        Commands::Scan { .. } | Commands::Container { .. }
+    ) {
+        nudge_seed_if_empty();
+    }
+
+    if cli.progress_file.is_some() {
         utils::progress("scanner.init", "initializing");
     }
     std::env::set_var(
