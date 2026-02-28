@@ -1114,7 +1114,7 @@
   "scan_status": "complete",
   "scanner": {
     "name": "scanrook",
-    "version": "1.3.3"
+    "version": "1.5.0"
   },
   "summary": {
     "confirmed_critical": 3,
@@ -1135,7 +1135,7 @@
   },
   "target": {
     "id": null,
-    "source": "./benchmark-artifacts/ubuntu-22.04.tar",
+    "source": "benchmark-artifacts/ubuntu-22.04.tar",
     "type": "container"
   }
 }

@@ -3,10 +3,10 @@
   "Trivy": {
     "Version": "0.69.1"
   },
-  "ReportID": "019ca161-2da1-730d-a1db-75851463f519",
-  "CreatedAt": "2026-02-27T17:13:46.401202-06:00",
+  "ReportID": "019ca26b-b911-7c6f-879f-acea94d4f512",
+  "CreatedAt": "2026-02-27T22:04:54.673818-06:00",
   "ArtifactID": "sha256:b601d36557f3f9ae2b2fa02aa184b770d7536538c16cf213ff3f48f41e0a193e",
-  "ArtifactName": "./benchmark-artifacts/alpine-3.20.tar",
+  "ArtifactName": "benchmark-artifacts/alpine-3.20.tar",
   "ArtifactType": "container_image",
   "Metadata": {
     "Size": 9109504,
@@ -65,7 +65,7 @@
   },
   "Results": [
     {
-      "Target": "./benchmark-artifacts/alpine-3.20.tar (alpine 3.20.9)",
+      "Target": "benchmark-artifacts/alpine-3.20.tar (alpine 3.20.9)",
       "Class": "os-pkgs",
       "Type": "alpine",
       "Packages": [

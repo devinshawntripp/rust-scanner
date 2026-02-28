@@ -1,4 +1,4 @@
 tool,duration_seconds,findings_count,output_path
-scanrook,1.240,18,./docs/benchmarks/reports/node-22-slim/scanrook.json
-trivy,0.781,109,./docs/benchmarks/reports/node-22-slim/trivy.json
-grype,3.761,103,./docs/benchmarks/reports/node-22-slim/grype.json
+scanrook,1.351,18,benchmark-out/v1.5.0/node-22-slim/scanrook.json
+trivy,0.195,109,benchmark-out/v1.5.0/node-22-slim/trivy.json
+grype,3.683,103,benchmark-out/v1.5.0/node-22-slim/grype.json

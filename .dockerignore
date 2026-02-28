@@ -10,3 +10,4 @@ var/uploads
 **/*.iso
 *.log
 /target/**
+blobs/

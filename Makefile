@@ -32,7 +32,9 @@ install:
 	else \
 	  true; \
 	fi; \
-	echo "Install complete. Open a new terminal or run: $$([ -n "$$TARGET_FILE" ] && echo 'source '"$$TARGET_FILE")"
+	echo "Install complete. Open a new terminal or run: $$([ -n "$$TARGET_FILE" ] && echo 'source '"$$TARGET_FILE")"; \
+	echo "Pre-warming vulnerability cache (runs in background)..."; \
+	nohup "$$CARGO_BIN_DIR/scanner" db seed --all >/dev/null 2>&1 &
 
 # Usage:
 # make scan FILE=/path/to/target [OUT=/path/to/report.json] [FORMAT=json|text] [MODE=light|deep] [REFS=1]

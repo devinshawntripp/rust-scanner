@@ -188,7 +188,16 @@ pub fn build_iso_report(
 
         let oval_redhat = oval_redhat
             .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-            .filter(|v| !v.trim().is_empty());
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+                if has_rpm {
+                    let cache = crate::vuln::resolve_enrich_cache_dir();
+                    crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
+                } else {
+                    None
+                }
+            });
         if let Some(oval_path) = oval_redhat.as_deref() {
             progress("iso.enrich.redhat.start", oval_path);
             let redhat_started = std::time::Instant::now();
@@ -600,6 +609,39 @@ fn query_packages_from_extracted_root(root: &Path) -> anyhow::Result<Vec<Package
 }
 
 fn query_rpm_db(dbpath: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    // Try native SQLite first
+    let sqlite_path = dbpath.join("rpmdb.sqlite");
+    if sqlite_path.exists() {
+        match crate::container::parse_rpm_sqlite(&sqlite_path) {
+            Ok(pkgs) if !pkgs.is_empty() => return Ok(pkgs),
+            Ok(_) => {}
+            Err(e) => {
+                crate::utils::progress(
+                    "iso.rpm.native.sqlite.error",
+                    &format!("{}: {}", sqlite_path.display(), e),
+                );
+            }
+        }
+    }
+
+    // Try native BerkeleyDB
+    for bdb_name in &["Packages", "Packages.db"] {
+        let bdb_path = dbpath.join(bdb_name);
+        if bdb_path.exists() {
+            match crate::container::parse_rpm_bdb(&bdb_path) {
+                Ok(pkgs) if !pkgs.is_empty() => return Ok(pkgs),
+                Ok(_) => {}
+                Err(e) => {
+                    crate::utils::progress(
+                        "iso.rpm.native.bdb.error",
+                        &format!("{}: {}", bdb_path.display(), e),
+                    );
+                }
+            }
+        }
+    }
+
+    // Fall back to rpm CLI
     let output = Command::new("rpm")
         .arg("-qa")
         .arg("--dbpath")
