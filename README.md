@@ -99,6 +99,10 @@ scanrook benchmark \
 
 Full reports: [`docs/benchmarks/reports/`](docs/benchmarks/reports/)
 
+### Transparency
+
+All benchmarks run on the same machine with the same images — no scanner-specific hardware or cache advantages. ScanRook uses only its standard SHA256-keyed file cache; no benchmark-specific pre-loading or hardcoding. Cold-scan times are longer because ScanRook queries live APIs, while Trivy and Grype use pre-compiled local databases. Full methodology and transparency details are available at [scanrook.io/docs/benchmarks](https://scanrook.io/docs/benchmarks).
+
 ## Commands
 
 ```bash
