@@ -118,6 +118,247 @@ pub fn filter_findings_with_redhat_oval(
     })
 }
 
+/// Generate new findings AND filter existing ones from RHEL OVAL data in a single parse.
+///
+/// Returns `(generated_count, filter_stats)`. New findings are appended to `findings`
+/// (deduplicated by `(cve_id, package_name)`) before the filter pass runs.
+pub fn apply_redhat_oval_enrichment(
+    findings: &mut Vec<Finding>,
+    packages: &[PackageCoordinate],
+    oval_path: &str,
+) -> anyhow::Result<(usize, OvalFilterStats)> {
+    let parsed = parse_oval_file(oval_path)?;
+    let package_map = build_rpm_package_map(packages);
+
+    // Step 1: generate new findings from OVAL that OSV may have missed
+    let new_findings = generate_from_parsed_oval(&parsed, &package_map, packages);
+
+    // Merge, deduplicating by (cve|package_name)
+    let existing_keys: HashSet<String> = findings
+        .iter()
+        .map(|f| {
+            format!(
+                "{}|{}",
+                f.id,
+                f.package.as_ref().map_or("", |p| p.name.as_str())
+            )
+        })
+        .collect();
+    let mut generated_count = 0usize;
+    for f in new_findings {
+        let key = format!(
+            "{}|{}",
+            f.id,
+            f.package.as_ref().map_or("", |p| p.name.as_str())
+        );
+        if !existing_keys.contains(&key) {
+            findings.push(f);
+            generated_count += 1;
+        }
+    }
+
+    // Step 2: filter using OVAL (removes findings for CVEs OVAL says are patched)
+    let eval = evaluate_oval_for_packages(&parsed.root, &parsed.test_constraints, &package_map);
+
+    let findings_before = findings.len();
+
+    for finding in findings.iter_mut() {
+        if !finding.id.starts_with("CVE-") {
+            continue;
+        }
+        let id = finding.id.to_ascii_uppercase();
+        let Some(pkg) = finding.package.as_ref() else {
+            continue;
+        };
+        if !is_rpm_ecosystem(&pkg.ecosystem) {
+            continue;
+        }
+        if eval.covered_cves.contains(&id) && eval.vulnerable_cves.contains(&id) {
+            finding.fixed = Some(false);
+        }
+    }
+
+    findings.retain(|finding| {
+        if !finding.id.starts_with("CVE-") {
+            return true;
+        }
+        let Some(pkg) = finding.package.as_ref() else {
+            return true;
+        };
+        if !is_rpm_ecosystem(&pkg.ecosystem) {
+            return true;
+        }
+        let id = finding.id.to_ascii_uppercase();
+        if eval.covered_cves.contains(&id) {
+            return eval.vulnerable_cves.contains(&id);
+        }
+        true
+    });
+
+    let findings_after = findings.len();
+    let stats = OvalFilterStats {
+        definitions_total: eval.definitions_total,
+        definitions_evaluable: eval.definitions_evaluable,
+        covered_cves: eval.covered_cves.len(),
+        vulnerable_cves: eval.vulnerable_cves.len(),
+        findings_before,
+        findings_after,
+        findings_filtered: findings_before.saturating_sub(findings_after),
+    };
+
+    Ok((generated_count, stats))
+}
+
+/// Generate `Finding`s from a pre-parsed OVAL file by iterating per-package test constraints.
+///
+/// This supplements OSV lookups by directly evaluating the RHEL OVAL advisory data.
+/// Package version comparisons use the same `compare_evr`/`rpmvercmp` logic as the filter.
+fn generate_from_parsed_oval(
+    parsed: &ParsedOval,
+    package_map: &HashMap<String, Vec<String>>,
+    packages: &[PackageCoordinate],
+) -> Vec<Finding> {
+    use crate::report::{ConfidenceTier, EvidenceSource, PackageInfo, ReferenceInfo};
+
+    if package_map.is_empty() {
+        return Vec::new();
+    }
+
+    let cve_re = Regex::new(r"CVE-\d{4}-\d+").expect("valid CVE regex");
+    let mut definitions = Vec::new();
+    collect_descendants_by_local(&parsed.root, "definition", &mut definitions);
+
+    // Build ecosystem lookup: package_name → original distro ecosystem
+    let name_to_ecosystem: HashMap<String, String> = packages
+        .iter()
+        .filter(|p| is_rpm_ecosystem(&p.ecosystem))
+        .map(|p| (p.name.clone(), p.ecosystem.clone()))
+        .collect();
+
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new(); // keys: "cve|package_name"
+
+    for definition in definitions {
+        let cves = extract_cves_from_definition(definition, &cve_re);
+        if cves.is_empty() {
+            continue;
+        }
+
+        // Collect all test_refs referenced anywhere in this definition's criteria tree
+        let mut test_refs: Vec<String> = Vec::new();
+        collect_test_refs_from_element(definition, &mut test_refs);
+
+        for test_ref in &test_refs {
+            let Some(constraints) = parsed.test_constraints.get(test_ref) else {
+                continue;
+            };
+            for constraint in constraints {
+                // Skip OS/distro version-gating packages (e.g. redhat-release, rocky-release)
+                if is_release_gating_package(&constraint.package) {
+                    continue;
+                }
+
+                let Some(installed_versions) = package_map.get(&constraint.package) else {
+                    continue;
+                };
+
+                // Evaluate: does the installed version satisfy the vulnerability condition?
+                // Typically: LessThan means installed < fixed_evr → vulnerable.
+                let is_vulnerable = installed_versions.iter().any(|installed| {
+                    let ord = compare_evr(installed, &constraint.evr);
+                    match constraint.op {
+                        CompareOp::LessThan => ord == Ordering::Less,
+                        CompareOp::LessThanOrEqual => ord != Ordering::Greater,
+                        CompareOp::Equal => ord == Ordering::Equal,
+                        CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
+                        CompareOp::GreaterThan => ord == Ordering::Greater,
+                    }
+                });
+
+                if !is_vulnerable {
+                    continue;
+                }
+
+                let ecosystem = name_to_ecosystem
+                    .get(&constraint.package)
+                    .cloned()
+                    .unwrap_or_else(|| "rpm".to_string());
+                let installed_version =
+                    installed_versions.first().cloned().unwrap_or_default();
+
+                for cve in &cves {
+                    let key = format!("{}|{}", cve, constraint.package);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+
+                    let nvd_url = format!(
+                        "https://nvd.nist.gov/vuln/detail/{}",
+                        cve
+                    );
+                    findings.push(Finding {
+                        id: cve.clone(),
+                        source_ids: vec!["redhat-oval".to_string()],
+                        package: Some(PackageInfo {
+                            name: constraint.package.clone(),
+                            ecosystem: ecosystem.clone(),
+                            version: installed_version.clone(),
+                        }),
+                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: EvidenceSource::InstalledDb,
+                        accuracy_note: Some("redhat-oval".to_string()),
+                        fixed: Some(false),
+                        fixed_in: Some(constraint.evr.clone()),
+                        recommendation: Some(format!(
+                            "Update {} to {}",
+                            constraint.package, constraint.evr
+                        )),
+                        severity: None,
+                        cvss: None,
+                        description: None,
+                        evidence: vec![],
+                        references: vec![ReferenceInfo {
+                            reference_type: "WEB".to_string(),
+                            url: nvd_url,
+                        }],
+                        confidence: None,
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
+                    });
+                }
+            }
+        }
+    }
+
+    findings
+}
+
+/// Collect all `test_ref` attribute values from all `criterion` elements in the subtree.
+fn collect_test_refs_from_element(el: &Element, out: &mut Vec<String>) {
+    for node in &el.children {
+        if let XMLNode::Element(child) = node {
+            if local_name(&child.name) == "criterion" {
+                if let Some(test_ref) = attr_value(child, "test_ref") {
+                    out.push(test_ref.to_string());
+                }
+            }
+            collect_test_refs_from_element(child, out);
+        }
+    }
+}
+
+/// Returns true for OS version-gating packages that should not generate findings.
+fn is_release_gating_package(name: &str) -> bool {
+    // e.g. redhat-release, redhat-release-server, rocky-release, centos-release, etc.
+    name.ends_with("-release")
+        || name.ends_with("-release-server")
+        || name == "redhat-release-workstation"
+        || name == "oraclelinux-release"
+        || name.starts_with("centos-linux-release")
+}
+
 /// Check if a CVE exists in a Red Hat OVAL XML file
 pub fn check_redhat_cve(cve: &str, oval_path: &str) {
     let parsed = match parse_oval_file(oval_path) {

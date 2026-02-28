@@ -1,4 +1,4 @@
-use crate::redhat::filter_findings_with_redhat_oval;
+use crate::redhat::apply_redhat_oval_enrichment;
 use crate::report::{
     compute_summary, retag_findings, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
     SbomInfo, ScanStatus, ScannerInfo, TargetInfo,
@@ -644,13 +644,14 @@ pub fn scan_container(
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
-        match filter_findings_with_redhat_oval(&mut findings_norm, &packages, oval_path) {
-            Ok(stats) => {
+        match apply_redhat_oval_enrichment(&mut findings_norm, &packages, oval_path) {
+            Ok((generated, stats)) => {
                 progress_timing("container.enrich.redhat", redhat_started);
                 progress(
                     "container.enrich.redhat.done",
                     &format!(
-                        "defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        "generated={} defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        generated,
                         stats.definitions_evaluable,
                         stats.definitions_total,
                         stats.vulnerable_cves,
@@ -1093,13 +1094,14 @@ pub fn build_container_report(
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
-        match filter_findings_with_redhat_oval(&mut findings_norm, &packages, oval_path) {
-            Ok(stats) => {
+        match apply_redhat_oval_enrichment(&mut findings_norm, &packages, oval_path) {
+            Ok((generated, stats)) => {
                 progress_timing("container.enrich.redhat", redhat_started);
                 progress(
                     "container.enrich.redhat.done",
                     &format!(
-                        "defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        "generated={} defs={}/{} cves={}/{} findings={}->{} filtered={}",
+                        generated,
                         stats.definitions_evaluable,
                         stats.definitions_total,
                         stats.vulnerable_cves,

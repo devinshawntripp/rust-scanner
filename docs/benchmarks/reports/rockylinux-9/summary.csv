@@ -1,4 +1,4 @@
 tool,duration_seconds,findings_count,output_path
-scanrook,2.646,117,benchmark-out/v1.5.0/rockylinux-9/scanrook.json
+scanrook,2.757,243,benchmark-out/v1.5.2/rockylinux-9/scanrook.json
 trivy,0.192,176,benchmark-out/v1.5.0/rockylinux-9/trivy.json
 grype,1.751,539,benchmark-out/v1.5.0/rockylinux-9/grype.json
