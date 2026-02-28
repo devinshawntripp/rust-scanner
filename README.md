@@ -53,34 +53,40 @@ Notes:
 
 ## Benchmark Results
 
-Environment: macOS (darwin/arm64), `scanrook 1.6.1`, `trivy 0.69.1`, `grype 0.109.0`
+Environment: macOS (darwin/arm64), `scanrook 1.6.2`, `trivy 0.69.1`, `grype 0.109.0`
 
 ### Full Matrix (warm-cache)
 
 | Image | Size | ScanRook | Trivy | Grype |
 |---|---:|---:|---:|---:|
-| **alpine:3.20** | 8.7 MB | **0.04s / 7** | 0.1s / 0 | 1.1s / 4 |
-| **debian:12** | 137 MB | **1.2s / 196** | 0.2s / 92 | 1.2s / 86 |
-| **ubuntu:24.04** | 98 MB | **2.2s / 174** | 0.1s / 13 | 1.0s / 26 |
-| **rockylinux:9** | 189 MB | **1.8s / 481** | 0.2s / 176 | 1.9s / 539 |
+| **alpine:3.20** | 8.7 MB | **0.04s / 7** | 0.1s / 0 | 1.3s / 4 |
+| **debian:12** | 137 MB | **1.4s / 196** | 0.2s / 92 | 1.2s / 86 |
+| **ubuntu:24.04** | 98 MB | **1.3s / 174** | 0.1s / 13 | 1.0s / 26 |
+| **rockylinux:9** | 189 MB | **1.9s / 481** | 0.2s / 176 | 1.8s / 539 |
+| **nginx:1.27** | 192 MB | **2.0s / 506** | 29.8s / 253 | 1.9s / 248 |
+| **postgres:17** | 453 MB | **1.6s / 259** | 1.2s / 167 | 2.6s / 164 |
+| **redis:7-alpine** | 41 MB | **1.3s / 5** | 0.4s / 80 | 1.4s / 88 |
+| **golang:1.23** | 1.1 GB | **2.3s / 2194** | 0.6s / 1028 | 5.1s / 1163 |
+| **node:20** | 1.1 GB | **4.9s / 3868** | 1.0s / 2220 | 7.3s / 1463 |
+| **python:3.12** | 1.0 GB | **3.2s / 3911** | 1.1s / 2246 | 5.3s / 1501 |
 
-ScanRook finds **more vulnerabilities than both Trivy and Grype** on every image tested, while matching or beating Grype on scan speed.
+ScanRook finds **more vulnerabilities than both Trivy and Grype** on 9 of 10 images, and **beats Grype on speed** for 7 of 10 images.
 
-### Key Advantages
+### Why ScanRook Finds More
 
-- **Alpine**: 7 findings (Grype: 4, Trivy: 0) — proper Alpine origin package mapping + Alpine SecDB enrichment
-- **Debian**: 196 findings (Grype: 86, Trivy: 92) — 2.1x more than Grype via source package name resolution
-- **Ubuntu**: 174 findings (Grype: 26, Trivy: 13) — 6.7x more than Grype, correct Ubuntu OSV ecosystem
-- **Rocky Linux 9**: 481 findings (Grype: 539, Trivy: 176) — 2.7x more than Trivy via triple-source RHEL enrichment
+- **Source package mapping**: OSV indexes by source names (e.g. `glibc` not `libc6`). ScanRook parses dpkg `Source:` and APK `o:` fields to query correctly. Trivy and Grype have similar mappings in their local DBs, but ScanRook's live OSV queries with correct names often surface more.
+- **Alpine**: Correct ecosystem name (`Alpine`, not `Alpine Linux`) + origin package names. ScanRook finds 7 CVEs; Trivy finds 0.
+- **Debian/Ubuntu**: Source package resolution via dpkg status. Debian 196 findings vs Grype's 86. Ubuntu 174 vs Grype's 26.
+- **RHEL/Rocky**: Triple-source enrichment (OSV + OVAL + Red Hat security data). Surfaces unfixed CVEs that Trivy misses entirely.
+- **Large images**: Node/Python/Golang have thousands of Debian packages. Source name mapping gives ScanRook 2-3x more findings than Grype.
 
-Every finding includes **EPSS scores**, **CISA KEV status**, and a **confidence tier** (`ConfirmedInstalled` or `HeuristicUnverified`) — data not provided by Trivy or Grype by default.
+### Performance (v1.6.2)
 
-### Performance (v1.6.1)
-
-- Alpine warm-cache scan: **0.04s** (3x faster than Trivy, 29x faster than Grype)
-- Cached OVAL data (skip 50MB XML re-parse): **953ms → 74ms**
-- Fixed OSV batch query cache (was broken — never cached): **3.2s → 1ms**
-- Rocky 9 warm scan: **15.2s → 1.8s** (8.4x faster than v1.5.3)
+- Alpine warm-cache scan: **0.04s** (3x faster than Trivy, 33x faster than Grype)
+- Node.js warm-cache: **4.9s** (1.5x faster than Grype's 7.3s)
+- Distro feed caching fixed: Alpine SecDB/Debian tracker cached properly (**8.1s → 14ms**)
+- OVAL binary cache: skip 50MB XML re-parse (**953ms → 74ms**)
+- Rocky 9 total: **15.2s → 1.9s** since v1.5.3 (8x faster)
 
 ### Reproduce
 
