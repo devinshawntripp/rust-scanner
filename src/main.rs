@@ -443,6 +443,10 @@ fn main() {
     }
     if let Some(p) = &cli.progress_file {
         std::env::set_var("SCANNER_PROGRESS_FILE", p);
+        // Eagerly create the file so the worker's tail loop can open it immediately
+        // rather than waiting for the first progress() call.
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(p);
+        utils::progress("scanner.init", "initializing");
     }
     std::env::set_var(
         "SCANNER_LOG_FORMAT",
