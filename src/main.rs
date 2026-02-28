@@ -1635,6 +1635,7 @@ fn run_db(
                         ecosystem: "redhat".into(),
                         name: "seed".into(),
                         version: format!("0-0.el{}", v),
+                        source_name: None,
                     }];
                     match redhat::fetch_redhat_oval(&pkgs, Some(&cache_dir)) {
                         Some(path) => {
@@ -1702,16 +1703,19 @@ fn run_db(
                         ecosystem: "deb".into(),
                         name: "openssl".into(),
                         version: "3.0.0".into(),
+                    source_name: None,
                     },
                     container::PackageCoordinate {
                         ecosystem: "npm".into(),
                         name: "lodash".into(),
                         version: "4.17.0".into(),
+                    source_name: None,
                     },
                     container::PackageCoordinate {
                         ecosystem: "PyPI".into(),
                         name: "requests".into(),
                         version: "2.25.0".into(),
+                    source_name: None,
                     },
                 ];
                 let _results = vuln::osv_batch_query(&sample_pkgs);

@@ -229,6 +229,10 @@ pub struct PackageCoordinate {
     pub ecosystem: String,
     pub name: String,
     pub version: String,
+    /// For dpkg packages: the Debian source package name (from `Source:` field).
+    /// OSV's Debian ecosystem indexes by source name, not binary name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 const IMAGE_HEURISTIC_NOTE: &str =
@@ -454,6 +458,7 @@ pub fn scan_container(
                 ecosystem: "redhat".into(),
                 name: p.name.clone(),
                 version: p.version.clone(),
+            source_name: None,
             })
             .collect();
         if !rhel_supp_pkgs.is_empty() {
@@ -516,7 +521,7 @@ pub fn scan_container(
 
     // Debian Security Tracker enrichment (for deb/dpkg packages)
     {
-        let has_deb = packages.iter().any(|p| p.ecosystem == "deb");
+        let has_deb = packages.iter().any(|p| p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb");
         if has_deb {
             progress("container.enrich.debian_tracker.start", "");
             let dst_started = std::time::Instant::now();
@@ -919,6 +924,7 @@ pub fn build_container_report(
                 ecosystem: "redhat".into(),
                 name: p.name.clone(),
                 version: p.version.clone(),
+            source_name: None,
             })
             .collect();
         if !rhel_supp_pkgs.is_empty() {
@@ -977,7 +983,7 @@ pub fn build_container_report(
     );
 
     // Debian Security Tracker enrichment (for deb/dpkg packages)
-    let has_deb_packages = packages.iter().any(|p| p.ecosystem == "deb");
+    let has_deb_packages = packages.iter().any(|p| p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb");
     if has_deb_packages {
         progress("container.enrich.debian_tracker.start", "");
         let dst_started = std::time::Instant::now();
@@ -1680,7 +1686,8 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
     let dpkg_status = rootfs.join("var/lib/dpkg/status");
     if dpkg_status.exists() {
         if let Ok(s) = fs::read_to_string(&dpkg_status) {
-            parse_dpkg_status(&s, &mut packages);
+            let dpkg_eco = detect_dpkg_ecosystem(rootfs);
+            parse_dpkg_status_with_ecosystem(&s, &dpkg_eco, &mut packages);
         }
     }
 
@@ -1718,6 +1725,7 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
                         ecosystem: rpm_ecosystem.clone(),
                         name,
                         version,
+                        source_name: None,
                     });
                 }
             }
@@ -1732,6 +1740,27 @@ fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
     }
 
     packages
+}
+
+/// Distinguish Ubuntu from Debian by reading /etc/os-release.
+/// OSV has separate "Ubuntu" and "Debian" ecosystems with different advisory data.
+fn detect_dpkg_ecosystem(rootfs: &Path) -> String {
+    let os_release = rootfs.join("etc/os-release");
+    let content = match fs::read_to_string(os_release) {
+        Ok(s) => s,
+        Err(_) => return "deb".to_string(),
+    };
+    let mut id = String::new();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = trim_os_release_value(v).to_lowercase();
+        }
+    }
+    if id == "ubuntu" {
+        "ubuntu-deb".to_string()
+    } else {
+        "deb".to_string()
+    }
 }
 
 fn detect_rpm_ecosystem(rootfs: &Path) -> String {
@@ -1816,47 +1845,82 @@ fn trim_os_release_value(v: &str) -> String {
     v.trim().trim_matches('"').to_string()
 }
 
+fn parse_dpkg_status_with_ecosystem(contents: &str, ecosystem: &str, out: &mut Vec<PackageCoordinate>) {
+    parse_dpkg_status_inner(contents, ecosystem, out);
+}
+
 fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
+    parse_dpkg_status_inner(contents, "deb", out);
+}
+
+fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<PackageCoordinate>) {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
+    let mut source: Option<String> = None;
     let mut installed_ok: bool = false;
+
+    let flush = |name: &mut Option<String>,
+                 version: &mut Option<String>,
+                 source: &mut Option<String>,
+                 installed_ok: bool,
+                 out: &mut Vec<PackageCoordinate>| {
+        if let (Some(n), Some(v)) = (name.take(), version.take()) {
+            let src = source.take();
+            if installed_ok {
+                // OSV's Debian ecosystem indexes by source package name. The dpkg
+                // `Source:` field gives us the source name when it differs from the
+                // binary package name (format: "srcname" or "srcname (version)").
+                let source_name = src
+                    .map(|s| {
+                        let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
+                        if trimmed == n { None } else { Some(trimmed) }
+                    })
+                    .flatten();
+                out.push(PackageCoordinate {
+                    ecosystem: ecosystem.into(),
+                    name: n,
+                    version: v,
+                    source_name,
+                });
+            }
+        } else {
+            source.take();
+        }
+    };
+
     for line in contents.lines() {
         if line.starts_with("Package:") {
-            if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                if installed_ok {
-                    out.push(PackageCoordinate {
-                        ecosystem: "deb".into(),
-                        name: n,
-                        version: v,
-                    });
-                }
-            }
+            flush(&mut name, &mut version, &mut source, installed_ok, out);
             name = Some(line[8..].trim().to_string());
             version = None;
+            source = None;
             installed_ok = false;
         } else if line.starts_with("Version:") {
             version = Some(line[8..].trim().to_string());
+        } else if line.starts_with("Source:") {
+            source = Some(line[7..].trim().to_string());
         } else if line.starts_with("Status:") {
-            // Expect: Status: install ok installed
             installed_ok = line.contains("install ok installed");
         } else if line.is_empty() {
-            if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                if installed_ok {
-                    out.push(PackageCoordinate {
-                        ecosystem: "deb".into(),
-                        name: n,
-                        version: v,
-                    });
-                }
-            }
+            flush(&mut name, &mut version, &mut source, installed_ok, out);
+            installed_ok = false;
         }
     }
+    // Flush final package
     if let (Some(n), Some(v)) = (name.take(), version.take()) {
+        let src = source.take();
         if installed_ok {
+            let source_name = src
+                .map(|s| {
+                    let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
+                    if trimmed == n { None } else { Some(trimmed) }
+                })
+                .flatten();
             out.push(PackageCoordinate {
-                ecosystem: "deb".into(),
+                ecosystem: ecosystem.into(),
                 name: n,
                 version: v,
+                source_name,
             });
         }
     }
@@ -1873,26 +1937,38 @@ fn parse_apk_installed_with_ecosystem(
 ) {
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
+    let mut origin: Option<String> = None;
     for line in contents.lines() {
         if line.starts_with("P:") {
             name = Some(line[2..].trim().to_string());
         } else if line.starts_with("V:") {
             version = Some(line[2..].trim().to_string());
+        } else if line.starts_with("o:") {
+            // Origin package name — OSV Alpine indexes by origin, not binary subpackage.
+            origin = Some(line[2..].trim().to_string());
         } else if line.is_empty() {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
+                let src = origin.take();
+                let source_name = src.and_then(|o| if o == n { None } else { Some(o) });
                 out.push(PackageCoordinate {
                     ecosystem: ecosystem.into(),
                     name: n,
                     version: v,
+                    source_name,
                 });
+            } else {
+                origin.take();
             }
         }
     }
     if let (Some(n), Some(v)) = (name.take(), version.take()) {
+        let src = origin.take();
+        let source_name = src.and_then(|o| if o == n { None } else { Some(o) });
         out.push(PackageCoordinate {
             ecosystem: ecosystem.into(),
             name: n,
             version: v,
+            source_name,
         });
     }
 }

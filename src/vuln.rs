@@ -268,6 +268,8 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
         return serde_json::json!([]);
     }
 
+    let cache_dir = resolve_enrich_cache_dir();
+
     // Build per-package queries and remember original indices
     let mut ecosystem_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -332,10 +334,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
             attempt += 1;
             // Try cache for this chunk first
             if let Some(bytes) = cache_get(
-                std::env::var_os("SCANNER_CACHE")
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .as_deref(),
+                cache_dir.as_deref(),
                 &cache_tag,
             ) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
@@ -388,10 +387,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                                             results[orig_idx] = item.clone();
                                         }
                                         cache_put(
-                                            std::env::var_os("SCANNER_CACHE")
-                                                .as_deref()
-                                                .map(PathBuf::from)
-                                                .as_deref(),
+                                            cache_dir.as_deref(),
                                             &cache_tag,
                                             v.to_string().as_bytes(),
                                         );
@@ -467,10 +463,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                 loop {
                     attempt_p += 1;
                     if let Some(bytes) = cache_get(
-                        std::env::var_os("SCANNER_CACHE")
-                            .as_deref()
-                            .map(PathBuf::from)
-                            .as_deref(),
+                        cache_dir.as_deref(),
                         &single_cache,
                     ) {
                         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
@@ -487,10 +480,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                         Ok(r) => match r.json::<Value>() {
                             Ok(v) => {
                                 cache_put(
-                                    std::env::var_os("SCANNER_CACHE")
-                                        .as_deref()
-                                        .map(PathBuf::from)
-                                        .as_deref(),
+                                    cache_dir.as_deref(),
                                     &single_cache,
                                     v.to_string().as_bytes(),
                                 );
@@ -538,22 +528,50 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
 fn map_ecosystem_name_version(p: &PackageCoordinate) -> (String, String, String) {
     // Map OS package ecosystems to OSV conventions
     match p.ecosystem.as_str() {
-        "deb" => ("Debian".into(), p.name.clone(), p.version.clone()),
-        "apk" => ("Alpine Linux".into(), p.name.clone(), p.version.clone()),
-        "redhat" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
-        "rocky" => ("Rocky Linux".into(), p.name.clone(), p.version.clone()),
-        "almalinux" => ("AlmaLinux".into(), p.name.clone(), p.version.clone()),
+        // OSV's Debian ecosystem indexes by source package name, not binary name.
+        // Use the source_name from dpkg's Source: field when available.
+        // dpkg: OSV Debian ecosystem indexes by SOURCE package name.
+        // Ubuntu has its own OSV ecosystem with separate advisory data.
+        "deb" | "ubuntu-deb" => {
+            let eco = if p.ecosystem == "ubuntu-deb" { "Ubuntu" } else { "Debian" };
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            (eco.into(), query_name, p.version.clone())
+        }
+        // APK: OSV Alpine ecosystem uses "Alpine" (NOT "Alpine Linux") and indexes
+        // by origin package name (the `o:` field in /lib/apk/db/installed).
+        "apk" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("Alpine".into(), query_name, p.version.clone())
+        }
+        // RPM ecosystems: OSV indexes by source RPM name for Rocky/SUSE/openSUSE.
+        // Red Hat and AlmaLinux list both source and binary names in advisories.
+        "redhat" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("Red Hat".into(), query_name, p.version.clone())
+        }
+        "rocky" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("Rocky Linux".into(), query_name, p.version.clone())
+        }
+        "almalinux" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("AlmaLinux".into(), query_name, p.version.clone())
+        }
+        "suse" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("SUSE".into(), query_name, p.version.clone())
+        }
+        "opensuse" => {
+            let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
+            ("openSUSE".into(), query_name, p.version.clone())
+        }
         "amazonlinux" => ("Amazon Linux".into(), p.name.clone(), p.version.clone()),
         "oraclelinux" => ("Oracle Linux".into(), p.name.clone(), p.version.clone()),
-        "suse" => ("SUSE".into(), p.name.clone(), p.version.clone()),
-        "opensuse" => ("openSUSE".into(), p.name.clone(), p.version.clone()),
         "chainguard" => ("Chainguard".into(), p.name.clone(), p.version.clone()),
         "wolfi" => ("Wolfi".into(), p.name.clone(), p.version.clone()),
         "fedora" => ("Fedora".into(), p.name.clone(), p.version.clone()),
         "centos" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
-        // Legacy fallback from older detector output.
         "rpm" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
-        // Fallback: pass through
         other => (other.to_string(), p.name.clone(), p.version.clone()),
     }
 }
@@ -1668,7 +1686,7 @@ fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
             continue;
         };
         let pkg_name = pkg.name.to_ascii_lowercase();
-        if pkg.ecosystem == "deb" {
+        if (pkg.ecosystem == "deb" || pkg.ecosystem == "ubuntu-deb") {
             needed_deb
                 .entry(pkg_name.clone())
                 .or_default()
@@ -1741,7 +1759,7 @@ fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
             continue;
         }
 
-        if ecosystem != "deb" {
+        if (ecosystem != "deb" && ecosystem != "ubuntu-deb") {
             continue;
         }
 
@@ -4826,7 +4844,16 @@ fn pg_put_redhat_cve(
 
 /// Returns the cache directory for enrichment functions to use from other modules.
 pub fn resolve_enrich_cache_dir() -> Option<PathBuf> {
-    std::env::var("SCANNER_CACHE").ok().map(PathBuf::from)
+    if let Ok(dir) = std::env::var("SCANNER_CACHE") {
+        return Some(PathBuf::from(dir));
+    }
+    // Fall back to ~/.scanrook/cache/ (same default as cache.rs)
+    if let Some(home) = std::env::var_os("HOME") {
+        let default_dir = PathBuf::from(home).join(".scanrook").join("cache");
+        let _ = std::fs::create_dir_all(&default_dir);
+        return Some(default_dir);
+    }
+    None
 }
 
 // ─── EPSS enrichment ───────────────────────────────────────────────
@@ -5053,7 +5080,7 @@ fn detect_debian_release(packages: &[PackageCoordinate]) -> Option<&'static str>
     // Check versions — Debian packages include the release codename in certain patterns
     // The most reliable way is from the dpkg status which includes versions like "2.36-9+deb12u9"
     for pkg in packages {
-        if pkg.ecosystem != "deb" {
+        if pkg.ecosystem != "deb" && pkg.ecosystem != "ubuntu-deb" {
             continue;
         }
         let v = &pkg.version;
@@ -5089,7 +5116,7 @@ pub fn debian_tracker_enrich(
     }
 
     let deb_packages: Vec<&PackageCoordinate> =
-        packages.iter().filter(|p| p.ecosystem == "deb").collect();
+        packages.iter().filter(|p| (p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb")).collect();
     if deb_packages.is_empty() {
         return;
     }
@@ -5526,6 +5553,7 @@ mod tests {
                 ecosystem: "deb".into(),
                 name: "libc6".into(),
                 version: "2.36-9+deb12u9".into(),
+            source_name: None,
             },
         ];
         assert_eq!(detect_debian_release(&pkgs), Some("bookworm"));
@@ -5535,6 +5563,7 @@ mod tests {
                 ecosystem: "deb".into(),
                 name: "bash".into(),
                 version: "5.1-2+deb11u1".into(),
+            source_name: None,
             },
         ];
         assert_eq!(detect_debian_release(&pkgs_11), Some("bullseye"));

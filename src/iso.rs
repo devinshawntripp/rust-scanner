@@ -446,6 +446,7 @@ fn packages_from_runtime_rpmdb_entries(
                     ecosystem: "redhat".into(),
                     name,
                     version,
+                    source_name: None,
                 })
                 .collect());
         }
@@ -593,6 +594,7 @@ fn query_packages_from_extracted_root(root: &Path) -> anyhow::Result<Vec<Package
                         ecosystem: "redhat".into(),
                         name,
                         version,
+                        source_name: None,
                     })
                     .collect());
             }
@@ -683,6 +685,7 @@ fn packages_from_rpm_entries(entries: &[String]) -> Vec<PackageCoordinate> {
                 ecosystem: "redhat".into(),
                 name,
                 version,
+                source_name: None,
             });
         }
     }
@@ -856,6 +859,7 @@ fn parse_primary_packages(primary_xml: &[u8]) -> Vec<PackageCoordinate> {
             ecosystem: "redhat".into(),
             name,
             version: full_ver,
+        source_name: None,
         });
     }
     packages
@@ -1044,11 +1048,13 @@ mod tests {
                 ecosystem: "redhat".into(),
                 name: "bash".into(),
                 version: "5.1-1".into(),
+            source_name: None,
             },
             PackageCoordinate {
                 ecosystem: "redhat".into(),
                 name: "bash".into(),
                 version: "5.1-1".into(),
+            source_name: None,
             },
         ];
         let out = dedupe_packages(input);

@@ -339,7 +339,7 @@ pub fn build_binary_report(
                 .map(|(path, ver)| PackageCoordinate {
                     ecosystem: "Go".into(),
                     name: path.clone(),
-                    version: ver.clone(),
+                    version: ver.clone(), source_name: None,
                 })
                 .collect();
             let osv_results = osv_batch_query(&coords);

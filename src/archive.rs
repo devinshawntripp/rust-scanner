@@ -417,6 +417,7 @@ fn push_if_new(
             ecosystem: ecosystem.to_string(),
             name: name.to_string(),
             version: version.to_string(),
+        source_name: None,
         });
     }
 }
