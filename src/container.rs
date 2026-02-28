@@ -7,7 +7,7 @@ use crate::utils::parse_name_version_from_filename;
 use crate::utils::{progress, progress_timing, run_syft_generate_sbom, write_output_if_needed};
 use crate::vuln::{
     enrich_findings_with_nvd, map_osv_results_to_findings, nvd_cpe_findings, nvd_keyword_findings,
-    nvd_keyword_findings_name, osv_batch_query,
+    nvd_keyword_findings_name, osv_batch_query, redhat_inject_unfixed_cves,
 };
 use crate::{OutputFormat, ScanMode};
 use bzip2::read::BzDecoder;
@@ -526,6 +526,12 @@ pub fn scan_container(
         }
     }
 
+    // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
+    // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
+    if packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem)) {
+        redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
+    }
+
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
@@ -978,6 +984,12 @@ pub fn build_container_report(
         let dst_cache_dir = crate::vuln::resolve_enrich_cache_dir();
         crate::vuln::debian_tracker_enrich(&packages, &mut findings_norm, dst_cache_dir.as_deref());
         progress_timing("container.enrich.debian_tracker", dst_started);
+    }
+
+    // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
+    // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
+    if packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem)) {
+        redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
     }
 
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")

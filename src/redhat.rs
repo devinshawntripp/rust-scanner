@@ -898,7 +898,7 @@ fn append_text(el: &Element, out: &mut String) {
 }
 
 /// Detect the Red Hat OVAL major version from an RPM ecosystem string and/or package metadata.
-fn detect_rhel_major_version(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
+pub fn detect_rhel_major_version(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
     // Look at release tags in package versions: e.g. "5.1.8-6.el9" → 9
     let re = regex::Regex::new(r"\.el(\d+)").ok()?;
     for pkg in packages {
