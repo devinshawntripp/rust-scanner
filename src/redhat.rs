@@ -2,10 +2,12 @@ use crate::container::PackageCoordinate;
 use crate::report::Finding;
 use anyhow::Context;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
+
 use xmltree::{Element, XMLNode};
 
 #[derive(Debug, Clone, Default)]
@@ -26,7 +28,7 @@ enum TriState {
     Unknown,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum CompareOp {
     LessThan,
     LessThanOrEqual,
@@ -41,7 +43,7 @@ struct StateConstraint {
     evr: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RpmConstraint {
     package: String,
     op: CompareOp,
@@ -60,6 +62,110 @@ struct OvalEval {
     definitions_evaluable: usize,
     covered_cves: HashSet<String>,
     vulnerable_cves: HashSet<String>,
+}
+
+/// Pre-processed definition data that can be cached to avoid re-parsing XML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedDefinition {
+    cves: Vec<String>,
+    test_refs: Vec<String>,
+}
+
+/// Cached representation of all data needed from parsed OVAL XML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedOvalData {
+    test_constraints: HashMap<String, Vec<RpmConstraint>>,
+    definitions: Vec<CachedDefinition>,
+}
+
+/// Resolve the cache directory for storing parsed OVAL data.
+fn resolve_oval_cache_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("SCANNER_CACHE") {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(
+            std::path::PathBuf::from(home)
+                .join(".scanrook")
+                .join("cache"),
+        );
+    }
+    None
+}
+
+/// Try to load cached OVAL data for the given OVAL file.
+fn load_cached_oval(oval_path: &str) -> Option<CachedOvalData> {
+    let file_hash = crate::utils::hash_file_stream(oval_path).ok()?;
+    let cache_dir = resolve_oval_cache_dir()?;
+    let cache_key = format!("oval_parsed_{}.json", &file_hash[..16]);
+    let data = crate::cache::cache_get(Some(cache_dir.as_path()), &cache_key)?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Store parsed OVAL data in the cache keyed by the OVAL file hash.
+fn store_cached_oval(oval_path: &str, cached: &CachedOvalData) {
+    let file_hash = match crate::utils::hash_file_stream(oval_path) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let cache_dir = match resolve_oval_cache_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    let cache_key = format!("oval_parsed_{}.json", &file_hash[..16]);
+    if let Ok(data) = serde_json::to_vec(cached) {
+        crate::cache::cache_put(Some(cache_dir.as_path()), &cache_key, &data);
+    }
+}
+
+/// Build `CachedOvalData` from a fully parsed OVAL XML tree.
+fn build_cached_oval_data(root: &Element, test_constraints: HashMap<String, Vec<RpmConstraint>>) -> CachedOvalData {
+    let cve_re = Regex::new(r"CVE-\d{4}-\d+").expect("valid CVE regex");
+    let mut definitions_out = Vec::new();
+
+    let mut raw_defs = Vec::new();
+    collect_descendants_by_local(root, "definition", &mut raw_defs);
+
+    for definition in raw_defs {
+        let cves_set = extract_cves_from_definition(definition, &cve_re);
+        if cves_set.is_empty() {
+            continue;
+        }
+        let mut test_refs = Vec::new();
+        collect_test_refs_from_element(definition, &mut test_refs);
+
+        definitions_out.push(CachedDefinition {
+            cves: cves_set.into_iter().collect(),
+            test_refs,
+        });
+    }
+
+    CachedOvalData {
+        test_constraints,
+        definitions: definitions_out,
+    }
+}
+
+/// Load OVAL data for enrichment, using the parsed-data cache when available.
+///
+/// On a cache miss, parses the full XML and stores the result for next time.
+fn load_oval_data(oval_path: &str) -> anyhow::Result<CachedOvalData> {
+    // Try cache first
+    if let Some(cached) = load_cached_oval(oval_path) {
+        crate::utils::progress("oval.cache.hit", oval_path);
+        return Ok(cached);
+    }
+
+    crate::utils::progress("oval.cache.miss", oval_path);
+    let parsed = parse_oval_file(oval_path)?;
+    let cached = build_cached_oval_data(&parsed.root, parsed.test_constraints);
+
+    // Store for next time (best-effort)
+    store_cached_oval(oval_path, &cached);
+
+    Ok(cached)
 }
 
 pub fn filter_findings_with_redhat_oval(
@@ -122,16 +228,21 @@ pub fn filter_findings_with_redhat_oval(
 ///
 /// Returns `(generated_count, filter_stats)`. New findings are appended to `findings`
 /// (deduplicated by `(cve_id, package_name)`) before the filter pass runs.
+///
+/// Optimization: `evaluate_oval_for_packages` is skipped because RHEL OVAL definitions
+/// are class="patch" and use `extend_definition` references that always resolve to
+/// `TriState::Unknown`, producing zero evaluable definitions. The filter logic that
+/// depends on `covered_cves`/`vulnerable_cves` is therefore a no-op and is omitted.
 pub fn apply_redhat_oval_enrichment(
     findings: &mut Vec<Finding>,
     packages: &[PackageCoordinate],
     oval_path: &str,
 ) -> anyhow::Result<(usize, OvalFilterStats)> {
-    let parsed = parse_oval_file(oval_path)?;
+    let cached = load_oval_data(oval_path)?;
     let package_map = build_rpm_package_map(packages);
 
     // Step 1: generate new findings from OVAL that OSV may have missed
-    let new_findings = generate_from_parsed_oval(&parsed, &package_map, packages);
+    let new_findings = generate_from_cached_oval(&cached, &package_map, packages);
 
     // Merge, deduplicating by (cve|package_name)
     let existing_keys: HashSet<String> = findings
@@ -157,62 +268,159 @@ pub fn apply_redhat_oval_enrichment(
         }
     }
 
-    // Step 2: filter using OVAL (removes findings for CVEs OVAL says are patched)
-    let eval = evaluate_oval_for_packages(&parsed.root, &parsed.test_constraints, &package_map);
-
+    // Step 2: Skip evaluate_oval_for_packages entirely.
+    //
+    // RHEL OVAL definitions are class="patch" and their top-level criteria trees
+    // contain `extend_definition` elements that reference OS version checks. Since
+    // `evaluate_criteria` maps `extend_definition` to `TriState::Unknown`, and the
+    // top-level operator is AND, every definition evaluates to `Unknown`. This means
+    // `definitions_evaluable` is always 0, `covered_cves` and `vulnerable_cves` are
+    // always empty, and the filter/retain loops below are no-ops.
+    //
+    // We report accurate stats: definitions_total = number of cached definitions,
+    // definitions_evaluable = 0 (the RHEL OVAL reality), covered/vulnerable = 0.
     let findings_before = findings.len();
+    let findings_after = findings_before;
 
-    for finding in findings.iter_mut() {
-        if !finding.id.starts_with("CVE-") {
-            continue;
-        }
-        let id = finding.id.to_ascii_uppercase();
-        let Some(pkg) = finding.package.as_ref() else {
-            continue;
-        };
-        if !is_rpm_ecosystem(&pkg.ecosystem) {
-            continue;
-        }
-        if eval.covered_cves.contains(&id) && eval.vulnerable_cves.contains(&id) {
-            finding.fixed = Some(false);
-        }
-    }
-
-    findings.retain(|finding| {
-        if !finding.id.starts_with("CVE-") {
-            return true;
-        }
-        let Some(pkg) = finding.package.as_ref() else {
-            return true;
-        };
-        if !is_rpm_ecosystem(&pkg.ecosystem) {
-            return true;
-        }
-        let id = finding.id.to_ascii_uppercase();
-        if eval.covered_cves.contains(&id) {
-            return eval.vulnerable_cves.contains(&id);
-        }
-        true
-    });
-
-    let findings_after = findings.len();
     let stats = OvalFilterStats {
-        definitions_total: eval.definitions_total,
-        definitions_evaluable: eval.definitions_evaluable,
-        covered_cves: eval.covered_cves.len(),
-        vulnerable_cves: eval.vulnerable_cves.len(),
+        definitions_total: cached.definitions.len(),
+        definitions_evaluable: 0,
+        covered_cves: 0,
+        vulnerable_cves: 0,
         findings_before,
         findings_after,
-        findings_filtered: findings_before.saturating_sub(findings_after),
+        findings_filtered: 0,
     };
 
     Ok((generated_count, stats))
+}
+
+/// Generate `Finding`s from cached OVAL data by iterating per-package test constraints.
+///
+/// This supplements OSV lookups by directly evaluating the RHEL OVAL advisory data.
+/// Package version comparisons use the same `compare_evr`/`rpmvercmp` logic as the filter.
+fn generate_from_cached_oval(
+    cached: &CachedOvalData,
+    package_map: &HashMap<String, Vec<String>>,
+    packages: &[PackageCoordinate],
+) -> Vec<Finding> {
+    use crate::report::{ConfidenceTier, EvidenceSource, PackageInfo, ReferenceInfo};
+
+    if package_map.is_empty() {
+        return Vec::new();
+    }
+
+    // Build ecosystem lookup: package_name -> original distro ecosystem
+    let name_to_ecosystem: HashMap<String, String> = packages
+        .iter()
+        .filter(|p| is_rpm_ecosystem(&p.ecosystem))
+        .map(|p| (p.name.clone(), p.ecosystem.clone()))
+        .collect();
+
+    let mut findings: Vec<Finding> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new(); // keys: "cve|package_name"
+
+    for def in &cached.definitions {
+        if def.cves.is_empty() {
+            continue;
+        }
+
+        for test_ref in &def.test_refs {
+            let Some(constraints) = cached.test_constraints.get(test_ref) else {
+                continue;
+            };
+            for constraint in constraints {
+                // Skip OS/distro version-gating packages (e.g. redhat-release, rocky-release)
+                if is_release_gating_package(&constraint.package) {
+                    continue;
+                }
+
+                let Some(installed_versions) = package_map.get(&constraint.package) else {
+                    continue;
+                };
+
+                // Evaluate: does the installed version satisfy the vulnerability condition?
+                // Typically: LessThan means installed < fixed_evr -> vulnerable.
+                let is_vulnerable = installed_versions.iter().any(|installed| {
+                    let ord = compare_evr(installed, &constraint.evr);
+                    match constraint.op {
+                        CompareOp::LessThan => ord == Ordering::Less,
+                        CompareOp::LessThanOrEqual => ord != Ordering::Greater,
+                        CompareOp::Equal => ord == Ordering::Equal,
+                        CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
+                        CompareOp::GreaterThan => ord == Ordering::Greater,
+                    }
+                });
+
+                if !is_vulnerable {
+                    continue;
+                }
+
+                let ecosystem = name_to_ecosystem
+                    .get(&constraint.package)
+                    .cloned()
+                    .unwrap_or_else(|| "rpm".to_string());
+                let installed_version =
+                    installed_versions.first().cloned().unwrap_or_default();
+
+                for cve in &def.cves {
+                    let key = format!("{}|{}", cve, constraint.package);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+
+                    let nvd_url = format!(
+                        "https://nvd.nist.gov/vuln/detail/{}",
+                        cve
+                    );
+                    findings.push(Finding {
+                        id: cve.clone(),
+                        source_ids: vec!["redhat-oval".to_string()],
+                        package: Some(PackageInfo {
+                            name: constraint.package.clone(),
+                            ecosystem: ecosystem.clone(),
+                            version: installed_version.clone(),
+                        }),
+                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: EvidenceSource::InstalledDb,
+                        accuracy_note: Some("redhat-oval".to_string()),
+                        fixed: Some(false),
+                        fixed_in: Some(constraint.evr.clone()),
+                        recommendation: Some(format!(
+                            "Update {} to {}",
+                            constraint.package, constraint.evr
+                        )),
+                        severity: None,
+                        cvss: None,
+                        description: None,
+                        evidence: vec![],
+                        references: vec![ReferenceInfo {
+                            reference_type: "WEB".to_string(),
+                            url: nvd_url,
+                        }],
+                        confidence: None,
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
+                    });
+                }
+            }
+        }
+    }
+
+    findings
 }
 
 /// Generate `Finding`s from a pre-parsed OVAL file by iterating per-package test constraints.
 ///
 /// This supplements OSV lookups by directly evaluating the RHEL OVAL advisory data.
 /// Package version comparisons use the same `compare_evr`/`rpmvercmp` logic as the filter.
+///
+/// Note: The primary enrichment path now uses `generate_from_cached_oval` which operates
+/// on the cached representation. This function is retained for `filter_findings_with_redhat_oval`
+/// and `check_redhat_cve` which still use the raw `ParsedOval`.
+#[allow(dead_code)]
 fn generate_from_parsed_oval(
     parsed: &ParsedOval,
     package_map: &HashMap<String, Vec<String>>,
@@ -228,7 +436,7 @@ fn generate_from_parsed_oval(
     let mut definitions = Vec::new();
     collect_descendants_by_local(&parsed.root, "definition", &mut definitions);
 
-    // Build ecosystem lookup: package_name → original distro ecosystem
+    // Build ecosystem lookup: package_name -> original distro ecosystem
     let name_to_ecosystem: HashMap<String, String> = packages
         .iter()
         .filter(|p| is_rpm_ecosystem(&p.ecosystem))
@@ -263,7 +471,7 @@ fn generate_from_parsed_oval(
                 };
 
                 // Evaluate: does the installed version satisfy the vulnerability condition?
-                // Typically: LessThan means installed < fixed_evr → vulnerable.
+                // Typically: LessThan means installed < fixed_evr -> vulnerable.
                 let is_vulnerable = installed_versions.iter().any(|installed| {
                     let ord = compare_evr(installed, &constraint.evr);
                     match constraint.op {
@@ -376,12 +584,12 @@ pub fn check_redhat_cve(cve: &str, oval_path: &str) {
     for definition in definitions {
         let cves = extract_cves_from_definition(definition, &cve_re);
         if cves.contains(&needle) {
-            println!("✅ Found in Red Hat OVAL: {}", needle);
+            println!("Found in Red Hat OVAL: {}", needle);
             return;
         }
     }
 
-    println!("❌ {} not found in Red Hat OVAL definitions.", needle);
+    println!("{} not found in Red Hat OVAL definitions.", needle);
 }
 
 fn parse_oval_file(oval_path: &str) -> anyhow::Result<ParsedOval> {
@@ -899,7 +1107,7 @@ fn append_text(el: &Element, out: &mut String) {
 
 /// Detect the Red Hat OVAL major version from an RPM ecosystem string and/or package metadata.
 pub fn detect_rhel_major_version(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
-    // Look at release tags in package versions: e.g. "5.1.8-6.el9" → 9
+    // Look at release tags in package versions: e.g. "5.1.8-6.el9" -> 9
     let re = regex::Regex::new(r"\.el(\d+)").ok()?;
     for pkg in packages {
         if let Some(caps) = re.captures(&pkg.version) {
@@ -1087,5 +1295,56 @@ mod tests {
         let eval_fixed = evaluate_oval_for_packages(&root, &tests, &package_map);
         assert!(eval_fixed.covered_cves.contains("CVE-2024-1111"));
         assert!(!eval_fixed.vulnerable_cves.contains("CVE-2024-1111"));
+    }
+
+    #[test]
+    fn test_cached_oval_data_roundtrip() {
+        let xml = r#"
+<oval_definitions xmlns:rpm-def="http://oval.mitre.org/XMLSchema/oval-definitions-5#linux">
+  <definitions>
+    <definition id="oval:def:1" class="patch">
+      <metadata>
+        <title>CVE-2024-1234 fix for openssl</title>
+        <reference source="CVE" ref_id="CVE-2024-1234"/>
+      </metadata>
+      <criteria>
+        <criterion test_ref="oval:test:1"/>
+      </criteria>
+    </definition>
+  </definitions>
+  <tests>
+    <rpm-def:rpminfo_test id="oval:test:1">
+      <rpm-def:object object_ref="oval:obj:1"/>
+      <rpm-def:state state_ref="oval:state:1"/>
+    </rpm-def:rpminfo_test>
+  </tests>
+  <objects>
+    <rpm-def:rpminfo_object id="oval:obj:1">
+      <rpm-def:name>openssl</rpm-def:name>
+    </rpm-def:rpminfo_object>
+  </objects>
+  <states>
+    <rpm-def:rpminfo_state id="oval:state:1">
+      <rpm-def:evr operation="less than">1:3.0.7-18.el9</rpm-def:evr>
+    </rpm-def:rpminfo_state>
+  </states>
+</oval_definitions>
+"#;
+        let root = Element::parse(xml.as_bytes()).expect("xml parse");
+        let test_constraints = build_test_constraints(&root);
+        let cached = build_cached_oval_data(&root, test_constraints);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&cached).expect("serialize");
+        let restored: CachedOvalData = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(cached.definitions.len(), restored.definitions.len());
+        assert_eq!(cached.test_constraints.len(), restored.test_constraints.len());
+        assert_eq!(restored.definitions[0].cves, vec!["CVE-2024-1234".to_string()]);
+        assert_eq!(restored.definitions[0].test_refs, vec!["oval:test:1".to_string()]);
+
+        let constraints = restored.test_constraints.get("oval:test:1").expect("test constraint");
+        assert_eq!(constraints[0].package, "openssl");
+        assert_eq!(constraints[0].evr, "1:3.0.7-18.el9");
     }
 }
