@@ -31,7 +31,7 @@ WORKDIR /app
 # Minimal runtime deps for scanner
 # Keep default apt sources here so ca-certificates can be installed before any HTTPS switch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 rpm && \
+    ca-certificates libssl3 rpm libarchive-tools && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy scanner binary installed in builder
