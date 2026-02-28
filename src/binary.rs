@@ -519,7 +519,7 @@ fn find_name_version_pairs(bytes: &[u8], scan_limit: usize) -> Vec<(String, Stri
     out
 }
 
-fn find_go_version(bytes: &[u8], scan_limit: usize) -> Option<String> {
+pub fn find_go_version(bytes: &[u8], scan_limit: usize) -> Option<String> {
     if bytes.is_empty() {
         return None;
     }
@@ -537,7 +537,7 @@ fn find_go_version(bytes: &[u8], scan_limit: usize) -> Option<String> {
 /// Searches for the `\xff Go build info:` magic header and extracts
 /// `dep` and `mod` records of the form `\t(dep|mod)\t<path>\t<version>`.
 /// Returns (module_path, version) pairs suitable for OSV lookup.
-fn parse_go_buildinfo(bytes: &[u8]) -> Vec<(String, String)> {
+pub fn parse_go_buildinfo(bytes: &[u8]) -> Vec<(String, String)> {
     const MAGIC: &[u8] = b"\xff Go build info:";
     // Find the magic header
     let start = match bytes.windows(MAGIC.len()).position(|w| w == MAGIC) {

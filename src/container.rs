@@ -366,7 +366,6 @@ pub fn scan_container(
                     "container.packages.detect.fast.done",
                     &format!("packages={}", pkgs.len()),
                 );
-                progress("container.layers.merge.skip", "reason=fast_inventory");
                 packages = pkgs;
             }
             Ok(_) => {
@@ -380,7 +379,9 @@ pub fn scan_container(
         }
     }
 
-    if packages.is_empty() {
+    // Always merge layers to get a rootfs — needed for Go binary scanning,
+    // app package detection, and deep analysis even when fast inventory succeeded.
+    {
         rootfs = if manifest_path.exists() {
             progress("container.layers.merge.start", "layout=docker-save");
             match merge_layers_docker_save(tmp.path()) {
@@ -415,17 +416,20 @@ pub fn scan_container(
             tmp.path().to_path_buf()
         };
 
-        progress(
-            "container.packages.detect.start",
-            rootfs.to_string_lossy().as_ref(),
-        );
-        let packages_started = std::time::Instant::now();
-        packages = detect_os_packages(&rootfs);
-        progress_timing("container.packages.detect", packages_started);
-        progress(
-            "container.packages.detect.done",
-            &format!("packages={}", packages.len()),
-        );
+        // Only detect OS packages if fast inventory didn't already find them
+        if packages.is_empty() {
+            progress(
+                "container.packages.detect.start",
+                rootfs.to_string_lossy().as_ref(),
+            );
+            let packages_started = std::time::Instant::now();
+            packages = detect_os_packages(&rootfs);
+            progress_timing("container.packages.detect", packages_started);
+            progress(
+                "container.packages.detect.done",
+                &format!("packages={}", packages.len()),
+            );
+        }
     }
 
     // Light mode: only OSV lookups for packages; Deep mode: run YARA too
@@ -818,7 +822,6 @@ pub fn build_container_report(
                     "container.packages.detect.fast.done",
                     &format!("packages={}", pkgs.len()),
                 );
-                progress("container.layers.merge.skip", "reason=fast_inventory");
                 packages = pkgs;
             }
             Ok(_) => {
@@ -832,7 +835,8 @@ pub fn build_container_report(
         }
     }
 
-    if packages.is_empty() {
+    // Always merge layers to get a rootfs — needed for Go binary scanning and app detection.
+    {
         rootfs = if has_manifest {
             progress("container.layers.merge.start", "layout=docker-save");
             match merge_layers_docker_save(tmp.path()) {
@@ -865,17 +869,19 @@ pub fn build_container_report(
             tmp.path().to_path_buf()
         };
 
-        progress(
-            "container.packages.detect.start",
-            rootfs.to_string_lossy().as_ref(),
-        );
-        let packages_started = std::time::Instant::now();
-        packages = detect_os_packages(&rootfs);
-        progress_timing("container.packages.detect", packages_started);
-        progress(
-            "container.packages.detect.done",
-            &format!("packages={}", packages.len()),
-        );
+        if packages.is_empty() {
+            progress(
+                "container.packages.detect.start",
+                rootfs.to_string_lossy().as_ref(),
+            );
+            let packages_started = std::time::Instant::now();
+            packages = detect_os_packages(&rootfs);
+            progress_timing("container.packages.detect", packages_started);
+            progress(
+                "container.packages.detect.done",
+                &format!("packages={}", packages.len()),
+            );
+        }
     }
 
     // Detect application-level packages (npm, pip, gem, go, maven, cargo, etc.)
@@ -888,6 +894,18 @@ pub fn build_container_report(
         &format!("app_packages={}", app_packages.len()),
     );
     packages.extend(app_packages);
+
+    // Scan Go binaries in the rootfs for embedded buildinfo (Go modules + stdlib)
+    let go_started = std::time::Instant::now();
+    let go_packages = scan_go_binaries_in_rootfs(&rootfs);
+    if !go_packages.is_empty() {
+        progress(
+            "container.go.binaries.done",
+            &format!("go_packages={}", go_packages.len()),
+        );
+        packages.extend(go_packages);
+    }
+    progress_timing("container.go.binaries", go_started);
 
     progress(
         "container.osv.query.start",
@@ -1662,6 +1680,126 @@ fn apply_layer_tar(layer_tar: &Path, rootfs: &Path) -> anyhow::Result<()> {
         ar.unpack(rootfs)?;
     }
     Ok(())
+}
+
+/// Scan Go binaries in the rootfs for embedded buildinfo (modules + stdlib version).
+/// This catches Go stdlib CVEs that OS package managers don't track.
+fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate> {
+    use std::collections::HashSet;
+
+    let mut packages = Vec::new();
+    let mut seen = HashSet::new();
+
+    // Directories to scan for Go binaries. Use a walkdir approach for deeper paths.
+    let search_roots = [
+        "usr/local/bin",
+        "usr/local/go/bin",
+        "usr/bin",
+        "usr/sbin",
+        "bin",
+        "sbin",
+        "app",
+        "opt",
+        "home",
+    ];
+
+    let go_magic = b"\xff Go build info:";
+
+    // Collect candidate binary paths (non-recursive for bin dirs, limited depth for others)
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for dir in &search_roots {
+        let full = rootfs.join(dir);
+        if !full.is_dir() {
+            continue;
+        }
+        // Walk up to 2 levels deep to find Go binaries
+        fn collect_binaries(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+            if depth > 2 { return; }
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_binaries(&path, depth + 1, out);
+                } else if path.is_file() {
+                    out.push(path);
+                }
+            }
+        }
+        collect_binaries(&full, 0, &mut candidates);
+    }
+
+    for path in &candidates {
+        {
+            if !path.is_file() {
+                continue;
+            }
+            // Quick check: read first 4 bytes for ELF magic
+            let mut header = [0u8; 4];
+            if let Ok(mut f) = fs::File::open(&path) {
+                use std::io::Read;
+                if f.read_exact(&mut header).is_err() {
+                    continue;
+                }
+            }
+            // ELF: \x7fELF, Mach-O: \xfe\xed\xfa\xce / \xcf\xfa\xed\xfe
+            let is_binary = header[..4] == [0x7f, b'E', b'L', b'F']
+                || header[..4] == [0xfe, 0xed, 0xfa, 0xce]
+                || header[..4] == [0xcf, 0xfa, 0xed, 0xfe];
+            if !is_binary {
+                continue;
+            }
+
+            // Read the binary (limit to 50MB to avoid OOM on huge binaries)
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > 50 * 1024 * 1024 {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            // Check for Go buildinfo magic
+            if bytes.windows(go_magic.len()).all(|w| w != go_magic) {
+                continue;
+            }
+
+            // Extract Go stdlib version
+            if let Some(go_ver) = crate::binary::find_go_version(&bytes, bytes.len()) {
+                let key = format!("stdlib|{}", go_ver);
+                if seen.insert(key) {
+                    packages.push(PackageCoordinate {
+                        ecosystem: "Go".into(),
+                        name: "stdlib".into(),
+                        version: go_ver,
+                        source_name: None,
+                    });
+                }
+            }
+
+            // Extract Go module dependencies
+            let modules = crate::binary::parse_go_buildinfo(&bytes);
+            for (mod_path, mod_ver) in modules {
+                let key = format!("{}|{}", mod_path, mod_ver);
+                if seen.insert(key) {
+                    packages.push(PackageCoordinate {
+                        ecosystem: "Go".into(),
+                        name: mod_path,
+                        version: mod_ver,
+                        source_name: None,
+                    });
+                }
+            }
+        }
+    }
+
+    packages
 }
 
 fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
