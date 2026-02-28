@@ -1269,7 +1269,7 @@ fn env_i64(name: &str, default: i64) -> i64 {
 }
 
 fn cached_http_json(url: &str, tag: &str, ttl_secs: i64, timeout_secs: u64) -> Option<Value> {
-    let cache_dir = std::env::var_os("SCANNER_CACHE").map(PathBuf::from);
+    let cache_dir = resolve_enrich_cache_dir();
     let key = cache_key(&["distro_feed", tag, url]);
     if let Some(bytes) = cache_get(cache_dir.as_deref(), &key) {
         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
