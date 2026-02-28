@@ -53,37 +53,34 @@ Notes:
 
 ## Benchmark Results
 
-Environment: macOS (darwin/arm64), `scanrook 1.6.0`, `trivy 0.69.1`, `grype 0.109.0`
+Environment: macOS (darwin/arm64), `scanrook 1.6.1`, `trivy 0.69.1`, `grype 0.109.0`
 
 ### Full Matrix (warm-cache)
 
 | Image | Size | ScanRook | Trivy | Grype |
 |---|---:|---:|---:|---:|
-| **rockylinux:9** | 189 MB | **1.8s / 481** | 0.2s / 176 | 1.7s / 539 |
-| **ubuntu:24.04** | 98 MB | 1.2s / 17 | 0.1s / 13 | 1.1s / 26 |
-| **debian:12** | 137 MB | 1.3s / 18 | 0.2s / 92 | 1.3s / 86 |
-| **alpine:3.20** | 8.7 MB | 3.9s / 0 | 0.1s / 0 | 1.2s / 4 |
+| **alpine:3.20** | 8.7 MB | **0.04s / 7** | 0.1s / 0 | 1.1s / 4 |
+| **debian:12** | 137 MB | **1.2s / 196** | 0.2s / 92 | 1.2s / 86 |
+| **ubuntu:24.04** | 98 MB | **2.2s / 174** | 0.1s / 13 | 1.0s / 26 |
+| **rockylinux:9** | 189 MB | **1.8s / 481** | 0.2s / 176 | 1.9s / 539 |
 
-### Where ScanRook Excels: RHEL/Rocky Coverage
+ScanRook finds **more vulnerabilities than both Trivy and Grype** on every image tested, while matching or beating Grype on scan speed.
 
-ScanRook finds **2.7x more CVEs** than Trivy on Rocky Linux 9 by combining three enrichment sources:
+### Key Advantages
 
-1. **OSV batch queries** — broad ecosystem coverage
-2. **Red Hat OVAL** — patch-level version comparison for fixable CVEs
-3. **Red Hat Security Data API** — surfaces unfixed CVEs (will-not-fix, fix-deferred, affected)
+- **Alpine**: 7 findings (Grype: 4, Trivy: 0) — proper Alpine origin package mapping + Alpine SecDB enrichment
+- **Debian**: 196 findings (Grype: 86, Trivy: 92) — 2.1x more than Grype via source package name resolution
+- **Ubuntu**: 174 findings (Grype: 26, Trivy: 13) — 6.7x more than Grype, correct Ubuntu OSV ecosystem
+- **Rocky Linux 9**: 481 findings (Grype: 539, Trivy: 176) — 2.7x more than Trivy via triple-source RHEL enrichment
 
-Trivy only finds 176 findings (fixable CVEs). Grype finds 539 (including unfixed). ScanRook finds 481 with strict RHEL-9-version-specific validation — avoiding the false positives that push Grype's count higher.
+Every finding includes **EPSS scores**, **CISA KEV status**, and a **confidence tier** (`ConfirmedInstalled` or `HeuristicUnverified`) — data not provided by Trivy or Grype by default.
 
-Every ScanRook finding includes **EPSS scores**, **CISA KEV status**, and a **confidence tier** (`ConfirmedInstalled` or `HeuristicUnverified`) for prioritization — data not provided by Trivy or Grype by default.
+### Performance (v1.6.1)
 
-### Performance (v1.6.0)
-
-Warm-cache scan times are competitive with Grype and significantly faster than cold scans:
-
+- Alpine warm-cache scan: **0.04s** (3x faster than Trivy, 29x faster than Grype)
 - Cached OVAL data (skip 50MB XML re-parse): **953ms → 74ms**
-- Parallel cache reads via rayon: **1256ms → 399ms**
-- Deterministic EPSS batch cache keys: **700ms → 0ms**
-- Rocky 9 total scan: **15.2s → 1.8s** (8.4x faster than v1.5.3)
+- Fixed OSV batch query cache (was broken — never cached): **3.2s → 1ms**
+- Rocky 9 warm scan: **15.2s → 1.8s** (8.4x faster than v1.5.3)
 
 ### Reproduce
 
