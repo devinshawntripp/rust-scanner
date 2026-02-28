@@ -436,6 +436,67 @@ pub fn scan_container(
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
     let mut heuristic_used = false;
 
+    // For RHEL-compatible distros (Rocky Linux, AlmaLinux, Oracle Linux, CentOS, Fedora),
+    // supplement with a "Red Hat" ecosystem query to capture RHSA advisory coverage for
+    // subpackages (e.g. openssl-libs, python3-libs, glibc-minimal-langpack) that are not
+    // indexed under distro-specific OSV ecosystems. These distros are binary-compatible
+    // with RHEL so RHSA advisories apply with the same version ranges.
+    {
+        let rhel_supp_pkgs: Vec<PackageCoordinate> = packages
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.ecosystem.as_str(),
+                    "rocky" | "almalinux" | "oraclelinux" | "fedora" | "centos"
+                )
+            })
+            .map(|p| PackageCoordinate {
+                ecosystem: "redhat".into(),
+                name: p.name.clone(),
+                version: p.version.clone(),
+            })
+            .collect();
+        if !rhel_supp_pkgs.is_empty() {
+            progress(
+                "container.osv.rhel_supplement.start",
+                &format!("pkg_count={}", rhel_supp_pkgs.len()),
+            );
+            let rhel_supp_results = osv_batch_query(&rhel_supp_pkgs);
+            let mut supp_findings =
+                map_osv_results_to_findings(&rhel_supp_pkgs, &rhel_supp_results);
+            // Remap ecosystem back to the original distro (cosmetic, for correct provenance).
+            let name_to_ecosystem: std::collections::HashMap<String, String> =
+                packages.iter().map(|p| (p.name.clone(), p.ecosystem.clone())).collect();
+            for f in supp_findings.iter_mut() {
+                if let Some(pkg) = f.package.as_mut() {
+                    if let Some(orig_eco) = name_to_ecosystem.get(&pkg.name) {
+                        pkg.ecosystem = orig_eco.clone();
+                    }
+                }
+            }
+            // Merge findings, deduplicating by (cve_id, package_name).
+            let existing_keys: std::collections::HashSet<String> = findings_norm
+                .iter()
+                .map(|f| {
+                    let pkg_name = f.package.as_ref().map_or("", |p| p.name.as_str());
+                    format!("{}|{}", f.id, pkg_name)
+                })
+                .collect();
+            let pre_merge_count = findings_norm.len();
+            for f in supp_findings {
+                let pkg_name = f.package.as_ref().map_or("", |p| p.name.as_str());
+                let key = format!("{}|{}", f.id, pkg_name);
+                if !existing_keys.contains(&key) {
+                    findings_norm.push(f);
+                }
+            }
+            progress(
+                "container.osv.rhel_supplement.done",
+                &format!("added={}", findings_norm.len() - pre_merge_count),
+            );
+        }
+    }
+
     // Enrich with OSV details first, then NVD for CVSS/refs
     progress(
         "container.enrich.osv.start",
@@ -811,6 +872,18 @@ pub fn build_container_report(
             &format!("packages={}", packages.len()),
         );
     }
+
+    // Detect application-level packages (npm, pip, gem, go, maven, cargo, etc.)
+    let app_started = std::time::Instant::now();
+    progress("container.packages.app.start", rootfs.to_string_lossy().as_ref());
+    let app_packages = crate::archive::detect_app_packages(&rootfs);
+    progress_timing("container.packages.app", app_started);
+    progress(
+        "container.packages.app.done",
+        &format!("app_packages={}", app_packages.len()),
+    );
+    packages.extend(app_packages);
+
     progress(
         "container.osv.query.start",
         &format!("packages={}", packages.len()),
@@ -821,6 +894,65 @@ pub fn build_container_report(
     progress("container.osv.query.done", "ok");
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
     let mut heuristic_used = false;
+
+    // For RHEL-compatible distros (Rocky Linux, AlmaLinux, Oracle Linux, CentOS, Fedora),
+    // supplement with a "Red Hat" ecosystem query to capture RHSA advisory coverage for
+    // subpackages (e.g. openssl-libs, python3-libs, glibc-minimal-langpack) that are not
+    // indexed under distro-specific OSV ecosystems.
+    {
+        let rhel_supp_pkgs: Vec<PackageCoordinate> = packages
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.ecosystem.as_str(),
+                    "rocky" | "almalinux" | "oraclelinux" | "fedora" | "centos"
+                )
+            })
+            .map(|p| PackageCoordinate {
+                ecosystem: "redhat".into(),
+                name: p.name.clone(),
+                version: p.version.clone(),
+            })
+            .collect();
+        if !rhel_supp_pkgs.is_empty() {
+            progress(
+                "container.osv.rhel_supplement.start",
+                &format!("pkg_count={}", rhel_supp_pkgs.len()),
+            );
+            let rhel_supp_results = osv_batch_query(&rhel_supp_pkgs);
+            let mut supp_findings =
+                map_osv_results_to_findings(&rhel_supp_pkgs, &rhel_supp_results);
+            let name_to_ecosystem: std::collections::HashMap<String, String> =
+                packages.iter().map(|p| (p.name.clone(), p.ecosystem.clone())).collect();
+            for f in supp_findings.iter_mut() {
+                if let Some(pkg) = f.package.as_mut() {
+                    if let Some(orig_eco) = name_to_ecosystem.get(&pkg.name) {
+                        pkg.ecosystem = orig_eco.clone();
+                    }
+                }
+            }
+            let existing_keys: std::collections::HashSet<String> = findings_norm
+                .iter()
+                .map(|f| {
+                    let pkg_name = f.package.as_ref().map_or("", |p| p.name.as_str());
+                    format!("{}|{}", f.id, pkg_name)
+                })
+                .collect();
+            let pre_merge_count = findings_norm.len();
+            for f in supp_findings {
+                let pkg_name = f.package.as_ref().map_or("", |p| p.name.as_str());
+                let key = format!("{}|{}", f.id, pkg_name);
+                if !existing_keys.contains(&key) {
+                    findings_norm.push(f);
+                }
+            }
+            progress(
+                "container.osv.rhel_supplement.done",
+                &format!("added={}", findings_norm.len() - pre_merge_count),
+            );
+        }
+    }
+
     progress(
         "container.enrich.osv.start",
         &format!("findings_pre_enrich={}", findings_norm.len()),
@@ -1924,19 +2056,27 @@ fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String)> {
     if blob.len() < 16 {
         return None;
     }
-    // Verify magic
-    if blob[0..4] != [0x8e, 0xad, 0xe8, 0x01] {
-        return None;
-    }
-    let nindex = u32::from_be_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
-    let hsize = u32::from_be_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+
+    // RPM header blobs come in two formats:
+    // 1. With magic prefix: [8e ad e8 01] [reserved 4B] [nindex 4B] [hsize 4B] ...
+    // 2. Without magic (rpmdb.sqlite in RPM 4.16+): [nindex 4B] [hsize 4B] ...
+    let (nindex, hsize, entries_start) = if blob[0..4] == [0x8e, 0xad, 0xe8, 0x01] {
+        // Format 1: magic header present
+        let ni = u32::from_be_bytes([blob[8], blob[9], blob[10], blob[11]]) as usize;
+        let hs = u32::from_be_bytes([blob[12], blob[13], blob[14], blob[15]]) as usize;
+        (ni, hs, 16usize)
+    } else {
+        // Format 2: no magic, starts with nindex + hsize directly (RPM 4.16+ SQLite)
+        let ni = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+        let hs = u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+        (ni, hs, 8usize)
+    };
 
     // Sanity check: nindex and hsize shouldn't be unreasonably large
     if nindex > 10000 || hsize > 64 * 1024 * 1024 {
         return None;
     }
 
-    let entries_start = 16;
     let entries_size = nindex * 16;
     let data_start = entries_start + entries_size;
     let total_needed = data_start + hsize;

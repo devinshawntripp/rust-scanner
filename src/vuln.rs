@@ -3012,8 +3012,8 @@ pub fn enrich_findings_with_nvd(
 
     // Determine polite sleep between requests
     let default_ms = match api_key {
-        Some(_) => 800u64,
-        None => 6500u64,
+        Some(_) => 400u64,
+        None => 6000u64,
     };
     let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
         .ok()
@@ -3060,7 +3060,7 @@ pub fn enrich_findings_with_nvd(
     let max_concurrent: usize = std::env::var("SCANNER_NVD_CONC")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(if api_key.is_some() { 5 } else { 1 });
+        .unwrap_or(if api_key.is_some() { 8 } else { 2 });
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(max_concurrent)
         .build()
@@ -3236,8 +3236,8 @@ pub fn nvd_keyword_findings(
         urlencoding::encode(&keyword)
     );
     let default_ms = match api_key {
-        Some(_) => 800u64,
-        None => 6500u64,
+        Some(_) => 400u64,
+        None => 6000u64,
     };
     let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
         .ok()
@@ -3353,8 +3353,8 @@ pub fn nvd_cpe_findings(
         urlencoding::encode(&cpe)
     );
     let default_ms = match api_key {
-        Some(_) => 800u64,
-        None => 6500u64,
+        Some(_) => 400u64,
+        None => 6000u64,
     };
     let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
         .ok()
@@ -3464,8 +3464,8 @@ pub fn nvd_keyword_findings_name(
         urlencoding::encode(component)
     );
     let default_ms = match api_key {
-        Some(_) => 800u64,
-        None => 6500u64,
+        Some(_) => 400u64,
+        None => 6000u64,
     };
     let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
         .ok()
@@ -3647,8 +3647,8 @@ pub fn nvd_findings_by_product_version(
         urlencoding::encode(product)
     );
     let default_ms = match api_key {
-        Some(_) => 800u64,
-        None => 6500u64,
+        Some(_) => 400u64,
+        None => 6000u64,
     };
     let sleep_ms: u64 = std::env::var("SCANNER_NVD_SLEEP_MS")
         .ok()

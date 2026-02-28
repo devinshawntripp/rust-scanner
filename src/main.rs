@@ -1,3 +1,4 @@
+mod archive;
 mod binary;
 mod cache;
 mod container;
@@ -945,6 +946,8 @@ fn build_scan_report_value(
     let tar_like = looks_like_tar_input(file);
     let iso_like = looks_like_iso_input(file);
     let sbom_like = looks_like_sbom_input(file);
+    let zip_like = looks_like_zip_input(file);
+    let dmg_like = looks_like_dmg_input(file);
     if tar_like {
         if let Some(r) = container::build_container_report(
             file,
@@ -969,6 +972,18 @@ fn build_scan_report_value(
     }
     if sbom_like {
         if let Some(r) = sbom::build_sbom_report(file, mode, nvd_api_key) {
+            return serde_json::to_value(r).ok();
+        }
+        return None;
+    }
+    if zip_like {
+        if let Some(r) = archive::build_archive_report(file, mode.clone(), nvd_api_key.clone()) {
+            return serde_json::to_value(r).ok();
+        }
+        // Fall through to binary if archive scanning fails
+    }
+    if dmg_like {
+        if let Some(r) = archive::build_dmg_report(file, mode.clone(), nvd_api_key.clone()) {
             return serde_json::to_value(r).ok();
         }
         return None;
@@ -2115,4 +2130,72 @@ fn looks_like_sbom_input(path: &str) -> bool {
     text.contains("\"bomformat\"")
         || text.contains("\"spdxversion\"")
         || text.contains("\"artifacts\"")
+}
+
+fn looks_like_zip_input(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    // Extension check for known ZIP-based formats
+    if lower.ends_with(".zip")
+        || lower.ends_with(".jar")
+        || lower.ends_with(".war")
+        || lower.ends_with(".ear")
+        || lower.ends_with(".aab")
+        || lower.ends_with(".whl")
+        || lower.ends_with(".nupkg")
+        || lower.ends_with(".ipa")
+        || lower.ends_with(".xpi")
+        || lower.ends_with(".vsix")
+        || lower.ends_with(".crx")
+    {
+        return true;
+    }
+    // .apk could be Android APK (ZIP) or Alpine package (tar) — check magic bytes
+    if lower.ends_with(".apk") {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut magic = [0u8; 4];
+        return f.read(&mut magic).ok().unwrap_or(0) >= 4
+            && magic[0] == 0x50
+            && magic[1] == 0x4b
+            && magic[2] == 0x03
+            && magic[3] == 0x04;
+    }
+
+    // Magic bytes: PK\x03\x04 (ZIP local file header)
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    if f.read(&mut magic).ok().unwrap_or(0) < 4 {
+        return false;
+    }
+    magic[0] == 0x50 && magic[1] == 0x4b && magic[2] == 0x03 && magic[3] == 0x04
+}
+
+fn looks_like_dmg_input(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".dmg") {
+        return true;
+    }
+    // Check for UDIF magic at the end of the file (koly block)
+    // or common DMG signatures
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // UDIF trailer is at the very end of the file: "koly" magic
+    if let Ok(pos) = f.seek(SeekFrom::End(-512)) {
+        let _ = pos;
+        let mut tail = [0u8; 512];
+        if f.read(&mut tail).ok().unwrap_or(0) >= 4 {
+            // Look for "koly" signature
+            if tail[0] == b'k' && tail[1] == b'o' && tail[2] == b'l' && tail[3] == b'y' {
+                return true;
+            }
+        }
+    }
+    false
 }
