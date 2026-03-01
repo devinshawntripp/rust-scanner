@@ -1730,8 +1730,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "scanner"
-version = "1.6.4"
+name = "scanrook"
+version = "1.8.2"
 dependencies = [
  "anyhow",
  "bzip2 0.4.4",
@@ -1759,6 +1759,7 @@ dependencies = [
  "xmltree",
  "yara",
  "zip",
+ "zstd",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
-name = "scanner"
-version = "1.6.4"
+name = "scanrook"
+version = "1.8.2"
 edition = "2021"
 
 [dependencies]
@@ -31,6 +31,7 @@ redis = "0.27"
 serde_yaml = "0.9.34"
 rusqlite = { version = "0.31", features = ["bundled"] }
 zip = "8.1"
+zstd = "0.13"
 
 [features]
 default = []
