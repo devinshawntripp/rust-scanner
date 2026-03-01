@@ -34,9 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 rpm libarchive-tools && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy scanner binary installed in builder
-COPY --from=builder /usr/local/bin/scanner /usr/local/bin/scanner
-RUN ln -sf /usr/local/bin/scanner /usr/local/bin/scanrook
+# Copy scanrook binary installed in builder
+COPY --from=builder /usr/local/bin/scanrook /usr/local/bin/scanrook
+RUN ln -sf /usr/local/bin/scanrook /usr/local/bin/scanner
 ENV PATH="/usr/local/bin:${PATH}"
 
 # Reasonable defaults; override at runtime

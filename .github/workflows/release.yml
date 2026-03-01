@@ -51,7 +51,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          BIN_PATH="target/${{ matrix.target }}/release/scanner"
+          BIN_PATH="target/${{ matrix.target }}/release/scanrook"
           STAGE_DIR="$(mktemp -d)"
           cp "${BIN_PATH}" "${STAGE_DIR}/scanrook"
           chmod +x "${STAGE_DIR}/scanrook"
@@ -83,7 +83,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           cd artifacts
-          find . -name "*.tar.gz" -exec sha256sum {} \; | sed 's|  \./[^/]*/||' > "scanrook-${VERSION}-checksums.txt"
+          find . -name "*.tar.gz" -exec sha256sum {} \; | sed 's|  \./[^/]*/|  |' > "scanrook-${VERSION}-checksums.txt"
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
       - name: Create GitHub Release
