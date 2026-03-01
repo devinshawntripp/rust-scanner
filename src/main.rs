@@ -10,6 +10,7 @@ mod sbom;
 mod usercli;
 mod utils;
 mod vuln;
+mod vulndb;
 
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -373,6 +374,18 @@ enum DbCommands {
         #[arg(long, value_enum, default_value_t = ScanMode::Deep)]
         mode: ScanMode,
     },
+    /// Build the pre-compiled SQLite vulnerability database from bulk sources
+    Build {
+        /// Output path for the SQLite database
+        #[arg(long, default_value = "scanrook-db.sqlite")]
+        output: String,
+    },
+    /// Fetch the latest pre-compiled vulndb from ScanRook servers
+    Fetch {
+        /// Force re-download even if local DB is up-to-date
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Pre-populate local cache from PostgreSQL CVE data or by downloading key feeds
     Seed {
         /// Seed from PostgreSQL DATABASE_URL (copies cached CVE data to local file cache)
@@ -475,6 +488,13 @@ fn main() {
             ScannerLogLevel::Debug => "debug",
         },
     );
+
+    if vuln::cluster_mode() {
+        progress(
+            "scanner.cluster_mode",
+            "enabled -- using PostgreSQL enrichment, file cache disabled",
+        );
+    }
 
     match cli.command {
         Commands::Scan {
@@ -1651,6 +1671,12 @@ fn run_db(
         DbCommands::Clear => {
             clear_scanrook_cache()?;
             println!("cache_cleared path={}", resolve_cache_dir().display());
+        }
+        DbCommands::Build { output } => {
+            vulndb::build_full_db(&output, nvd_api_key.as_deref())?;
+        }
+        DbCommands::Fetch { force } => {
+            vulndb::fetch_db(force)?;
         }
         DbCommands::Update {
             source,

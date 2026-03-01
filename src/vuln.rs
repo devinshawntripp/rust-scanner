@@ -35,6 +35,15 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Returns true when the scanner is running in cluster mode (SCANROOK_CLUSTER_MODE=1).
+/// In cluster mode the local file cache is skipped and PostgreSQL is used as the
+/// primary enrichment cache so that all workers in the cluster share results.
+pub fn cluster_mode() -> bool {
+    std::env::var("SCANROOK_CLUSTER_MODE")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn parse_cvss_score(score_raw: &str) -> Option<(f32, String)> {
     let s = score_raw.trim();
     if s.is_empty() {
@@ -3056,9 +3065,78 @@ pub fn redhat_inject_unfixed_cves(
         .max(1);
 
     let client = build_http_client(timeout_secs);
+    let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
 
     if let Some(c) = pg.as_mut() {
         pg_init_schema(c);
+    }
+
+    // In cluster mode, check the rhel_cves PG table for previously cached structured
+    // findings. Any (cve_id, package) pairs found with valid TTL are injected directly
+    // and excluded from later API fetching.
+    let mut pg_preloaded_keys: HashSet<String> = HashSet::new();
+    if cluster_mode() {
+        if let Some(c) = pg.as_mut() {
+            let rhel_ver = rhel_major_str.as_deref().unwrap_or("0");
+            let unfixed_states_set: HashSet<&str> =
+                ["affected", "fix deferred", "will not fix"].iter().copied().collect();
+            for pkg in &rpm_packages {
+                let rows = pg_get_rhel_cves(c, &pkg.name, rhel_ver, ttl_days);
+                for (cve_id, _state, fix_state, _advisory) in &rows {
+                    let key = format!("{}|{}", cve_id, pkg.name);
+                    let state_lc = fix_state.to_ascii_lowercase();
+                    if !unfixed_states_set.contains(state_lc.as_str()) {
+                        // Cached as non-unfixed -- record key so we skip it downstream
+                        pg_preloaded_keys.insert(key);
+                        continue;
+                    }
+                    if existing_keys.contains(&key) || !pg_preloaded_keys.insert(key.clone()) {
+                        continue;
+                    }
+                    // Build a finding from the cached structured data
+                    let recommendation = Some(format!(
+                        "No fix is currently available for {} on this platform (Red Hat state: {}).",
+                        pkg.name, fix_state
+                    ));
+                    findings.push(Finding {
+                        id: cve_id.clone(),
+                        source_ids: vec!["redhat-security-data".to_string()],
+                        package: Some(PackageInfo {
+                            name: pkg.name.clone(),
+                            ecosystem: pkg.ecosystem.clone(),
+                            version: pkg.version.clone(),
+                        }),
+                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: EvidenceSource::InstalledDb,
+                        accuracy_note: Some(format!("redhat-state:{}", fix_state)),
+                        fixed: Some(false),
+                        fixed_in: None,
+                        recommendation,
+                        severity: None,
+                        cvss: None,
+                        description: None,
+                        evidence: vec![],
+                        references: vec![ReferenceInfo {
+                            reference_type: "WEB".to_string(),
+                            url: format!("https://access.redhat.com/security/cve/{}", cve_id),
+                        }],
+                        confidence: None,
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
+                    });
+                }
+            }
+            if !pg_preloaded_keys.is_empty() {
+                progress(
+                    "rhel_cves.pg.preload",
+                    &format!("preloaded={}", pg_preloaded_keys.len()),
+                );
+            }
+        }
     }
 
     // Collect unique candidate query names: exact installed name + derived base names.
@@ -3173,7 +3251,7 @@ pub fn redhat_inject_unfixed_cves(
             }
             for attrib in pkg_attribs {
                 let key = format!("{}|{}", cve_id, attrib.0);
-                if !existing_keys.contains(&key) {
+                if !existing_keys.contains(&key) && !pg_preloaded_keys.contains(&key) {
                     cve_to_packages
                         .entry(cve_id.clone())
                         .or_default()
@@ -3202,10 +3280,6 @@ pub fn redhat_inject_unfixed_cves(
     // Check PG cache first (sequential since PgClient is !Send).
     let mut id_to_json: HashMap<String, Value> = HashMap::new();
     let mut pg_misses: Vec<String> = Vec::new();
-    let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
 
     for cve_id in &new_cve_ids {
         let mut pg_hit = false;
@@ -3431,6 +3505,34 @@ pub fn redhat_inject_unfixed_cves(
                 in_kev: None,
             });
             injected_count += 1;
+        }
+    }
+
+    // In cluster mode, write back structured RHEL CVE data to PostgreSQL so that
+    // other workers in the cluster can reuse the results without re-fetching.
+    if cluster_mode() {
+        if let Some(c) = pg.as_mut() {
+            let rhel_ver = rhel_major_str.as_deref().unwrap_or("0");
+            let mut wb_count = 0usize;
+            for f in &new_findings {
+                if let Some(ref pkg) = f.package {
+                    let fix_state = f
+                        .accuracy_note
+                        .as_deref()
+                        .and_then(|n| n.strip_prefix("redhat-state:"))
+                        .unwrap_or("");
+                    let advisory = f
+                        .references
+                        .iter()
+                        .find(|r| r.url.contains("access.redhat.com"))
+                        .map(|r| r.url.as_str());
+                    pg_put_rhel_cve(c, &f.id, &pkg.name, rhel_ver, "unfixed", fix_state, advisory);
+                    wb_count += 1;
+                }
+            }
+            if wb_count > 0 {
+                progress("rhel_cves.pg.writeback", &format!("rows={}", wb_count));
+            }
         }
     }
 
@@ -4493,7 +4595,9 @@ fn adjust_rate_limits(resp: &Response) {
 
 // --- Postgres helpers ---
 pub fn pg_connect() -> Option<PgClient> {
-    let raw_url = std::env::var("DATABASE_URL").ok()?;
+    let raw_url = std::env::var("SCANROOK_ENRICHMENT_DATABASE_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .ok()?;
     // Support schema in URL via ?schema=..., but strip it before connecting (postgres crate rejects unknown params)
     let (clean_url, schema_in_url) = strip_param_from_url(&raw_url, "schema");
     progress("nvd.cache.pg.connect.start", "");
@@ -4517,7 +4621,7 @@ pub fn pg_connect() -> Option<PgClient> {
 
 pub fn pg_init_schema(client: &mut PgClient) {
     let res = client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE INDEX IF NOT EXISTS idx_nvd_cve_cache_last_checked ON nvd_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_osv_vuln_cache_last_checked ON osv_vuln_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_csaf_cache_last_checked ON redhat_csaf_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_cve_cache_last_checked ON redhat_cve_cache (last_checked_at);"
+        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS rhel_cves (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            rhel_version TEXT NOT NULL,\n            state TEXT,\n            fix_state TEXT,\n            advisory TEXT,\n            fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n            PRIMARY KEY (cve_id, package, rhel_version)\n        );\n        CREATE INDEX IF NOT EXISTS idx_nvd_cve_cache_last_checked ON nvd_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_osv_vuln_cache_last_checked ON osv_vuln_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_csaf_cache_last_checked ON redhat_csaf_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_cve_cache_last_checked ON redhat_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_package ON rhel_cves (package);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_fetched_at ON rhel_cves (fetched_at);\n        CREATE TABLE IF NOT EXISTS epss_scores_cache (\n            cve_id TEXT PRIMARY KEY,\n            score REAL NOT NULL,\n            percentile REAL NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS kev_entries_cache (\n            cve_id TEXT PRIMARY KEY,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS debian_tracker_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            urgency TEXT,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS ubuntu_usn_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            priority TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS alpine_secdb_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            branch TEXT NOT NULL,\n            repo TEXT NOT NULL,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, branch, repo)\n        );\n        CREATE INDEX IF NOT EXISTS idx_debian_cache_pkg ON debian_tracker_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_ubuntu_cache_pkg ON ubuntu_usn_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_alpine_cache_pkg ON alpine_secdb_cache (package, branch);"
     );
     match res {
         Ok(_) => progress("nvd.cache.pg.init.ok", ""),
@@ -4842,8 +4946,68 @@ fn pg_put_redhat_cve(
     }
 }
 
+/// Query the `rhel_cves` table for previously cached structured RHEL CVE data for
+/// a given package and RHEL major version. Returns rows that are still within the
+/// configured TTL (defaults to 30 days).
+fn pg_get_rhel_cves(
+    client: &mut PgClient,
+    package: &str,
+    rhel_version: &str,
+    ttl_days: i64,
+) -> Vec<(String, String, String, Option<String>)> {
+    // Returns (cve_id, state, fix_state, advisory)
+    let rows = client
+        .query(
+            "SELECT cve_id, state, fix_state, advisory FROM rhel_cves \
+             WHERE package = $1 AND rhel_version = $2 \
+             AND fetched_at > NOW() - make_interval(days => $3)",
+            &[&package, &rhel_version, &(ttl_days as i32)],
+        )
+        .unwrap_or_default();
+    rows.iter()
+        .map(|row| {
+            let cve_id: String = row.get(0);
+            let state: String = row.get(1);
+            let fix_state: String = row.get(2);
+            let advisory: Option<String> = row.get(3);
+            (cve_id, state, fix_state, advisory)
+        })
+        .collect()
+}
+
+/// Write a structured RHEL CVE row into the `rhel_cves` table. Uses upsert so that
+/// re-scans update the state and fetched_at timestamp rather than creating duplicates.
+fn pg_put_rhel_cve(
+    client: &mut PgClient,
+    cve_id: &str,
+    package: &str,
+    rhel_version: &str,
+    state: &str,
+    fix_state: &str,
+    advisory: Option<&str>,
+) {
+    let res = client.execute(
+        "INSERT INTO rhel_cves (cve_id, package, rhel_version, state, fix_state, advisory, fetched_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, NOW()) \
+         ON CONFLICT (cve_id, package, rhel_version) DO UPDATE SET \
+           state = EXCLUDED.state, fix_state = EXCLUDED.fix_state, \
+           advisory = EXCLUDED.advisory, fetched_at = NOW()",
+        &[&cve_id, &package, &rhel_version, &state, &fix_state, &advisory],
+    );
+    match res {
+        Ok(_) => {}
+        Err(e) => progress("rhel_cves.pg.put.err", &format!("{} {} {}", cve_id, package, e)),
+    }
+}
+
 /// Returns the cache directory for enrichment functions to use from other modules.
+/// Returns the cache directory for enrichment functions to use from other modules.
+/// In cluster mode, returns None so the local file cache is never used -- PostgreSQL
+/// serves as the shared enrichment cache across all workers.
 pub fn resolve_enrich_cache_dir() -> Option<PathBuf> {
+    if cluster_mode() {
+        return None; // Skip file cache in cluster mode -- use PG directly
+    }
     if let Ok(dir) = std::env::var("SCANNER_CACHE") {
         return Some(PathBuf::from(dir));
     }
@@ -4889,8 +5053,58 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
 
     let mut scores: HashMap<String, (f32, f32)> = HashMap::new();
 
-    // Batch in groups of 100
-    for chunk in cve_ids.chunks(100) {
+    // Try PostgreSQL cache first (bulk-populated by vulndb-pg-import CronJob)
+    let mut pg_miss_ids: Vec<String> = Vec::new();
+    if let Some(mut client) = pg_connect() {
+        for chunk in cve_ids.chunks(500) {
+            let params_str: String = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let query = format!(
+                "SELECT cve_id, score, percentile FROM epss_scores_cache WHERE cve_id IN ({})",
+                params_str
+            );
+            let params: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                chunk.iter().map(|s| s as &(dyn postgres::types::ToSql + Sync)).collect();
+            match client.query(&*query, &params) {
+                Ok(rows) => {
+                    let found: HashSet<String> = rows
+                        .iter()
+                        .filter_map(|row| {
+                            let cve_id: String = row.get(0);
+                            let score: f32 = row.get(1);
+                            let percentile: f32 = row.get(2);
+                            scores.insert(cve_id.clone(), (score, percentile));
+                            Some(cve_id)
+                        })
+                        .collect();
+                    for id in chunk {
+                        if !found.contains(id) {
+                            pg_miss_ids.push(id.clone());
+                        }
+                    }
+                }
+                Err(e) => {
+                    progress("epss.enrich.pg_error", &format!("{}", e));
+                    pg_miss_ids.extend(chunk.iter().cloned());
+                }
+            }
+        }
+        if !scores.is_empty() {
+            progress(
+                "epss.enrich.pg_hit",
+                &format!("hit={} miss={}", scores.len(), pg_miss_ids.len()),
+            );
+        }
+    } else {
+        pg_miss_ids = cve_ids.clone();
+    }
+
+    // Fall back to FIRST.org API for misses
+    for chunk in pg_miss_ids.chunks(100) {
         let cache_k = cache_key(
             &std::iter::once("epss_v1")
                 .chain(chunk.iter().map(|s| s.as_str()))
@@ -4989,35 +5203,24 @@ pub fn kev_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pat
     if !has_cves {
         return;
     }
-    progress("kev.enrich.start", "downloading CISA KEV catalog");
+    progress("kev.enrich.start", "checking KEV catalog");
     let started = std::time::Instant::now();
 
-    let cache_k = cache_key(&["kev_catalog_v1"]);
-    let kev_set: HashSet<String> = if let Some(cached) = cache_get(cache_dir, &cache_k) {
-        if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&cached) {
-            progress("kev.enrich.cache_hit", &format!("cves={}", set.len()));
-            set
-        } else {
-            match fetch_kev_catalog() {
-                Some(set) => {
-                    if let Ok(serialized) = serde_json::to_vec(&set) {
-                        cache_put(cache_dir, &cache_k, &serialized);
-                    }
-                    set
-                }
-                None => return,
+    // Try PostgreSQL cache first (bulk-populated by vulndb-pg-import CronJob)
+    let kev_set: HashSet<String> = if let Some(mut client) = pg_connect() {
+        match client.query("SELECT cve_id FROM kev_entries_cache", &[]) {
+            Ok(rows) if !rows.is_empty() => {
+                let set: HashSet<String> = rows.iter().map(|r| r.get(0)).collect();
+                progress("kev.enrich.pg_hit", &format!("entries={}", set.len()));
+                set
+            }
+            _ => {
+                // PG table empty or error, fall back to file cache / API
+                kev_from_cache_or_api(cache_dir)
             }
         }
     } else {
-        match fetch_kev_catalog() {
-            Some(set) => {
-                if let Ok(serialized) = serde_json::to_vec(&set) {
-                    cache_put(cache_dir, &cache_k, &serialized);
-                }
-                set
-            }
-            None => return,
-        }
+        kev_from_cache_or_api(cache_dir)
     };
 
     let mut enriched = 0usize;
@@ -5037,6 +5240,25 @@ pub fn kev_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pat
             findings.len()
         ),
     );
+}
+
+fn kev_from_cache_or_api(cache_dir: Option<&std::path::Path>) -> HashSet<String> {
+    let cache_k = cache_key(&["kev_catalog_v1"]);
+    if let Some(cached) = cache_get(cache_dir, &cache_k) {
+        if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&cached) {
+            progress("kev.enrich.cache_hit", &format!("cves={}", set.len()));
+            return set;
+        }
+    }
+    match fetch_kev_catalog() {
+        Some(set) => {
+            if let Ok(serialized) = serde_json::to_vec(&set) {
+                cache_put(cache_dir, &cache_k, &serialized);
+            }
+            set
+        }
+        None => HashSet::new(),
+    }
 }
 
 fn fetch_kev_catalog() -> Option<HashSet<String>> {
