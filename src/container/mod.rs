@@ -1,9 +1,11 @@
 mod dpkg;
+mod apk;
 mod rpm;
 
 pub use rpm::{parse_rpm_bdb, parse_rpm_sqlite};
 use rpm::detect_rpm_packages_native;
 use dpkg::{parse_dpkg_status, parse_dpkg_status_with_ecosystem};
+use apk::{parse_apk_installed, parse_apk_installed_with_ecosystem};
 use crate::redhat::apply_redhat_oval_enrichment;
 use crate::report::{
     compute_summary, retag_findings, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
@@ -1975,51 +1977,5 @@ fn trim_os_release_value(v: &str) -> String {
 }
 
 
-fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
-    parse_apk_installed_with_ecosystem(contents, "apk", out);
-}
-
-fn parse_apk_installed_with_ecosystem(
-    contents: &str,
-    ecosystem: &str,
-    out: &mut Vec<PackageCoordinate>,
-) {
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    let mut origin: Option<String> = None;
-    for line in contents.lines() {
-        if line.starts_with("P:") {
-            name = Some(line[2..].trim().to_string());
-        } else if line.starts_with("V:") {
-            version = Some(line[2..].trim().to_string());
-        } else if line.starts_with("o:") {
-            // Origin package name — OSV Alpine indexes by origin, not binary subpackage.
-            origin = Some(line[2..].trim().to_string());
-        } else if line.is_empty() {
-            if let (Some(n), Some(v)) = (name.take(), version.take()) {
-                let src = origin.take();
-                let source_name = src.and_then(|o| if o == n { None } else { Some(o) });
-                out.push(PackageCoordinate {
-                    ecosystem: ecosystem.into(),
-                    name: n,
-                    version: v,
-                    source_name,
-                });
-            } else {
-                origin.take();
-            }
-        }
-    }
-    if let (Some(n), Some(v)) = (name.take(), version.take()) {
-        let src = origin.take();
-        let source_name = src.and_then(|o| if o == n { None } else { Some(o) });
-        out.push(PackageCoordinate {
-            ecosystem: ecosystem.into(),
-            name: n,
-            version: v,
-            source_name,
-        });
-    }
-}
 
 
