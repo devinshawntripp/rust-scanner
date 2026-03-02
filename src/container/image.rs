@@ -40,20 +40,17 @@ pub fn pull_and_save_image(image_ref: &str) -> anyhow::Result<(TempDir, String)>
         if save.status.success() && tar_path.exists() {
             let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
             if size > 0 {
-                progress(
-                    "image.saved",
-                    &format!("runtime={} size={}", runtime, size),
-                );
+                progress("image.saved", &format!("runtime={} size={}", runtime, size));
                 return Ok((tmpdir, tar_str));
             }
         }
 
         // Image not pulled yet — pull first, then save
-        progress("image.pull.start", &format!("{} pull {}", runtime, image_ref));
-        let pull = Command::new(runtime)
-            .arg("pull")
-            .arg(image_ref)
-            .output()?;
+        progress(
+            "image.pull.start",
+            &format!("{} pull {}", runtime, image_ref),
+        );
+        let pull = Command::new(runtime).arg("pull").arg(image_ref).output()?;
 
         if !pull.status.success() {
             let stderr = String::from_utf8_lossy(&pull.stderr);
@@ -75,10 +72,7 @@ pub fn pull_and_save_image(image_ref: &str) -> anyhow::Result<(TempDir, String)>
         if save.status.success() && tar_path.exists() {
             let size = fs::metadata(&tar_path).map(|m| m.len()).unwrap_or(0);
             if size > 0 {
-                progress(
-                    "image.saved",
-                    &format!("runtime={} size={}", runtime, size),
-                );
+                progress("image.saved", &format!("runtime={} size={}", runtime, size));
                 return Ok((tmpdir, tar_str));
             }
         }

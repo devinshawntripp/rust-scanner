@@ -2,7 +2,9 @@
 
 use crate::container::apk::parse_apk_installed_with_ecosystem;
 use crate::container::dpkg::parse_dpkg_status_with_ecosystem;
-use crate::container::ecosystem::{detect_apk_ecosystem, detect_dpkg_ecosystem, detect_rpm_ecosystem};
+use crate::container::ecosystem::{
+    detect_apk_ecosystem, detect_dpkg_ecosystem, detect_rpm_ecosystem,
+};
 use crate::container::rpm::detect_rpm_packages_native;
 use crate::container::PackageCoordinate;
 use crate::utils::progress;
@@ -104,7 +106,9 @@ pub(super) fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate
         }
         // Walk up to 2 levels deep to find Go binaries
         fn collect_binaries(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
-            if depth > 2 { return; }
+            if depth > 2 {
+                return;
+            }
             let entries = match fs::read_dir(dir) {
                 Ok(e) => e,
                 Err(_) => return,

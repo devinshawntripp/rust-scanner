@@ -2,7 +2,11 @@
 
 use crate::container::PackageCoordinate;
 
-pub(super) fn parse_dpkg_status_with_ecosystem(contents: &str, ecosystem: &str, out: &mut Vec<PackageCoordinate>) {
+pub(super) fn parse_dpkg_status_with_ecosystem(
+    contents: &str,
+    ecosystem: &str,
+    out: &mut Vec<PackageCoordinate>,
+) {
     parse_dpkg_status_inner(contents, ecosystem, out);
 }
 
@@ -30,7 +34,11 @@ fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<Packag
                 let source_name = src
                     .map(|s| {
                         let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
-                        if trimmed == n { None } else { Some(trimmed) }
+                        if trimmed == n {
+                            None
+                        } else {
+                            Some(trimmed)
+                        }
                     })
                     .flatten();
                 out.push(PackageCoordinate {
@@ -70,7 +78,11 @@ fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<Packag
             let source_name = src
                 .map(|s| {
                     let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
-                    if trimmed == n { None } else { Some(trimmed) }
+                    if trimmed == n {
+                        None
+                    } else {
+                        Some(trimmed)
+                    }
                 })
                 .flatten();
             out.push(PackageCoordinate {

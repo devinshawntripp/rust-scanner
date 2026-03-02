@@ -118,7 +118,9 @@ pub fn extract_tar(tar_path: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(super) fn try_detect_os_packages_from_layout(extracted: &Path) -> anyhow::Result<Vec<PackageCoordinate>> {
+pub(super) fn try_detect_os_packages_from_layout(
+    extracted: &Path,
+) -> anyhow::Result<Vec<PackageCoordinate>> {
     let manifest_path = extracted.join("manifest.json");
     let oci_index_path = extracted.join("index.json");
 

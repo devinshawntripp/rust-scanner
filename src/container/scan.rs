@@ -27,7 +27,6 @@ use walkdir::WalkDir;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
-
 const IMAGE_HEURISTIC_NOTE: &str =
     "Installed package inventory could not be fully determined for this image. Finding may be false positive.";
 
@@ -255,7 +254,7 @@ pub fn scan_container(
                 ecosystem: "redhat".into(),
                 name: p.name.clone(),
                 version: p.version.clone(),
-            source_name: None,
+                source_name: None,
             })
             .collect();
         if !rhel_supp_pkgs.is_empty() {
@@ -267,8 +266,10 @@ pub fn scan_container(
             let mut supp_findings =
                 map_osv_results_to_findings(&rhel_supp_pkgs, &rhel_supp_results);
             // Remap ecosystem back to the original distro (cosmetic, for correct provenance).
-            let name_to_ecosystem: std::collections::HashMap<String, String> =
-                packages.iter().map(|p| (p.name.clone(), p.ecosystem.clone())).collect();
+            let name_to_ecosystem: std::collections::HashMap<String, String> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.ecosystem.clone()))
+                .collect();
             for f in supp_findings.iter_mut() {
                 if let Some(pkg) = f.package.as_mut() {
                     if let Some(orig_eco) = name_to_ecosystem.get(&pkg.name) {
@@ -323,7 +324,10 @@ pub fn scan_container(
 
     // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
     // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
-    if packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem)) {
+    if packages
+        .iter()
+        .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem))
+    {
         redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
     }
 
@@ -434,7 +438,9 @@ pub fn scan_container(
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
             // Auto-download OVAL for RPM-based images when not explicitly provided
-            let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+            let has_rpm = packages
+                .iter()
+                .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
             if has_rpm {
                 let cache = crate::vuln::resolve_enrich_cache_dir();
                 crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
@@ -679,7 +685,10 @@ pub fn build_container_report(
 
     // Detect application-level packages (npm, pip, gem, go, maven, cargo, etc.)
     let app_started = std::time::Instant::now();
-    progress("container.packages.app.start", rootfs.to_string_lossy().as_ref());
+    progress(
+        "container.packages.app.start",
+        rootfs.to_string_lossy().as_ref(),
+    );
     let app_packages = crate::archive::detect_app_packages(&rootfs);
     progress_timing("container.packages.app", app_started);
     progress(
@@ -728,7 +737,7 @@ pub fn build_container_report(
                 ecosystem: "redhat".into(),
                 name: p.name.clone(),
                 version: p.version.clone(),
-            source_name: None,
+                source_name: None,
             })
             .collect();
         if !rhel_supp_pkgs.is_empty() {
@@ -739,8 +748,10 @@ pub fn build_container_report(
             let rhel_supp_results = osv_batch_query(&rhel_supp_pkgs);
             let mut supp_findings =
                 map_osv_results_to_findings(&rhel_supp_pkgs, &rhel_supp_results);
-            let name_to_ecosystem: std::collections::HashMap<String, String> =
-                packages.iter().map(|p| (p.name.clone(), p.ecosystem.clone())).collect();
+            let name_to_ecosystem: std::collections::HashMap<String, String> = packages
+                .iter()
+                .map(|p| (p.name.clone(), p.ecosystem.clone()))
+                .collect();
             for f in supp_findings.iter_mut() {
                 if let Some(pkg) = f.package.as_mut() {
                     if let Some(orig_eco) = name_to_ecosystem.get(&pkg.name) {
@@ -790,7 +801,10 @@ pub fn build_container_report(
 
     // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
     // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
-    if packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem)) {
+    if packages
+        .iter()
+        .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem))
+    {
         redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
     }
 
@@ -897,7 +911,9 @@ pub fn build_container_report(
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
             // Auto-download OVAL for RPM-based images when not explicitly provided
-            let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+            let has_rpm = packages
+                .iter()
+                .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
             if has_rpm {
                 let cache = crate::vuln::resolve_enrich_cache_dir();
                 crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
@@ -1239,7 +1255,3 @@ pub fn scan_source_tarball(
         }
     }
 }
-
-
-
-

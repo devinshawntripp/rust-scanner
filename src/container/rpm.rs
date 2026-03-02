@@ -17,7 +17,9 @@ const RPM_TYPE_STRING: u32 = 6;
 const RPM_TYPE_INT32: u32 = 4;
 
 /// Detect RPM packages using native parsing (SQLite + BerkeleyDB), falling back to rpm CLI.
-pub(super) fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+pub(super) fn detect_rpm_packages_native(
+    rootfs: &Path,
+) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     let db_candidates = [
         rootfs.join("var/lib/rpm/rpmdb.sqlite"),
         rootfs.join("usr/lib/sysimage/rpm/rpmdb.sqlite"),
@@ -28,7 +30,10 @@ pub(super) fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(S
         if !sqlite_path.exists() {
             continue;
         }
-        progress("container.rpm.native.sqlite", &sqlite_path.to_string_lossy());
+        progress(
+            "container.rpm.native.sqlite",
+            &sqlite_path.to_string_lossy(),
+        );
         match parse_rpm_sqlite(sqlite_path) {
             Ok(pkgs) if !pkgs.is_empty() => {
                 progress(
@@ -38,7 +43,10 @@ pub(super) fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(S
                 return Ok(pkgs);
             }
             Ok(_) => {
-                progress("container.rpm.native.sqlite.empty", &sqlite_path.to_string_lossy());
+                progress(
+                    "container.rpm.native.sqlite.empty",
+                    &sqlite_path.to_string_lossy(),
+                );
             }
             Err(e) => {
                 progress(
@@ -70,7 +78,10 @@ pub(super) fn detect_rpm_packages_native(rootfs: &Path) -> anyhow::Result<Vec<(S
                 return Ok(pkgs);
             }
             Ok(_) => {
-                progress("container.rpm.native.bdb.empty", &bdb_path.to_string_lossy());
+                progress(
+                    "container.rpm.native.bdb.empty",
+                    &bdb_path.to_string_lossy(),
+                );
             }
             Err(e) => {
                 progress(
@@ -302,17 +313,25 @@ pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Opti
                 last_dash = Some(i);
             }
         }
-        second_last_dash.map(|i| {
-            let src_name = stripped[..i].to_string();
-            if src_name == n { None } else { Some(src_name) }
-        }).flatten()
+        second_last_dash
+            .map(|i| {
+                let src_name = stripped[..i].to_string();
+                if src_name == n {
+                    None
+                } else {
+                    Some(src_name)
+                }
+            })
+            .flatten()
     });
 
     Some((n, full_version, source_name))
 }
 
 /// Fallback: detect RPM packages using the system rpm CLI.
-pub(super) fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+pub(super) fn detect_rpm_packages_cli(
+    rootfs: &Path,
+) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
     use std::process::Command;
     let dbpaths = [
         rootfs.join("var/lib/rpm"),
@@ -350,9 +369,13 @@ pub(super) fn detect_rpm_packages_cli(rootfs: &Path) -> anyhow::Result<Vec<(Stri
                             let mut last_dash = None;
                             let mut second_last = None;
                             for (i, c) in stripped.char_indices() {
-                                if c == '-' { second_last = last_dash; last_dash = Some(i); }
+                                if c == '-' {
+                                    second_last = last_dash;
+                                    last_dash = Some(i);
+                                }
                             }
-                            second_last.map(|i| stripped[..i].to_string())
+                            second_last
+                                .map(|i| stripped[..i].to_string())
                                 .filter(|s| s != name)
                         };
                         results.push((name.to_string(), ver.to_string(), source_name));
