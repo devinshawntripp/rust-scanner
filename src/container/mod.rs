@@ -1,7 +1,9 @@
+mod dpkg;
 mod rpm;
 
 pub use rpm::{parse_rpm_bdb, parse_rpm_sqlite};
 use rpm::detect_rpm_packages_native;
+use dpkg::{parse_dpkg_status, parse_dpkg_status_with_ecosystem};
 use crate::redhat::apply_redhat_oval_enrichment;
 use crate::report::{
     compute_summary, retag_findings, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
@@ -1972,86 +1974,6 @@ fn trim_os_release_value(v: &str) -> String {
     v.trim().trim_matches('"').to_string()
 }
 
-fn parse_dpkg_status_with_ecosystem(contents: &str, ecosystem: &str, out: &mut Vec<PackageCoordinate>) {
-    parse_dpkg_status_inner(contents, ecosystem, out);
-}
-
-fn parse_dpkg_status(contents: &str, out: &mut Vec<PackageCoordinate>) {
-    parse_dpkg_status_inner(contents, "deb", out);
-}
-
-fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<PackageCoordinate>) {
-    let mut name: Option<String> = None;
-    let mut version: Option<String> = None;
-    let mut source: Option<String> = None;
-    let mut installed_ok: bool = false;
-
-    let flush = |name: &mut Option<String>,
-                 version: &mut Option<String>,
-                 source: &mut Option<String>,
-                 installed_ok: bool,
-                 out: &mut Vec<PackageCoordinate>| {
-        if let (Some(n), Some(v)) = (name.take(), version.take()) {
-            let src = source.take();
-            if installed_ok {
-                // OSV's Debian ecosystem indexes by source package name. The dpkg
-                // `Source:` field gives us the source name when it differs from the
-                // binary package name (format: "srcname" or "srcname (version)").
-                let source_name = src
-                    .map(|s| {
-                        let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
-                        if trimmed == n { None } else { Some(trimmed) }
-                    })
-                    .flatten();
-                out.push(PackageCoordinate {
-                    ecosystem: ecosystem.into(),
-                    name: n,
-                    version: v,
-                    source_name,
-                });
-            }
-        } else {
-            source.take();
-        }
-    };
-
-    for line in contents.lines() {
-        if line.starts_with("Package:") {
-            flush(&mut name, &mut version, &mut source, installed_ok, out);
-            name = Some(line[8..].trim().to_string());
-            version = None;
-            source = None;
-            installed_ok = false;
-        } else if line.starts_with("Version:") {
-            version = Some(line[8..].trim().to_string());
-        } else if line.starts_with("Source:") {
-            source = Some(line[7..].trim().to_string());
-        } else if line.starts_with("Status:") {
-            installed_ok = line.contains("install ok installed");
-        } else if line.is_empty() {
-            flush(&mut name, &mut version, &mut source, installed_ok, out);
-            installed_ok = false;
-        }
-    }
-    // Flush final package
-    if let (Some(n), Some(v)) = (name.take(), version.take()) {
-        let src = source.take();
-        if installed_ok {
-            let source_name = src
-                .map(|s| {
-                    let trimmed = s.split_whitespace().next().unwrap_or(&s).to_string();
-                    if trimmed == n { None } else { Some(trimmed) }
-                })
-                .flatten();
-            out.push(PackageCoordinate {
-                ecosystem: ecosystem.into(),
-                name: n,
-                version: v,
-                source_name,
-            });
-        }
-    }
-}
 
 fn parse_apk_installed(contents: &str, out: &mut Vec<PackageCoordinate>) {
     parse_apk_installed_with_ecosystem(contents, "apk", out);
@@ -2101,25 +2023,3 @@ fn parse_apk_installed_with_ecosystem(
 }
 
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_dpkg_status_basic() {
-        let status = "Package: libc6
-Status: install ok installed
-Version: 2.36-9
-
-Package: removed-pkg
-Status: deinstall ok config-files
-Version: 1.0
-
-";
-        let mut out = Vec::new();
-        parse_dpkg_status(status, &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "libc6");
-        assert_eq!(out[0].version, "2.36-9");
-    }
-}
