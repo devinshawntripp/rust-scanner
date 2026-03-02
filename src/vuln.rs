@@ -819,7 +819,7 @@ pub fn map_osv_results_to_findings(
 /// This function must be called sequentially because it mutates the shared `findings`
 /// vec; it is intentionally separated from the HTTP-fetch path so that the fetch can
 /// be parallelised independently.
-fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Finding>) {
+fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
     // Extract description
     let description = json["summary"]
         .as_str()
@@ -968,7 +968,7 @@ fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Find
 
     // Debian DLA-/DSA- fallback: if still advisory-only, map via the Debian tracker
     if (id.starts_with("DLA-") || id.starts_with("DSA-")) && findings.iter().any(|f| f.id == id) {
-        if let Some(mut mapped) = map_debian_advisory_to_cves(id) {
+        if let Some(mut mapped) = map_debian_advisory_to_cves(id, pg) {
             mapped.sort();
             mapped.dedup();
             if !mapped.is_empty() {
@@ -1205,7 +1205,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
             &format!("{}/{} {}", idx + 1, total_apply, id),
         );
         if let Some(json) = all_payloads.get(&id) {
-            osv_apply_payload_to_findings(&id, json, findings);
+            osv_apply_payload_to_findings(&id, json, findings, pg);
             progress("osv.fetch.ok", &id);
         }
     }
@@ -1217,7 +1217,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     // CVE-level Red Hat enrichment computes package applicability and fixed package versions.
     redhat_enrich_cve_findings(findings, pg);
     // First-class distro advisory enrichment for Debian/Ubuntu/Alpine.
-    distro_feed_enrich_findings(findings);
+    distro_feed_enrich_findings(findings, pg);
     let dropped_fixed = drop_fixed_findings(findings);
     if dropped_fixed > 0 {
         progress("osv.fixed.drop", &format!("count={}", dropped_fixed));
@@ -1235,8 +1235,56 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
     }
 }
 
-fn map_debian_advisory_to_cves(advisory_id: &str) -> Option<Vec<String>> {
-    // Fetch Debian tracker page and extract CVE IDs
+fn map_debian_advisory_to_cves(advisory_id: &str, pg: &mut Option<PgClient>) -> Option<Vec<String>> {
+    // 1. Check PG osv_vuln_cache for aliases (populated by bulk import)
+    if let Some(client_pg) = pg.as_mut() {
+        if let Some((payload, _last_checked, _last_mod)) = pg_get_osv(client_pg, advisory_id) {
+            let mut cves: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if let Some(arr) = payload["aliases"].as_array() {
+                for a in arr.iter().filter_map(|x| x.as_str()) {
+                    if a.starts_with("CVE-") {
+                        cves.insert(a.to_string());
+                    }
+                }
+            }
+            // Also check references and text for CVE IDs
+            if let Ok(re) = regex::Regex::new(r"CVE-\d{4}-\d+") {
+                if let Some(arr) = payload["references"].as_array() {
+                    for r in arr {
+                        if let Some(u) = r["url"].as_str() {
+                            for m in re.find_iter(u) {
+                                cves.insert(m.as_str().to_string());
+                            }
+                        }
+                    }
+                }
+                for field in ["summary", "details"] {
+                    if let Some(text) = payload[field].as_str() {
+                        for m in re.find_iter(text) {
+                            cves.insert(m.as_str().to_string());
+                        }
+                    }
+                }
+            }
+            if !cves.is_empty() {
+                progress("osv.debian.map.pg_hit", &format!("{} -> {} CVEs", advisory_id, cves.len()));
+                return Some(cves.into_iter().collect());
+            }
+        }
+    }
+
+    // 2. Check file cache
+    let cache_dir = resolve_enrich_cache_dir();
+    let cache_key_str = cache_key(&["debian_advisory_map", advisory_id]);
+    if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_key_str) {
+        if let Ok(arr) = serde_json::from_slice::<Vec<String>>(&bytes) {
+            if !arr.is_empty() {
+                return Some(arr);
+            }
+        }
+    }
+
+    // 3. Fallback: fetch Debian tracker HTML page
     let url = format!(
         "https://security-tracker.debian.org/tracker/{}",
         advisory_id
@@ -1252,7 +1300,16 @@ fn map_debian_advisory_to_cves(advisory_id: &str) -> Option<Vec<String>> {
     for m in re.find_iter(&body) {
         set.insert(m.as_str().to_string());
     }
-    Some(set.into_iter().collect())
+    let result: Vec<String> = set.into_iter().collect();
+
+    // Store in file cache for future runs
+    if !result.is_empty() {
+        if let Ok(json_bytes) = serde_json::to_vec(&result) {
+            cache_put(cache_dir.as_deref(), &cache_key_str, &json_bytes);
+        }
+    }
+
+    Some(result)
 }
 
 #[derive(Debug, Clone)]
@@ -1575,6 +1632,96 @@ fn build_ubuntu_candidate_index(
     out
 }
 
+/// Query debian_tracker_cache in PG for needed packages/CVEs instead of downloading bulk JSON.
+fn build_debian_candidate_index_pg(
+    pg: &mut Option<PgClient>,
+    needed: &HashMap<String, HashSet<String>>,
+) -> Option<HashMap<String, Vec<DistroFixCandidate>>> {
+    let client_pg = pg.as_mut()?;
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    for (pkg, cves) in needed {
+        let source_names = debian_source_name_candidates(pkg);
+        for source in &source_names {
+            let rows = client_pg
+                .query(
+                    "SELECT cve_id, release, status, fixed_version FROM debian_tracker_cache WHERE package = $1",
+                    &[&source],
+                )
+                .ok()?;
+            for row in &rows {
+                let cve_id: String = row.get(0);
+                let _release: String = row.get(1);
+                let status: Option<String> = row.get(2);
+                let fixed_version: Option<String> = row.get(3);
+                if !cves.contains(&cve_id) {
+                    continue;
+                }
+                let fv = fixed_version.unwrap_or_default();
+                if fv.is_empty() || fv == "0" {
+                    continue;
+                }
+                let key = pkg_cve_key(pkg, &cve_id);
+                out.entry(key).or_default().push(DistroFixCandidate {
+                    fixed_version: fv.clone(),
+                    source_id: "debian:security-tracker".into(),
+                    reference_url: format!("https://security-tracker.debian.org/tracker/{}", cve_id),
+                    note: format!(
+                        "Debian tracker (PG cache) source={} status={} fixed_version={}",
+                        source, status.as_deref().unwrap_or("unknown"), fv
+                    ),
+                });
+            }
+        }
+    }
+    progress("distro.debian.pg_hit", &format!("{} candidates", out.len()));
+    Some(out)
+}
+
+/// Query ubuntu_usn_cache in PG for needed package/CVE pairs instead of downloading bulk JSON.
+fn build_ubuntu_candidate_index_pg(
+    pg: &mut Option<PgClient>,
+    needed_keys: &HashSet<String>,
+) -> Option<HashMap<String, Vec<DistroFixCandidate>>> {
+    let client_pg = pg.as_mut()?;
+    // Extract unique package names from needed keys (format: "pkg|CVE-...")
+    let mut pkgs: HashSet<String> = HashSet::new();
+    for key in needed_keys {
+        if let Some(pkg) = key.split('|').next() {
+            pkgs.insert(pkg.to_string());
+        }
+    }
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    for pkg in &pkgs {
+        let rows = client_pg
+            .query(
+                "SELECT cve_id, release, status FROM ubuntu_usn_cache WHERE package = $1",
+                &[&pkg],
+            )
+            .ok()?;
+        for row in &rows {
+            let cve_id: String = row.get(0);
+            let _release: String = row.get(1);
+            let status: Option<String> = row.get(2);
+            let key = pkg_cve_key(pkg, &cve_id);
+            if !needed_keys.contains(&key) {
+                continue;
+            }
+            let fv = status.unwrap_or_default();
+            if fv.is_empty() {
+                continue;
+            }
+            out.entry(key).or_default().push(DistroFixCandidate {
+                fixed_version: fv.clone(),
+                source_id: "ubuntu:usn-cache".into(),
+                reference_url: format!("https://ubuntu.com/security/cves/{}", cve_id),
+                note: format!("Ubuntu USN (PG cache) package={}", pkg),
+            });
+        }
+    }
+    progress("distro.ubuntu.pg_hit", &format!("{} candidates", out.len()));
+    Some(out)
+}
+
 fn alpine_secdb_branches() -> Vec<String> {
     if let Ok(raw) = std::env::var("SCANNER_ALPINE_SECDB_BRANCHES") {
         let mut out: Vec<String> = raw
@@ -1672,7 +1819,7 @@ fn build_alpine_candidate_index(
     out
 }
 
-fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
+fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
     if findings.is_empty() {
         return;
     }
@@ -1714,9 +1861,12 @@ fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
 
     let ubuntu_index = if ubuntu_enabled && !needed_ubuntu_keys.is_empty() {
         let started = std::time::Instant::now();
-        let idx = load_ubuntu_notices_data()
-            .map(|v| build_ubuntu_candidate_index(&v, &needed_ubuntu_keys))
-            .unwrap_or_default();
+        let idx = build_ubuntu_candidate_index_pg(pg, &needed_ubuntu_keys)
+            .unwrap_or_else(|| {
+                load_ubuntu_notices_data()
+                    .map(|v| build_ubuntu_candidate_index(&v, &needed_ubuntu_keys))
+                    .unwrap_or_default()
+            });
         progress_timing("distro.ubuntu.enrich", started);
         idx
     } else {
@@ -1725,9 +1875,12 @@ fn distro_feed_enrich_findings(findings: &mut Vec<Finding>) {
 
     let debian_index = if debian_enabled && !needed_deb.is_empty() {
         let started = std::time::Instant::now();
-        let idx = load_debian_tracker_data()
-            .map(|v| build_debian_candidate_index(&v, &needed_deb))
-            .unwrap_or_default();
+        let idx = build_debian_candidate_index_pg(pg, &needed_deb)
+            .unwrap_or_else(|| {
+                load_debian_tracker_data()
+                    .map(|v| build_debian_candidate_index(&v, &needed_deb))
+                    .unwrap_or_default()
+            });
         progress_timing("distro.debian.enrich", started);
         idx
     } else {
