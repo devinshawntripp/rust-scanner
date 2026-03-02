@@ -15,7 +15,41 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Current schema version — bump when adding tables or changing columns.
-const SCHEMA_VERSION: &str = "1";
+const SCHEMA_VERSION: &str = "2";
+
+/// Wrapper around a SQLite vulndb connection with optional zstd dictionaries
+/// for dictionary-compressed payloads (schema v2+).
+pub struct VulnDb {
+    pub conn: Connection,
+    nvd_dict: Option<Vec<u8>>,
+    osv_dict: Option<Vec<u8>>,
+}
+
+impl VulnDb {
+    /// Open vulndb and load any zstd dictionaries from metadata.
+    pub fn open() -> Option<Self> {
+        let conn = open_vulndb()?;
+        let nvd_dict = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'nvd_zstd_dict'", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .ok();
+        let osv_dict = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'osv_zstd_dict'", [], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .ok();
+        Some(VulnDb { conn, nvd_dict, osv_dict })
+    }
+
+    pub fn query_osv(&self, ecosystem: &str, name: &str) -> Vec<Value> {
+        query_osv_vulns_with_dict(&self.conn, ecosystem, name, self.osv_dict.as_deref())
+    }
+
+    pub fn query_nvd(&self, cve_id: &str) -> Option<Value> {
+        query_nvd_cve_with_dict(&self.conn, cve_id, self.nvd_dict.as_deref())
+    }
+}
 
 // ─── Path helpers ────────────────────────────────────────────────────
 
@@ -160,6 +194,10 @@ pub fn query_osv_vulns(conn: &Connection, ecosystem: &str, name: &str) -> Vec<Va
 
 /// Query a single NVD CVE. Returns decompressed JSON payload.
 pub fn query_nvd_cve(conn: &Connection, cve_id: &str) -> Option<Value> {
+    query_nvd_cve_with_dict(conn, cve_id, None)
+}
+
+fn query_nvd_cve_with_dict(conn: &Connection, cve_id: &str, dict: Option<&[u8]>) -> Option<Value> {
     let blob: Vec<u8> = conn
         .query_row(
             "SELECT payload FROM nvd_cves WHERE cve_id = ?1",
@@ -167,7 +205,38 @@ pub fn query_nvd_cve(conn: &Connection, cve_id: &str) -> Option<Value> {
             |row| row.get(0),
         )
         .ok()?;
-    decompress_json(&blob)
+    decompress_json_with_dict(&blob, dict)
+}
+
+fn query_osv_vulns_with_dict(conn: &Connection, ecosystem: &str, name: &str, dict: Option<&[u8]>) -> Vec<Value> {
+    let new_query = "SELECT p.payload FROM osv_vulns v JOIN osv_payloads p ON v.id = p.id WHERE v.ecosystem = ?1 AND v.name = ?2";
+    if let Ok(mut stmt) = conn.prepare(new_query) {
+        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        }) {
+            let results: Vec<Value> = rows
+                .flatten()
+                .filter_map(|blob| decompress_json_with_dict(&blob, dict))
+                .collect();
+            if !results.is_empty() {
+                return results;
+            }
+        }
+    }
+    let old_query = "SELECT payload FROM osv_vulns WHERE ecosystem = ?1 AND name = ?2";
+    if let Ok(mut stmt) = conn.prepare(old_query) {
+        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
+            let blob: Vec<u8> = row.get(0)?;
+            Ok(blob)
+        }) {
+            return rows
+                .flatten()
+                .filter_map(|blob| decompress_json_with_dict(&blob, dict))
+                .collect();
+        }
+    }
+    vec![]
 }
 
 /// Batch query EPSS scores. Returns map of cve_id -> (score, percentile).
@@ -1251,8 +1320,22 @@ pub fn decompress_payload(data: &[u8]) -> Option<Value> {
 }
 
 fn decompress_json(data: &[u8]) -> Option<Value> {
-    // Try zstd first (new format)
-    if let Ok(decompressed) = zstd::decode_all(data) {
+    decompress_json_with_dict(data, None)
+}
+
+fn decompress_json_with_dict(data: &[u8], dict: Option<&[u8]>) -> Option<Value> {
+    // Try zstd with dictionary first (schema v2)
+    if let Some(dict_bytes) = dict {
+        let mut decoder = zstd::Decoder::with_dictionary(std::io::Cursor::new(data), dict_bytes).ok()?;
+        let mut buf = Vec::new();
+        if decoder.read_to_end(&mut buf).is_ok() {
+            if let Ok(v) = serde_json::from_slice(&buf) {
+                return Some(v);
+            }
+        }
+    }
+    // Try plain zstd (schema v1 / no dict)
+    if let Ok(decompressed) = zstd::decode_all(std::io::Cursor::new(data)) {
         if let Ok(v) = serde_json::from_slice(&decompressed) {
             return Some(v);
         }
