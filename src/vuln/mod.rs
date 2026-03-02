@@ -4362,3 +4362,6 @@ pub fn seed_distro_feeds() {
     }
     progress("seed.distro.alpine.done", "ok");
 }
+
+#[cfg(test)]
+mod tests;
