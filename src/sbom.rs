@@ -216,7 +216,7 @@ pub fn build_sbom_diff(baseline: &str, current: &str) -> anyhow::Result<SbomDiff
                 ecosystem: eco.clone(),
                 name: name.clone(),
                 version: ver.clone(),
-            source_name: None,
+                source_name: None,
             }),
             Some(old) if old != ver => changed.push(ChangedPackage {
                 ecosystem: eco.clone(),
@@ -234,7 +234,7 @@ pub fn build_sbom_diff(baseline: &str, current: &str) -> anyhow::Result<SbomDiff
                 ecosystem: eco.clone(),
                 name: name.clone(),
                 version: ver.clone(),
-            source_name: None,
+                source_name: None,
             });
         }
     }
@@ -327,7 +327,7 @@ fn package_from_component(component: &Value) -> Option<PackageCoordinate> {
         ecosystem,
         name: name.to_string(),
         version: version.to_string(),
-    source_name: None,
+        source_name: None,
     })
 }
 
@@ -388,7 +388,7 @@ fn package_from_spdx(pkg: &Value) -> Option<PackageCoordinate> {
         ecosystem: "unknown".to_string(),
         name: name.to_string(),
         version: version.to_string(),
-    source_name: None,
+        source_name: None,
     })
 }
 
@@ -435,7 +435,7 @@ fn parse_syft_packages(doc: &Value) -> Vec<PackageCoordinate> {
             ecosystem,
             name: name.to_string(),
             version: version.to_string(),
-        source_name: None,
+            source_name: None,
         });
     }
 

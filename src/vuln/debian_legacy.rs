@@ -57,8 +57,10 @@ pub fn debian_tracker_enrich(
         return;
     }
 
-    let deb_packages: Vec<&PackageCoordinate> =
-        packages.iter().filter(|p| (p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb")).collect();
+    let deb_packages: Vec<&PackageCoordinate> = packages
+        .iter()
+        .filter(|p| (p.ecosystem == "deb" || p.ecosystem == "ubuntu-deb"))
+        .collect();
     if deb_packages.is_empty() {
         return;
     }
@@ -71,9 +73,7 @@ pub fn debian_tracker_enrich(
 
     let existing_cve_pkg: HashSet<(String, String)> = findings
         .iter()
-        .filter_map(|f| {
-            f.package.as_ref().map(|p| (f.id.clone(), p.name.clone()))
-        })
+        .filter_map(|f| f.package.as_ref().map(|p| (f.id.clone(), p.name.clone())))
         .collect();
 
     let tracker_json = match fetch_debian_tracker_json(cache_dir) {
@@ -186,10 +186,7 @@ pub fn debian_tracker_enrich(
                 }],
                 references: vec![ReferenceInfo {
                     reference_type: "advisory".into(),
-                    url: format!(
-                        "https://security-tracker.debian.org/tracker/{}",
-                        cve_id
-                    ),
+                    url: format!("https://security-tracker.debian.org/tracker/{}", cve_id),
                 }],
                 confidence: Some("HIGH".into()),
                 epss_score: None,
@@ -250,7 +247,10 @@ fn fetch_debian_tracker_json(
     }
 
     // Fetch from Debian Security Tracker
-    progress("debian.tracker.fetch", "https://security-tracker.debian.org/tracker/data/json");
+    progress(
+        "debian.tracker.fetch",
+        "https://security-tracker.debian.org/tracker/data/json",
+    );
     let client = enrich_http_client();
     let resp = client
         .get("https://security-tracker.debian.org/tracker/data/json")
@@ -258,9 +258,7 @@ fn fetch_debian_tracker_json(
         .send()?;
 
     if !resp.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Debian tracker HTTP {}", resp.status()
-        ));
+        return Err(anyhow::anyhow!("Debian tracker HTTP {}", resp.status()));
     }
 
     let bytes = resp.bytes()?;

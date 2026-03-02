@@ -30,16 +30,24 @@ impl VulnDb {
     pub fn open() -> Option<Self> {
         let conn = open_vulndb()?;
         let nvd_dict = conn
-            .query_row("SELECT value FROM metadata WHERE key = 'nvd_zstd_dict'", [], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'nvd_zstd_dict'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
             .ok();
         let osv_dict = conn
-            .query_row("SELECT value FROM metadata WHERE key = 'osv_zstd_dict'", [], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'osv_zstd_dict'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
             .ok();
-        Some(VulnDb { conn, nvd_dict, osv_dict })
+        Some(VulnDb {
+            conn,
+            nvd_dict,
+            osv_dict,
+        })
     }
 
     pub fn query_osv(&self, ecosystem: &str, name: &str) -> Vec<Value> {
@@ -208,7 +216,12 @@ fn query_nvd_cve_with_dict(conn: &Connection, cve_id: &str, dict: Option<&[u8]>)
     decompress_json_with_dict(&blob, dict)
 }
 
-fn query_osv_vulns_with_dict(conn: &Connection, ecosystem: &str, name: &str, dict: Option<&[u8]>) -> Vec<Value> {
+fn query_osv_vulns_with_dict(
+    conn: &Connection,
+    ecosystem: &str,
+    name: &str,
+    dict: Option<&[u8]>,
+) -> Vec<Value> {
     let new_query = "SELECT p.payload FROM osv_vulns v JOIN osv_payloads p ON v.id = p.id WHERE v.ecosystem = ?1 AND v.name = ?2";
     if let Ok(mut stmt) = conn.prepare(new_query) {
         if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
@@ -243,12 +256,11 @@ fn query_osv_vulns_with_dict(conn: &Connection, ecosystem: &str, name: &str, dic
 pub fn query_epss(conn: &Connection, cve_ids: &[String]) -> HashMap<String, (f32, f32)> {
     let mut out = HashMap::new();
     // Use individual queries — rusqlite doesn't support dynamic IN clauses easily
-    let mut stmt = match conn.prepare(
-        "SELECT cve_id, score, percentile FROM epss_scores WHERE cve_id = ?1",
-    ) {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
+    let mut stmt =
+        match conn.prepare("SELECT cve_id, score, percentile FROM epss_scores WHERE cve_id = ?1") {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
     for id in cve_ids {
         if let Ok((score, pct)) = stmt.query_row(params![id], |row| {
             Ok((row.get::<_, f64>(1)? as f32, row.get::<_, f64>(2)? as f32))
@@ -299,7 +311,11 @@ pub fn create_db(path: &std::path::Path) -> anyhow::Result<Connection> {
 
 /// Import a single OSV ecosystem zip (one vuln per JSON file inside the zip).
 /// Returns the number of vulnerabilities imported.
-pub fn import_osv_ecosystem(conn: &Connection, ecosystem: &str, zip_bytes: &[u8]) -> anyhow::Result<usize> {
+pub fn import_osv_ecosystem(
+    conn: &Connection,
+    ecosystem: &str,
+    zip_bytes: &[u8],
+) -> anyhow::Result<usize> {
     let reader = std::io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(reader)?;
     let tx = conn.unchecked_transaction()?;
@@ -379,10 +395,7 @@ pub fn import_nvd_page(conn: &Connection, json_bytes: &[u8]) -> anyhow::Result<u
             Some(c) => c,
             None => continue,
         };
-        let cve_id = cve
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        let cve_id = cve.get("id").and_then(|v| v.as_str()).unwrap_or_default();
         if cve_id.is_empty() {
             continue;
         }
@@ -579,10 +592,7 @@ pub fn import_alpine_secdb(
             Some(p) => p,
             None => continue,
         };
-        let pkg_name = pkg
-            .get("name")
-            .and_then(|n| n.as_str())
-            .unwrap_or_default();
+        let pkg_name = pkg.get("name").and_then(|n| n.as_str()).unwrap_or_default();
         if pkg_name.is_empty() {
             continue;
         }
@@ -598,7 +608,8 @@ pub fn import_alpine_secdb(
             for cve_val in cves {
                 let cve_id = cve_val.as_str().unwrap_or_default();
                 // Some entries are just comments or references, skip those
-                if cve_id.is_empty() || (!cve_id.starts_with("CVE-") && !cve_id.starts_with("XSA-")) {
+                if cve_id.is_empty() || (!cve_id.starts_with("CVE-") && !cve_id.starts_with("XSA-"))
+                {
                     continue;
                 }
                 tx.execute(
@@ -680,7 +691,10 @@ pub fn build_osv(conn: &Connection, client: &reqwest::blocking::Client) -> anyho
             "https://osv-vulnerabilities.storage.googleapis.com/{}/all.zip",
             urlencoding::encode(eco_name)
         );
-        progress("vulndb.build.osv.download", &format!("ecosystem={}", eco_name));
+        progress(
+            "vulndb.build.osv.download",
+            &format!("ecosystem={}", eco_name),
+        );
         match client.get(&url).send() {
             Ok(resp) if resp.status().is_success() => {
                 let bytes = resp.bytes()?;
@@ -769,10 +783,7 @@ pub fn build_nvd(
                     std::thread::sleep(std::time::Duration::from_secs(30));
                     continue; // retry same page
                 }
-                progress(
-                    "vulndb.build.nvd.error",
-                    &format!("status={}", status),
-                );
+                progress("vulndb.build.nvd.error", &format!("status={}", status));
                 break;
             }
             Err(e) => {
@@ -797,10 +808,7 @@ pub fn build_epss(conn: &Connection, client: &reqwest::blocking::Client) -> anyh
     let mut csv_bytes = Vec::new();
     decoder.read_to_end(&mut csv_bytes)?;
     let count = import_epss_csv(conn, &csv_bytes)?;
-    progress(
-        "vulndb.build.epss.done",
-        &format!("scores={}", count),
-    );
+    progress("vulndb.build.epss.done", &format!("scores={}", count));
     Ok(count)
 }
 
@@ -819,7 +827,10 @@ pub fn build_kev(conn: &Connection, client: &reqwest::blocking::Client) -> anyho
 }
 
 /// Download Debian Security Tracker and import.
-pub fn build_debian(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_debian(
+    conn: &Connection,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<usize> {
     let url = "https://security-tracker.debian.org/tracker/data/json";
     progress("vulndb.build.debian.download", url);
     let resp = client.get(url).send()?;
@@ -828,15 +839,15 @@ pub fn build_debian(conn: &Connection, client: &reqwest::blocking::Client) -> an
     }
     let bytes = resp.bytes()?;
     let count = import_debian_tracker(conn, &bytes)?;
-    progress(
-        "vulndb.build.debian.done",
-        &format!("entries={}", count),
-    );
+    progress("vulndb.build.debian.done", &format!("entries={}", count));
     Ok(count)
 }
 
 /// Download Ubuntu USN data and import.
-pub fn build_ubuntu(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_ubuntu(
+    conn: &Connection,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<usize> {
     // Ubuntu Security Notices API — paginated, we fetch a reasonable amount
     let url = "https://ubuntu.com/security/notices.json?limit=10000&offset=0";
     progress("vulndb.build.ubuntu.download", url);
@@ -931,29 +942,24 @@ pub fn build_ubuntu(conn: &Connection, client: &reqwest::blocking::Client) -> an
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    progress(
-        "vulndb.build.ubuntu.done",
-        &format!("entries={}", total),
-    );
+    progress("vulndb.build.ubuntu.done", &format!("entries={}", total));
     Ok(total)
 }
 
 /// Alpine SecDB branches to fetch.
 pub fn alpine_branches() -> Vec<&'static str> {
-    vec![
-        "v3.17", "v3.18", "v3.19", "v3.20", "v3.21", "edge",
-    ]
+    vec!["v3.17", "v3.18", "v3.19", "v3.20", "v3.21", "edge"]
 }
 
 /// Download Alpine SecDB and import.
-pub fn build_alpine(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_alpine(
+    conn: &Connection,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<usize> {
     let mut total = 0usize;
     for branch in alpine_branches() {
         for repo in &["main", "community"] {
-            let url = format!(
-                "https://secdb.alpinelinux.org/{}/{}.json",
-                branch, repo
-            );
+            let url = format!("https://secdb.alpinelinux.org/{}/{}.json", branch, repo);
             progress(
                 "vulndb.build.alpine.download",
                 &format!("branch={} repo={}", branch, repo),
@@ -982,10 +988,7 @@ pub fn build_alpine(conn: &Connection, client: &reqwest::blocking::Client) -> an
             }
         }
     }
-    progress(
-        "vulndb.build.alpine.done",
-        &format!("entries={}", total),
-    );
+    progress("vulndb.build.alpine.done", &format!("entries={}", total));
     Ok(total)
 }
 
@@ -1112,8 +1115,8 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
         .build()?;
 
     // Determine API base URL (default: scanrook.io, overridable for dev)
-    let api_base = std::env::var("SCANROOK_API_BASE")
-        .unwrap_or_else(|_| "https://scanrook.io".to_string());
+    let api_base =
+        std::env::var("SCANROOK_API_BASE").unwrap_or_else(|_| "https://scanrook.io".to_string());
     let meta_url = format!("{}/api/db/latest", api_base);
 
     progress("vulndb.fetch.check", &format!("querying {}", meta_url));
@@ -1155,7 +1158,11 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     );
     progress(
         "vulndb.fetch.download",
-        &format!("build_date={} size_mb={:.1}", build_date, asset_size as f64 / 1_048_576.0),
+        &format!(
+            "build_date={} size_mb={:.1}",
+            build_date,
+            asset_size as f64 / 1_048_576.0
+        ),
     );
 
     // The API returns a presigned S3 URL — follow redirect and download
@@ -1233,7 +1240,9 @@ pub fn print_db_status() {
         }
     } else {
         println!("vulndb_status=not_found");
-        println!("hint: run `scanrook db fetch` to download the pre-compiled vulnerability database");
+        println!(
+            "hint: run `scanrook db fetch` to download the pre-compiled vulnerability database"
+        );
     }
 }
 
@@ -1250,7 +1259,15 @@ fn strip_osv_unused_fields(val: &Value) -> Value {
     };
     let mut out = serde_json::Map::new();
     // Keep only the fields the scanner actually reads
-    for key in &["id", "modified", "summary", "details", "aliases", "severity", "references"] {
+    for key in &[
+        "id",
+        "modified",
+        "summary",
+        "details",
+        "aliases",
+        "severity",
+        "references",
+    ] {
         if let Some(v) = obj.get(*key) {
             out.insert(key.to_string(), v.clone());
         }
@@ -1326,7 +1343,8 @@ fn decompress_json(data: &[u8]) -> Option<Value> {
 fn decompress_json_with_dict(data: &[u8], dict: Option<&[u8]>) -> Option<Value> {
     // Try zstd with dictionary first (schema v2)
     if let Some(dict_bytes) = dict {
-        let mut decoder = zstd::Decoder::with_dictionary(std::io::Cursor::new(data), dict_bytes).ok()?;
+        let mut decoder =
+            zstd::Decoder::with_dictionary(std::io::Cursor::new(data), dict_bytes).ok()?;
         let mut buf = Vec::new();
         if decoder.read_to_end(&mut buf).is_ok() {
             if let Ok(v) = serde_json::from_slice(&buf) {
@@ -1351,4 +1369,3 @@ fn decompress_json_with_dict(data: &[u8], dict: Option<&[u8]>) -> Option<Value> 
     // Fallback: uncompressed JSON
     serde_json::from_slice(data).ok()
 }
-

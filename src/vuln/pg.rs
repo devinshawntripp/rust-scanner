@@ -415,7 +415,10 @@ pub(super) fn pg_put_rhel_cve(
     );
     match res {
         Ok(_) => {}
-        Err(e) => progress("rhel_cves.pg.put.err", &format!("{} {} {}", cve_id, package, e)),
+        Err(e) => progress(
+            "rhel_cves.pg.put.err",
+            &format!("{} {} {}", cve_id, package, e),
+        ),
     }
 }
 

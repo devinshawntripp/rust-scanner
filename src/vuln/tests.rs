@@ -193,25 +193,27 @@ fn build_ubuntu_candidate_index_maps_notice_to_pkg_cve_key() {
 
 #[test]
 fn detect_debian_release_from_package_versions() {
-    let pkgs = vec![
-        PackageCoordinate {
-            ecosystem: "deb".into(),
-            name: "libc6".into(),
-            version: "2.36-9+deb12u9".into(),
-            source_name: None,
-        },
-    ];
-    assert_eq!(debian_legacy::detect_debian_release(&pkgs), Some("bookworm"));
+    let pkgs = vec![PackageCoordinate {
+        ecosystem: "deb".into(),
+        name: "libc6".into(),
+        version: "2.36-9+deb12u9".into(),
+        source_name: None,
+    }];
+    assert_eq!(
+        debian_legacy::detect_debian_release(&pkgs),
+        Some("bookworm")
+    );
 
-    let pkgs_11 = vec![
-        PackageCoordinate {
-            ecosystem: "deb".into(),
-            name: "bash".into(),
-            version: "5.1-2+deb11u1".into(),
-            source_name: None,
-        },
-    ];
-    assert_eq!(debian_legacy::detect_debian_release(&pkgs_11), Some("bullseye"));
+    let pkgs_11 = vec![PackageCoordinate {
+        ecosystem: "deb".into(),
+        name: "bash".into(),
+        version: "5.1-2+deb11u1".into(),
+        source_name: None,
+    }];
+    assert_eq!(
+        debian_legacy::detect_debian_release(&pkgs_11),
+        Some("bullseye")
+    );
 }
 
 #[test]

@@ -3,8 +3,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rayon::prelude::*;
 use postgres::Client as PgClient;
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::report::{
@@ -15,7 +15,9 @@ use crate::utils::{progress, progress_timing};
 
 use super::env_bool;
 use super::http::{build_http_client, nvd_get_json};
-use super::pg::{compute_dynamic_ttl_days, parse_nvd_last_modified, pg_get_cve, pg_init_schema, pg_put_cve};
+use super::pg::{
+    compute_dynamic_ttl_days, parse_nvd_last_modified, pg_get_cve, pg_init_schema, pg_put_cve,
+};
 use super::version::{cmp_versions, cpe_parts, is_version_in_range};
 
 /// Queries the NVD API for a given component + version
@@ -262,84 +264,84 @@ pub fn enrich_findings_with_nvd(
                 None
             };
             if let Some(cve) = cve_ref {
-                    if let Some(cvss3) = cve["metrics"]["cvssMetricV31"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .or_else(|| {
-                            cve["metrics"]["cvssMetricV30"]
-                                .as_array()
-                                .and_then(|a| a.first())
-                        })
-                    {
-                        // vector/score
-                        if f.cvss.is_none() {
-                            if let (Some(base), Some(vector)) = (
-                                cvss3["cvssData"]["baseScore"].as_f64(),
-                                cvss3["cvssData"]["vectorString"].as_str(),
-                            ) {
-                                let base_f = base as f32;
-                                f.cvss = Some(CvssInfo {
-                                    base: base_f,
-                                    vector: vector.to_string(),
-                                });
-                                if f.severity.is_none() {
-                                    f.severity = Some(severity_from_score(base_f).to_string());
-                                }
-                            }
-                        }
-                        // explicit severity if provided
-                        if f.severity.is_none() {
-                            if let Some(sev) = cvss3["cvssData"]["baseSeverity"]
-                                .as_str()
-                                .or_else(|| cvss3["baseSeverity"].as_str())
-                            {
-                                f.severity = Some(sev.to_uppercase());
-                            }
-                        }
-                    } else if let Some(cvss2) = cve["metrics"]["cvssMetricV2"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                    {
-                        if f.cvss.is_none() {
-                            if let Some(base) = cvss2["cvssData"]["baseScore"].as_f64() {
-                                let base_f = base as f32;
-                                let vector = cvss2["cvssData"]["vectorString"]
-                                    .as_str()
-                                    .unwrap_or("")
-                                    .to_string();
-                                f.cvss = Some(CvssInfo {
-                                    base: base_f,
-                                    vector,
-                                });
-                                if f.severity.is_none() {
-                                    f.severity = Some(severity_from_score(base_f).to_string());
-                                }
-                            }
-                        }
-                        if f.severity.is_none() {
-                            if let Some(sev) = cvss2["baseSeverity"].as_str() {
-                                f.severity = Some(sev.to_uppercase());
-                            }
-                        }
-                    }
-                    if f.description.is_none() {
-                        let desc = cve["descriptions"]
+                if let Some(cvss3) = cve["metrics"]["cvssMetricV31"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .or_else(|| {
+                        cve["metrics"]["cvssMetricV30"]
                             .as_array()
-                            .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
-                            .and_then(|d| d["value"].as_str())
-                            .map(|s| s.to_string());
-                        f.description = desc;
-                    }
-                    if let Some(refs) = cve["references"]["referenceData"].as_array() {
-                        for r in refs {
-                            if let Some(url) = r["url"].as_str() {
-                                f.references.push(ReferenceInfo {
-                                    reference_type: "nvd".into(),
-                                    url: url.into(),
-                                });
+                            .and_then(|a| a.first())
+                    })
+                {
+                    // vector/score
+                    if f.cvss.is_none() {
+                        if let (Some(base), Some(vector)) = (
+                            cvss3["cvssData"]["baseScore"].as_f64(),
+                            cvss3["cvssData"]["vectorString"].as_str(),
+                        ) {
+                            let base_f = base as f32;
+                            f.cvss = Some(CvssInfo {
+                                base: base_f,
+                                vector: vector.to_string(),
+                            });
+                            if f.severity.is_none() {
+                                f.severity = Some(severity_from_score(base_f).to_string());
                             }
                         }
                     }
+                    // explicit severity if provided
+                    if f.severity.is_none() {
+                        if let Some(sev) = cvss3["cvssData"]["baseSeverity"]
+                            .as_str()
+                            .or_else(|| cvss3["baseSeverity"].as_str())
+                        {
+                            f.severity = Some(sev.to_uppercase());
+                        }
+                    }
+                } else if let Some(cvss2) = cve["metrics"]["cvssMetricV2"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                {
+                    if f.cvss.is_none() {
+                        if let Some(base) = cvss2["cvssData"]["baseScore"].as_f64() {
+                            let base_f = base as f32;
+                            let vector = cvss2["cvssData"]["vectorString"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            f.cvss = Some(CvssInfo {
+                                base: base_f,
+                                vector,
+                            });
+                            if f.severity.is_none() {
+                                f.severity = Some(severity_from_score(base_f).to_string());
+                            }
+                        }
+                    }
+                    if f.severity.is_none() {
+                        if let Some(sev) = cvss2["baseSeverity"].as_str() {
+                            f.severity = Some(sev.to_uppercase());
+                        }
+                    }
+                }
+                if f.description.is_none() {
+                    let desc = cve["descriptions"]
+                        .as_array()
+                        .and_then(|arr| arr.iter().find(|d| d["lang"] == "en"))
+                        .and_then(|d| d["value"].as_str())
+                        .map(|s| s.to_string());
+                    f.description = desc;
+                }
+                if let Some(refs) = cve["references"]["referenceData"].as_array() {
+                    for r in refs {
+                        if let Some(url) = r["url"].as_str() {
+                            f.references.push(ReferenceInfo {
+                                reference_type: "nvd".into(),
+                                url: url.into(),
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -687,7 +689,6 @@ pub fn nvd_keyword_findings_name(
     }
     out
 }
-
 
 /// Broader NVD search for vendor/product and filter by version ranges in CPEs
 pub fn nvd_findings_by_product_version(

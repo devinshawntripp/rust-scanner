@@ -190,7 +190,9 @@ pub fn build_iso_report(
             .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
             .filter(|v| !v.trim().is_empty())
             .or_else(|| {
-                let has_rpm = packages.iter().any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+                let has_rpm = packages
+                    .iter()
+                    .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
                 if has_rpm {
                     let cache = crate::vuln::resolve_enrich_cache_dir();
                     crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
@@ -863,7 +865,7 @@ fn parse_primary_packages(primary_xml: &[u8]) -> Vec<PackageCoordinate> {
             ecosystem: "redhat".into(),
             name,
             version: full_ver,
-        source_name: None,
+            source_name: None,
         });
     }
     packages
@@ -1052,13 +1054,13 @@ mod tests {
                 ecosystem: "redhat".into(),
                 name: "bash".into(),
                 version: "5.1-1".into(),
-            source_name: None,
+                source_name: None,
             },
             PackageCoordinate {
                 ecosystem: "redhat".into(),
                 name: "bash".into(),
                 version: "5.1-1".into(),
-            source_name: None,
+                source_name: None,
             },
         ];
         let out = dedupe_packages(input);

@@ -153,7 +153,12 @@ fn retry_backoff_with_jitter_ms(attempt: usize) -> u64 {
     rand::thread_rng().gen_range(0..=max_backoff)
 }
 
-pub(super) fn cached_http_json(url: &str, tag: &str, ttl_secs: i64, timeout_secs: u64) -> Option<Value> {
+pub(super) fn cached_http_json(
+    url: &str,
+    tag: &str,
+    ttl_secs: i64,
+    timeout_secs: u64,
+) -> Option<Value> {
     let cache_dir = super::resolve_enrich_cache_dir();
     let key = cache_key(&["distro_feed", tag, url]);
     if let Some(bytes) = cache_get(cache_dir.as_deref(), &key) {
@@ -191,7 +196,12 @@ pub(super) fn cached_http_json(url: &str, tag: &str, ttl_secs: i64, timeout_secs
     wrapped.get("payload").cloned()
 }
 
-pub(super) fn nvd_get_json(url: &str, api_key: Option<&str>, cache_tag: &str, sleep_ms: u64) -> Option<Value> {
+pub(super) fn nvd_get_json(
+    url: &str,
+    api_key: Option<&str>,
+    cache_tag: &str,
+    sleep_ms: u64,
+) -> Option<Value> {
     let skip_cache = super::env_bool("SCANNER_SKIP_CACHE", false);
     let key = cache_key(&["nvd", cache_tag, url]);
     if !skip_cache {

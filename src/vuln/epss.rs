@@ -5,8 +5,8 @@ use crate::report::Finding;
 use crate::utils::{progress, progress_timing};
 use serde_json::Value;
 
-use super::pg::pg_connect;
 use super::http::enrich_http_client;
+use super::pg::pg_connect;
 
 fn epss_enrich_enabled() -> bool {
     std::env::var("SCANNER_EPSS_ENRICH")
@@ -53,8 +53,10 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
                 "SELECT cve_id, score, percentile FROM epss_scores_cache WHERE cve_id IN ({})",
                 params_str
             );
-            let params: Vec<&(dyn postgres::types::ToSql + Sync)> =
-                chunk.iter().map(|s| s as &(dyn postgres::types::ToSql + Sync)).collect();
+            let params: Vec<&(dyn postgres::types::ToSql + Sync)> = chunk
+                .iter()
+                .map(|s| s as &(dyn postgres::types::ToSql + Sync))
+                .collect();
             match client.query(&*query, &params) {
                 Ok(rows) => {
                     let found: HashSet<String> = rows

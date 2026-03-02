@@ -4,24 +4,23 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rayon::prelude::*;
 use postgres::Client as PgClient;
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::cache::{cache_get, cache_key, cache_put};
 use crate::container::PackageCoordinate;
 use crate::redhat::{compare_evr, is_rpm_ecosystem};
 use crate::report::{
-    ConfidenceTier, CvssInfo, EvidenceItem, EvidenceSource, Finding,
-    PackageInfo, ReferenceInfo,
+    ConfidenceTier, CvssInfo, EvidenceItem, EvidenceSource, Finding, PackageInfo, ReferenceInfo,
 };
 use crate::utils::{progress, progress_timing};
 
+use super::cluster_mode;
 use super::cvss::normalize_redhat_severity;
 use super::env_bool;
-use super::cluster_mode;
-use super::pg::resolve_enrich_cache_dir;
 use super::http::build_http_client;
+use super::pg::resolve_enrich_cache_dir;
 use super::pg::{
     compute_dynamic_ttl_days, parse_redhat_cve_last_modified, parse_redhat_last_modified,
     pg_get_redhat, pg_get_redhat_cve, pg_get_rhel_cves, pg_init_schema, pg_put_redhat,
@@ -125,7 +124,6 @@ pub(super) fn is_redhat_errata_id(id: &str) -> bool {
         && !seq.is_empty()
         && seq.chars().all(|c| c.is_ascii_digit())
 }
-
 
 pub(super) fn redhat_cvss_from_vuln(vuln: &Value) -> Option<CvssInfo> {
     let scores = vuln.get("scores").and_then(|s| s.as_array())?;
@@ -1209,7 +1207,10 @@ pub fn redhat_inject_unfixed_cves(
         return;
     }
     if env_bool("SCANNER_REDHAT_UNFIXED_SKIP", false) {
-        progress("redhat.pkg.cve.skip", "disabled by SCANNER_REDHAT_UNFIXED_SKIP");
+        progress(
+            "redhat.pkg.cve.skip",
+            "disabled by SCANNER_REDHAT_UNFIXED_SKIP",
+        );
         return;
     }
 
@@ -1273,8 +1274,10 @@ pub fn redhat_inject_unfixed_cves(
     if cluster_mode() {
         if let Some(c) = pg.as_mut() {
             let rhel_ver = rhel_major_str.as_deref().unwrap_or("0");
-            let unfixed_states_set: HashSet<&str> =
-                ["affected", "fix deferred", "will not fix"].iter().copied().collect();
+            let unfixed_states_set: HashSet<&str> = ["affected", "fix deferred", "will not fix"]
+                .iter()
+                .copied()
+                .collect();
             for pkg in &rpm_packages {
                 let rows = pg_get_rhel_cves(c, &pkg.name, rhel_ver, ttl_days);
                 for (cve_id, _state, fix_state, _advisory) in &rows {
@@ -1343,10 +1346,11 @@ pub fn redhat_inject_unfixed_cves(
             if seen_query.insert(qname.clone()) {
                 query_names.push(qname.clone());
             }
-            query_to_packages
-                .entry(qname)
-                .or_default()
-                .push((pkg.name.clone(), pkg.version.clone(), pkg.ecosystem.clone()));
+            query_to_packages.entry(qname).or_default().push((
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.ecosystem.clone(),
+            ));
         }
     }
 
@@ -1431,7 +1435,9 @@ pub fn redhat_inject_unfixed_cves(
 
     let mut cve_to_packages: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     for (qname, cve_ids) in loaded_lists {
-        let Some(pkg_attribs) = query_to_packages.get(&qname) else { continue };
+        let Some(pkg_attribs) = query_to_packages.get(&qname) else {
+            continue;
+        };
         for cve_id in cve_ids {
             if !cve_id.starts_with("CVE-") {
                 continue;
@@ -1455,7 +1461,10 @@ pub fn redhat_inject_unfixed_cves(
 
     if cve_to_packages.is_empty() {
         progress_timing("redhat.pkg.cve", started);
-        progress("redhat.pkg.cve.done", "injected=0 (no new CVEs from pkg list)");
+        progress(
+            "redhat.pkg.cve.done",
+            "injected=0 (no new CVEs from pkg list)",
+        );
         return;
     }
 
@@ -1552,20 +1561,18 @@ pub fn redhat_inject_unfixed_cves(
                         );
                         let local_client = build_http_client(timeout_secs);
                         match local_client.get(&url).send() {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.json::<Value>() {
-                                    Ok(v) => {
-                                        let lm = parse_redhat_cve_last_modified(&v);
-                                        let bytes = serde_json::to_vec(&v).unwrap_or_default();
-                                        if !bytes.is_empty() {
-                                            let cd = resolve_enrich_cache_dir();
-                                            cache_put(cd.as_deref(), &cache_tag, &bytes);
-                                        }
-                                        Some((cve_id.clone(), v, lm))
+                            Ok(resp) if resp.status().is_success() => match resp.json::<Value>() {
+                                Ok(v) => {
+                                    let lm = parse_redhat_cve_last_modified(&v);
+                                    let bytes = serde_json::to_vec(&v).unwrap_or_default();
+                                    if !bytes.is_empty() {
+                                        let cd = resolve_enrich_cache_dir();
+                                        cache_put(cd.as_deref(), &cache_tag, &bytes);
                                     }
-                                    Err(_) => None,
+                                    Some((cve_id.clone(), v, lm))
                                 }
-                            }
+                                Err(_) => None,
+                            },
                             _ => None,
                         }
                     })
@@ -1635,18 +1642,17 @@ pub fn redhat_inject_unfixed_cves(
             // Without this strict filter we incorrectly pick up "Will not fix" / "Out of
             // support scope" states from RHEL 4/5/6/7/8 entries that do not apply to the
             // currently installed distribution.
-            let best_state: Option<&RedHatPackageState> = if let Some(ref rhel_str) = rhel_major_str {
+            let best_state: Option<&RedHatPackageState> = if let Some(ref rhel_str) = rhel_major_str
+            {
                 // Only accept an entry matching both package name AND this RHEL version via CPE.
-                package_states
-                    .iter()
-                    .find(|s| {
-                        package_name_matches(installed_name, &s.package_name)
-                            && s.cpe
-                                .as_deref()
-                                .and_then(extract_rhel_major_from_cpe)
-                                .as_deref()
-                                == Some(rhel_str.as_str())
-                    })
+                package_states.iter().find(|s| {
+                    package_name_matches(installed_name, &s.package_name)
+                        && s.cpe
+                            .as_deref()
+                            .and_then(extract_rhel_major_from_cpe)
+                            .as_deref()
+                            == Some(rhel_str.as_str())
+                })
             } else {
                 // No RHEL version detected — match on package name only as last resort.
                 package_states
@@ -1718,7 +1724,9 @@ pub fn redhat_inject_unfixed_cves(
                         .iter()
                         .find(|r| r.url.contains("access.redhat.com"))
                         .map(|r| r.url.as_str());
-                    pg_put_rhel_cve(c, &f.id, &pkg.name, rhel_ver, "unfixed", fix_state, advisory);
+                    pg_put_rhel_cve(
+                        c, &f.id, &pkg.name, rhel_ver, "unfixed", fix_state, advisory,
+                    );
                     wb_count += 1;
                 }
             }

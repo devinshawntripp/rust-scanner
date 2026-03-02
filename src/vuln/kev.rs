@@ -5,8 +5,8 @@ use crate::report::Finding;
 use crate::utils::{progress, progress_timing};
 use serde_json::Value;
 
-use super::pg::pg_connect;
 use super::http::enrich_http_client;
+use super::pg::pg_connect;
 
 fn kev_enrich_enabled() -> bool {
     std::env::var("SCANNER_KEV_ENRICH")

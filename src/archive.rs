@@ -199,10 +199,7 @@ fn extract_zip(path: &str, dest: &Path) -> anyhow::Result<()> {
 
         // Zip Slip protection: reject entries with path traversal
         if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
-            progress(
-                "archive.extract.skip",
-                &format!("path_traversal: {}", name),
-            );
+            progress("archive.extract.skip", &format!("path_traversal: {}", name));
             continue;
         }
 
@@ -212,10 +209,7 @@ fn extract_zip(path: &str, dest: &Path) -> anyhow::Result<()> {
         let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
         if let Ok(canonical_out) = out_path.canonicalize() {
             if !canonical_out.starts_with(&canonical_dest) {
-                progress(
-                    "archive.extract.skip",
-                    &format!("escape: {}", name),
-                );
+                progress("archive.extract.skip", &format!("escape: {}", name));
                 continue;
             }
         }
@@ -254,8 +248,7 @@ fn classify_archive(path: &str, extracted: &Path) -> ArchiveKind {
     // Extension-based hints
     if lower.ends_with(".apk") && !lower.ends_with(".nupkg") {
         // Android APK (not Alpine APK which is a tar)
-        if extracted.join("AndroidManifest.xml").exists()
-            || extracted.join("classes.dex").exists()
+        if extracted.join("AndroidManifest.xml").exists() || extracted.join("classes.dex").exists()
         {
             return ArchiveKind::AndroidApk;
         }
@@ -417,7 +410,7 @@ fn push_if_new(
             ecosystem: ecosystem.to_string(),
             name: name.to_string(),
             version: version.to_string(),
-        source_name: None,
+            source_name: None,
         });
     }
 }
@@ -442,10 +435,7 @@ fn parse_npm_lockfile(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut
             if key.is_empty() {
                 continue; // root package
             }
-            let name = key
-                .strip_prefix("node_modules/")
-                .unwrap_or(key)
-                .to_string();
+            let name = key.strip_prefix("node_modules/").unwrap_or(key).to_string();
             let version = val
                 .get("version")
                 .and_then(|v| v.as_str())
@@ -466,10 +456,7 @@ fn parse_npm_v1_deps(
     seen: &mut HashSet<String>,
 ) {
     for (name, val) in deps {
-        let version = val
-            .get("version")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("");
         push_if_new(pkgs, seen, "npm", name, version);
         // Nested deps
         if let Some(sub) = val.get("dependencies").and_then(|d| d.as_object()) {
@@ -595,17 +582,18 @@ fn parse_requirements_txt(
         // name==version or name>=version or name~=version
         if let Some(idx) = trimmed.find("==") {
             let name = trimmed[..idx].trim();
-            let version = trimmed[idx + 2..].trim().split(';').next().unwrap_or("").trim();
+            let version = trimmed[idx + 2..]
+                .trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim();
             push_if_new(pkgs, seen, "PyPI", name, version);
         }
     }
 }
 
-fn parse_pipfile_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_pipfile_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -629,11 +617,7 @@ fn parse_pipfile_lock(
     }
 }
 
-fn parse_poetry_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_poetry_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -699,11 +683,7 @@ fn parse_dist_info_metadata(
 // Ruby parser
 // ---------------------------------------------------------------------------
 
-fn parse_gemfile_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_gemfile_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -724,9 +704,7 @@ fn parse_gemfile_lock(
             let parts = trimmed.trim();
             if let Some(paren) = parts.find('(') {
                 let name = parts[..paren].trim();
-                let version = parts[paren + 1..]
-                    .trim_end_matches(')')
-                    .trim();
+                let version = parts[paren + 1..].trim_end_matches(')').trim();
                 if !name.contains(' ') {
                     push_if_new(pkgs, seen, "RubyGems", name, version);
                 }
@@ -896,8 +874,7 @@ fn parse_csproj(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashS
         Err(_) => return,
     };
     // <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
-    let re =
-        regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).ok();
+    let re = regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).ok();
     if let Some(re) = re {
         for cap in re.captures_iter(&text) {
             let name = cap.get(1).map_or("", |m| m.as_str());
@@ -911,11 +888,7 @@ fn parse_csproj(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashS
 // PHP parser
 // ---------------------------------------------------------------------------
 
-fn parse_composer_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_composer_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -943,11 +916,7 @@ fn parse_composer_lock(
 // Dart / Flutter parser
 // ---------------------------------------------------------------------------
 
-fn parse_pubspec_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_pubspec_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -1018,7 +987,10 @@ fn parse_swift_resolved(
                 .unwrap_or("");
             let version = pin
                 .get("state")
-                .and_then(|s| s.get("version").or_else(|| s.get("checkoutState").and_then(|c| c.get("version"))))
+                .and_then(|s| {
+                    s.get("version")
+                        .or_else(|| s.get("checkoutState").and_then(|c| c.get("version")))
+                })
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             push_if_new(pkgs, seen, "SwiftURL", name, version);
@@ -1030,11 +1002,7 @@ fn parse_swift_resolved(
 // CocoaPods parser
 // ---------------------------------------------------------------------------
 
-fn parse_podfile_lock(
-    path: &Path,
-    pkgs: &mut Vec<PackageCoordinate>,
-    seen: &mut HashSet<String>,
-) {
+fn parse_podfile_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut HashSet<String>) {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
         Err(_) => return,
@@ -1055,11 +1023,7 @@ fn parse_podfile_lock(
             if let Some(rest) = trimmed.strip_prefix("- ") {
                 if let Some(paren) = rest.find('(') {
                     let name = rest[..paren].trim();
-                    let version = rest[paren + 1..]
-                        .split(')')
-                        .next()
-                        .unwrap_or("")
-                        .trim();
+                    let version = rest[paren + 1..].split(')').next().unwrap_or("").trim();
                     push_if_new(pkgs, seen, "CocoaPods", name, version);
                 }
             }
@@ -1130,11 +1094,7 @@ fn detect_nuspec(root: &Path, pkgs: &mut Vec<PackageCoordinate>) {
 // Android-specific detectors
 // ---------------------------------------------------------------------------
 
-fn detect_android_metadata(
-    root: &Path,
-    kind: &ArchiveKind,
-    pkgs: &mut Vec<PackageCoordinate>,
-) {
+fn detect_android_metadata(root: &Path, kind: &ArchiveKind, pkgs: &mut Vec<PackageCoordinate>) {
     let mut seen = HashSet::new();
 
     // Detect Flutter apps
@@ -1302,10 +1262,7 @@ fn scan_embedded_binaries(
             continue;
         }
         let path = entry.path();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         if binary_exts.contains(&ext) {
             if let Some(report) = crate::binary::build_binary_report(
@@ -1361,7 +1318,11 @@ pub fn extract_dmg(path: &str, dest: &Path) -> anyhow::Result<()> {
                 let copy_dest = dest.join("contents");
                 fs::create_dir_all(&copy_dest)?;
                 let cp_status = Command::new("cp")
-                    .args(["-R", &format!("{}/.", mount_point.to_string_lossy()), &copy_dest.to_string_lossy()])
+                    .args([
+                        "-R",
+                        &format!("{}/.", mount_point.to_string_lossy()),
+                        &copy_dest.to_string_lossy(),
+                    ])
                     .status();
                 // Always try to unmount
                 let _ = Command::new("hdiutil")
@@ -1394,11 +1355,7 @@ pub fn extract_dmg(path: &str, dest: &Path) -> anyhow::Result<()> {
 }
 
 /// Build a report for a DMG disk image.
-pub fn build_dmg_report(
-    path: &str,
-    mode: ScanMode,
-    nvd_api_key: Option<String>,
-) -> Option<Report> {
+pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>) -> Option<Report> {
     let started = std::time::Instant::now();
     progress("dmg.extract.start", path);
 

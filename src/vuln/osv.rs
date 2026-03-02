@@ -17,13 +17,13 @@ use crate::report::{
 use crate::utils::{progress, progress_timing};
 
 use super::cvss::parse_cvss_score;
+use super::env_bool;
 use super::http::build_http_client;
 use super::pg::{
     compute_dynamic_ttl_days, parse_osv_last_modified, pg_get_osv, pg_init_schema, pg_put_osv,
     resolve_enrich_cache_dir,
 };
 use super::version::cmp_versions;
-use super::env_bool;
 
 /// Batch query OSV with package coordinates. Returns a JSON value (array of results)
 pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
@@ -96,10 +96,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
         while attempt < retries && !done {
             attempt += 1;
             // Try cache for this chunk first
-            if let Some(bytes) = cache_get(
-                cache_dir.as_deref(),
-                &cache_tag,
-            ) {
+            if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     if let Some(arr) = v["results"].as_array() {
                         for (idx_in_chunk, item) in arr.iter().enumerate() {
@@ -225,10 +222,7 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                 let single_cache = cache_key(&["osv_one", &q.to_string()]);
                 loop {
                     attempt_p += 1;
-                    if let Some(bytes) = cache_get(
-                        cache_dir.as_deref(),
-                        &single_cache,
-                    ) {
+                    if let Some(bytes) = cache_get(cache_dir.as_deref(), &single_cache) {
                         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                             results[*orig_idx] = v;
                             break;
@@ -296,7 +290,11 @@ fn map_ecosystem_name_version(p: &PackageCoordinate) -> (String, String, String)
         // dpkg: OSV Debian ecosystem indexes by SOURCE package name.
         // Ubuntu has its own OSV ecosystem with separate advisory data.
         "deb" | "ubuntu-deb" => {
-            let eco = if p.ecosystem == "ubuntu-deb" { "Ubuntu" } else { "Debian" };
+            let eco = if p.ecosystem == "ubuntu-deb" {
+                "Ubuntu"
+            } else {
+                "Debian"
+            };
             let query_name = p.source_name.as_deref().unwrap_or(&p.name).to_string();
             (eco.into(), query_name, p.version.clone())
         }
@@ -573,7 +571,12 @@ pub fn map_osv_results_to_findings(
 /// This function must be called sequentially because it mutates the shared `findings`
 /// vec; it is intentionally separated from the HTTP-fetch path so that the fetch can
 /// be parallelised independently.
-fn osv_apply_payload_to_findings(id: &str, json: &Value, findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+fn osv_apply_payload_to_findings(
+    id: &str,
+    json: &Value,
+    findings: &mut Vec<Finding>,
+    pg: &mut Option<PgClient>,
+) {
     // Extract description
     let description = json["summary"]
         .as_str()
@@ -988,4 +991,3 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
         progress("osv.advisory.drop.final", &format!("count={}", dropped));
     }
 }
-

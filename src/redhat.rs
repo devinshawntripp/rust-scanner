@@ -121,7 +121,10 @@ fn store_cached_oval(oval_path: &str, cached: &CachedOvalData) {
 }
 
 /// Build `CachedOvalData` from a fully parsed OVAL XML tree.
-fn build_cached_oval_data(root: &Element, test_constraints: HashMap<String, Vec<RpmConstraint>>) -> CachedOvalData {
+fn build_cached_oval_data(
+    root: &Element,
+    test_constraints: HashMap<String, Vec<RpmConstraint>>,
+) -> CachedOvalData {
     let cve_re = Regex::new(r"CVE-\d{4}-\d+").expect("valid CVE regex");
     let mut definitions_out = Vec::new();
 
@@ -360,8 +363,7 @@ fn generate_from_cached_oval(
                     .get(&constraint.package)
                     .cloned()
                     .unwrap_or_else(|| "rpm".to_string());
-                let installed_version =
-                    installed_versions.first().cloned().unwrap_or_default();
+                let installed_version = installed_versions.first().cloned().unwrap_or_default();
 
                 for cve in &def.cves {
                     let key = format!("{}|{}", cve, constraint.package);
@@ -370,10 +372,7 @@ fn generate_from_cached_oval(
                     }
                     seen.insert(key);
 
-                    let nvd_url = format!(
-                        "https://nvd.nist.gov/vuln/detail/{}",
-                        cve
-                    );
+                    let nvd_url = format!("https://nvd.nist.gov/vuln/detail/{}", cve);
                     findings.push(Finding {
                         id: cve.clone(),
                         source_ids: vec!["redhat-oval".to_string()],
@@ -491,8 +490,7 @@ fn generate_from_parsed_oval(
                     .get(&constraint.package)
                     .cloned()
                     .unwrap_or_else(|| "rpm".to_string());
-                let installed_version =
-                    installed_versions.first().cloned().unwrap_or_default();
+                let installed_version = installed_versions.first().cloned().unwrap_or_default();
 
                 for cve in &cves {
                     let key = format!("{}|{}", cve, constraint.package);
@@ -501,10 +499,7 @@ fn generate_from_parsed_oval(
                     }
                     seen.insert(key);
 
-                    let nvd_url = format!(
-                        "https://nvd.nist.gov/vuln/detail/{}",
-                        cve
-                    );
+                    let nvd_url = format!("https://nvd.nist.gov/vuln/detail/{}", cve);
                     findings.push(Finding {
                         id: cve.clone(),
                         source_ids: vec!["redhat-oval".to_string()],
@@ -1164,10 +1159,7 @@ pub fn fetch_redhat_oval(
                     .duration_since(modified)
                     .unwrap_or_default();
                 if age < std::time::Duration::from_secs(7 * 24 * 3600) {
-                    crate::utils::progress(
-                        "oval.auto.cache_hit",
-                        &oval_xml_path.to_string_lossy(),
-                    );
+                    crate::utils::progress("oval.auto.cache_hit", &oval_xml_path.to_string_lossy());
                     return Some(oval_xml_path.to_string_lossy().to_string());
                 }
             }
@@ -1187,10 +1179,7 @@ pub fn fetch_redhat_oval(
     let resp = match client.get(&url).send() {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            crate::utils::progress(
-                "oval.auto.download.error",
-                &format!("HTTP {}", r.status()),
-            );
+            crate::utils::progress("oval.auto.download.error", &format!("HTTP {}", r.status()));
             return None;
         }
         Err(e) => {
@@ -1339,11 +1328,23 @@ mod tests {
         let restored: CachedOvalData = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(cached.definitions.len(), restored.definitions.len());
-        assert_eq!(cached.test_constraints.len(), restored.test_constraints.len());
-        assert_eq!(restored.definitions[0].cves, vec!["CVE-2024-1234".to_string()]);
-        assert_eq!(restored.definitions[0].test_refs, vec!["oval:test:1".to_string()]);
+        assert_eq!(
+            cached.test_constraints.len(),
+            restored.test_constraints.len()
+        );
+        assert_eq!(
+            restored.definitions[0].cves,
+            vec!["CVE-2024-1234".to_string()]
+        );
+        assert_eq!(
+            restored.definitions[0].test_refs,
+            vec!["oval:test:1".to_string()]
+        );
 
-        let constraints = restored.test_constraints.get("oval:test:1").expect("test constraint");
+        let constraints = restored
+            .test_constraints
+            .get("oval:test:1")
+            .expect("test constraint");
         assert_eq!(constraints[0].package, "openssl");
         assert_eq!(constraints[0].evr, "1:3.0.7-18.el9");
     }

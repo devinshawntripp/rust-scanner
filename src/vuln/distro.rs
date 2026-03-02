@@ -4,9 +4,7 @@ use postgres::Client as PgClient;
 use serde_json::Value;
 
 use crate::cache::{cache_get, cache_key, cache_put};
-use crate::report::{
-    Finding, ReferenceInfo,
-};
+use crate::report::{Finding, ReferenceInfo};
 use crate::utils::{progress, progress_timing};
 
 use super::env_bool;
@@ -14,7 +12,10 @@ use super::http::{build_http_client, cached_http_json};
 use super::pg::{pg_get_osv, resolve_enrich_cache_dir};
 use super::version::cmp_versions;
 
-pub(super) fn map_debian_advisory_to_cves(advisory_id: &str, pg: &mut Option<PgClient>) -> Option<Vec<String>> {
+pub(super) fn map_debian_advisory_to_cves(
+    advisory_id: &str,
+    pg: &mut Option<PgClient>,
+) -> Option<Vec<String>> {
     // 1. Check PG osv_vuln_cache for aliases (populated by bulk import)
     if let Some(client_pg) = pg.as_mut() {
         if let Some((payload, _last_checked, _last_mod)) = pg_get_osv(client_pg, advisory_id) {
@@ -46,7 +47,10 @@ pub(super) fn map_debian_advisory_to_cves(advisory_id: &str, pg: &mut Option<PgC
                 }
             }
             if !cves.is_empty() {
-                progress("osv.debian.map.pg_hit", &format!("{} -> {} CVEs", advisory_id, cves.len()));
+                progress(
+                    "osv.debian.map.pg_hit",
+                    &format!("{} -> {} CVEs", advisory_id, cves.len()),
+                );
                 return Some(cves.into_iter().collect());
             }
         }
@@ -112,7 +116,6 @@ fn env_i64(name: &str, default: i64) -> i64 {
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(default)
 }
-
 
 pub(super) fn is_cve_id(id: &str) -> bool {
     id.starts_with("CVE-")
@@ -406,10 +409,15 @@ fn build_debian_candidate_index_pg(
                 out.entry(key).or_default().push(DistroFixCandidate {
                     fixed_version: fv.clone(),
                     source_id: "debian:security-tracker".into(),
-                    reference_url: format!("https://security-tracker.debian.org/tracker/{}", cve_id),
+                    reference_url: format!(
+                        "https://security-tracker.debian.org/tracker/{}",
+                        cve_id
+                    ),
                     note: format!(
                         "Debian tracker (PG cache) source={} status={} fixed_version={}",
-                        source, status.as_deref().unwrap_or("unknown"), fv
+                        source,
+                        status.as_deref().unwrap_or("unknown"),
+                        fv
                     ),
                 });
             }
@@ -603,12 +611,11 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
 
     let ubuntu_index = if ubuntu_enabled && !needed_ubuntu_keys.is_empty() {
         let started = std::time::Instant::now();
-        let idx = build_ubuntu_candidate_index_pg(pg, &needed_ubuntu_keys)
-            .unwrap_or_else(|| {
-                load_ubuntu_notices_data()
-                    .map(|v| build_ubuntu_candidate_index(&v, &needed_ubuntu_keys))
-                    .unwrap_or_default()
-            });
+        let idx = build_ubuntu_candidate_index_pg(pg, &needed_ubuntu_keys).unwrap_or_else(|| {
+            load_ubuntu_notices_data()
+                .map(|v| build_ubuntu_candidate_index(&v, &needed_ubuntu_keys))
+                .unwrap_or_default()
+        });
         progress_timing("distro.ubuntu.enrich", started);
         idx
     } else {
@@ -617,12 +624,11 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
 
     let debian_index = if debian_enabled && !needed_deb.is_empty() {
         let started = std::time::Instant::now();
-        let idx = build_debian_candidate_index_pg(pg, &needed_deb)
-            .unwrap_or_else(|| {
-                load_debian_tracker_data()
-                    .map(|v| build_debian_candidate_index(&v, &needed_deb))
-                    .unwrap_or_default()
-            });
+        let idx = build_debian_candidate_index_pg(pg, &needed_deb).unwrap_or_else(|| {
+            load_debian_tracker_data()
+                .map(|v| build_debian_candidate_index(&v, &needed_deb))
+                .unwrap_or_default()
+        });
         progress_timing("distro.debian.enrich", started);
         idx
     } else {
@@ -714,11 +720,6 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
         progress("distro.feed.enrich.skip", "no matching distro candidates");
     }
 }
-
-
-
-
-
 
 /// Pre-warm all distro advisory feeds (Ubuntu USN, Alpine SecDB) into the local cache.
 pub fn seed_distro_feeds() {
