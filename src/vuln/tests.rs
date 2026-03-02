@@ -1,5 +1,6 @@
 use super::*;
-use crate::report::{ConfidenceTier, EvidenceSource, Finding, PackageInfo};
+use crate::container::PackageCoordinate;
+use crate::report::{ConfidenceTier, EvidenceSource, Finding, PackageInfo, ReferenceInfo};
 
 #[test]
 fn parse_redhat_release_package_handles_name_with_dash() {
