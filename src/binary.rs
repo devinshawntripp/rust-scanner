@@ -163,6 +163,8 @@ pub fn build_binary_report(
     yara_rules: Option<String>,
     nvd_api_key: Option<String>,
 ) -> Option<Report> {
+    crate::progress::init_pipeline("binary");
+    crate::progress::enter_stage("parse");
     progress("binary.hash.start", path);
     #[cfg(not(feature = "yara"))]
     let _ = &yara_rules;
@@ -292,6 +294,7 @@ pub fn build_binary_report(
             progress("binary.nvd.lookup.skip", "no-candidate-components");
         }
 
+        crate::progress::enter_stage("nvd_lookup");
         for (idx, (product, version)) in pairs.iter().enumerate() {
             let step = format!("{}/{} {} {}", idx + 1, total, product, version);
             progress("binary.nvd.lookup.start", &step);
@@ -327,6 +330,7 @@ pub fn build_binary_report(
     }
 
     // Go module OSV lookup via embedded buildinfo
+    crate::progress::enter_stage("go_osv");
     {
         let go_modules = parse_go_buildinfo(&bytes);
         if !go_modules.is_empty() {
@@ -400,6 +404,7 @@ pub fn build_binary_report(
     }
 
     // Enrich with NVD using Postgres cache (single connection per binary report)
+    crate::progress::enter_stage("nvd_enrich");
     {
         let nvd_started = std::time::Instant::now();
         let mut pg = crate::vuln::pg_connect();
@@ -410,10 +415,13 @@ pub fn build_binary_report(
         progress_timing("binary.enrich.nvd", nvd_started);
     }
 
+    crate::progress::enter_stage("epss");
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
     crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::progress::enter_stage("kev");
     crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
 
+    crate::progress::enter_stage("report");
     let mut report = Report {
         scanner,
         target,
@@ -441,6 +449,7 @@ pub fn build_binary_report(
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
+    crate::progress::finish_pipeline();
     Some(report)
 }
 

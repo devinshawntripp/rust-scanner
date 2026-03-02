@@ -593,6 +593,8 @@ pub fn build_container_report(
     #[cfg(not(feature = "yara"))]
     let _ = &yara_rules;
 
+    crate::progress::init_pipeline("container");
+    crate::progress::enter_stage("extract");
     let extract_started = std::time::Instant::now();
     progress("container.extract.start", tar_path);
     if let Err(e) = extract_tar(tar_path, tmp.path()) {
@@ -609,6 +611,7 @@ pub fn build_container_report(
         || sbom
         || matches!(mode, ScanMode::Deep) && yara_rules.as_deref().is_some();
 
+    crate::progress::enter_stage("inventory");
     let mut rootfs = tmp.path().to_path_buf();
     let mut packages = Vec::new();
     if !needs_full_rootfs {
@@ -709,6 +712,7 @@ pub fn build_container_report(
     }
     progress_timing("container.go.binaries", go_started);
 
+    crate::progress::enter_stage("osv_query");
     progress(
         "container.osv.query.start",
         &format!("packages={}", packages.len()),
@@ -781,6 +785,7 @@ pub fn build_container_report(
         }
     }
 
+    crate::progress::enter_stage("osv_enrich");
     progress(
         "container.enrich.osv.start",
         &format!("findings_pre_enrich={}", findings_norm.len()),
@@ -808,6 +813,7 @@ pub fn build_container_report(
         redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
     }
 
+    crate::progress::enter_stage("nvd_enrich");
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
@@ -906,6 +912,7 @@ pub fn build_container_report(
         );
     }
 
+    crate::progress::enter_stage("redhat");
     let oval_redhat = oval_redhat
         .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
         .filter(|v| !v.trim().is_empty())
@@ -1040,9 +1047,12 @@ pub fn build_container_report(
     }
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::progress::enter_stage("epss");
     crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
     crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::progress::enter_stage("kev");
 
+    crate::progress::enter_stage("report");
     let (scan_status, inventory_status, inventory_reason) =
         report_state_for_inventory(packages.len(), &mode, heuristic_used);
     let mut report = Report {
@@ -1057,6 +1067,7 @@ pub fn build_container_report(
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
+    crate::progress::finish_pipeline();
     Some(report)
 }
 

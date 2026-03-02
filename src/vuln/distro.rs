@@ -444,19 +444,21 @@ pub(super) fn build_ubuntu_candidate_index_pg(
     for pkg in &pkgs {
         let rows = client_pg
             .query(
-                "SELECT cve_id, release, status FROM ubuntu_usn_cache WHERE package = $1",
+                "SELECT cve_id, release, status, fixed_version FROM ubuntu_usn_cache WHERE package = $1 AND status = 'released'",
                 &[&pkg],
             )
             .ok()?;
         for row in &rows {
             let cve_id: String = row.get(0);
             let _release: String = row.get(1);
-            let status: Option<String> = row.get(2);
+            let _status: Option<String> = row.get(2);
+            let fixed_version: Option<String> = row.get(3);
             let key = pkg_cve_key(pkg, &cve_id);
             if !needed_keys.contains(&key) {
                 continue;
             }
-            let fv = status.unwrap_or_default();
+            // Use the fixed_version column (populated by bulk import). Skip if absent.
+            let fv = fixed_version.unwrap_or_default();
             if fv.is_empty() {
                 continue;
             }
@@ -504,6 +506,52 @@ fn load_alpine_secdb(branch: &str, repo: &str) -> Option<Value> {
         ttl,
         timeout,
     )
+}
+
+/// Query alpine_secdb_cache in PG for needed package/CVE pairs instead of downloading bulk JSON.
+fn build_alpine_candidate_index_pg(
+    pg: &mut Option<PgClient>,
+    needed_keys: &HashSet<String>,
+    needed_pkgs: &HashSet<String>,
+) -> Option<HashMap<String, Vec<DistroFixCandidate>>> {
+    let client_pg = pg.as_mut()?;
+    let mut out: HashMap<String, Vec<DistroFixCandidate>> = HashMap::new();
+    for pkg in needed_pkgs {
+        let rows = client_pg
+            .query(
+                "SELECT cve_id, branch, repo, fixed_version FROM alpine_secdb_cache WHERE package = $1",
+                &[&pkg],
+            )
+            .ok()?;
+        for row in &rows {
+            let cve_id: String = row.get(0);
+            let branch: String = row.get(1);
+            let repo: String = row.get(2);
+            let fixed_version: Option<String> = row.get(3);
+            let key = pkg_cve_key(pkg, &cve_id);
+            if !needed_keys.contains(&key) {
+                continue;
+            }
+            let fv = fixed_version.unwrap_or_default();
+            if fv.is_empty() {
+                continue;
+            }
+            out.entry(key).or_default().push(DistroFixCandidate {
+                fixed_version: fv.clone(),
+                source_id: format!("alpine-secdb:{}:{}", branch, repo),
+                reference_url: format!(
+                    "https://secdb.alpinelinux.org/{}/{}.json",
+                    branch, repo
+                ),
+                note: format!(
+                    "Alpine SecDB (PG cache) branch={} repo={} package={}",
+                    branch, repo, pkg
+                ),
+            });
+        }
+    }
+    progress("distro.alpine.pg_hit", &format!("{} candidates", out.len()));
+    Some(out)
 }
 
 fn build_alpine_candidate_index(
@@ -637,8 +685,10 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
 
     let alpine_index = if alpine_enabled && !needed_alpine_keys.is_empty() {
         let started = std::time::Instant::now();
-        let idx =
-            build_alpine_candidate_index(&needed_alpine_keys, &needed_apk_pkgs, &needed_apk_cves);
+        let idx = build_alpine_candidate_index_pg(pg, &needed_alpine_keys, &needed_apk_pkgs)
+            .unwrap_or_else(|| {
+                build_alpine_candidate_index(&needed_alpine_keys, &needed_apk_pkgs, &needed_apk_cves)
+            });
         progress_timing("distro.alpine.enrich", started);
         idx
     } else {

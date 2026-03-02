@@ -5,6 +5,7 @@ mod cli;
 mod container;
 mod iso;
 mod license;
+mod progress;
 mod redhat;
 mod report;
 mod sbom;

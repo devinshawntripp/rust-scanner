@@ -50,6 +50,8 @@ pub fn build_iso_report(
     nvd_api_key: Option<String>,
     oval_redhat: Option<String>,
 ) -> Option<Report> {
+    crate::progress::init_pipeline("iso");
+    crate::progress::enter_stage("detect");
     progress("iso.detect.start", path);
     let detect_started = std::time::Instant::now();
     let entries = match list_iso_entries(path) {
@@ -62,6 +64,7 @@ pub fn build_iso_report(
     progress_timing("iso.detect", detect_started);
     progress("iso.detect.done", &format!("entries={}", entries.len()));
 
+    crate::progress::enter_stage("inventory");
     let runtime_started = std::time::Instant::now();
     let mut runtime_error_reason: Option<String> = None;
     let runtime_packages = match packages_from_runtime_inventory(path, &entries) {
@@ -135,6 +138,7 @@ pub fn build_iso_report(
     }
 
     if !packages.is_empty() {
+        crate::progress::enter_stage("osv_query");
         progress(
             "iso.osv.query.start",
             &format!("packages={}", packages.len()),
@@ -144,6 +148,7 @@ pub fn build_iso_report(
         progress_timing("iso.osv.query", osv_query_started);
         progress("iso.osv.query.done", "ok");
         findings_norm = map_osv_results_to_findings(&packages, &osv_results);
+        crate::progress::enter_stage("osv_enrich");
         progress(
             "iso.enrich.osv.start",
             &format!("findings_pre_enrich={}", findings_norm.len()),
@@ -160,6 +165,7 @@ pub fn build_iso_report(
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(true);
         if nvd_enrich_enabled {
+            crate::progress::enter_stage("nvd_enrich");
             let unique_cves = findings_norm
                 .iter()
                 .filter(|f| f.id.starts_with("CVE-"))
@@ -200,6 +206,7 @@ pub fn build_iso_report(
                     None
                 }
             });
+        crate::progress::enter_stage("redhat");
         if let Some(oval_path) = oval_redhat.as_deref() {
             progress("iso.enrich.redhat.start", oval_path);
             let redhat_started = std::time::Instant::now();
@@ -257,6 +264,7 @@ pub fn build_iso_report(
         )
     };
 
+    crate::progress::enter_stage("report");
     let scanner = ScannerInfo {
         name: "scanrook",
         version: env!("CARGO_PKG_VERSION"),
@@ -268,7 +276,9 @@ pub fn build_iso_report(
     };
     let files = iso_entries_to_file_rows(&entries, 20_000);
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+    crate::progress::enter_stage("epss");
     crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::progress::enter_stage("kev");
     crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
 
     let mut report = Report {
@@ -283,6 +293,7 @@ pub fn build_iso_report(
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
+    crate::progress::finish_pipeline();
     Some(report)
 }
 

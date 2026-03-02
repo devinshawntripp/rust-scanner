@@ -265,12 +265,17 @@ pub fn parse_name_version_from_filename(filename: &str) -> Option<(String, Strin
 }
 
 pub fn progress(stage: &str, detail: &str) {
+    progress_pct(stage, detail, 0);
+}
+
+/// Emit a progress event with an explicit percentage field.
+pub fn progress_pct(stage: &str, detail: &str, pct: u8) {
     let ts = chrono::Local::now().to_rfc3339();
     let level = stage_level(stage).to_string();
     let component = stage_component(stage);
     let event_name = stage.to_string();
     let detail_clean = sanitize_detail(detail);
-    let event = serde_json::json!({
+    let mut event = serde_json::json!({
         "ts": ts,
         "level": level,
         "component": component,
@@ -278,6 +283,9 @@ pub fn progress(stage: &str, detail: &str) {
         "stage": stage,
         "detail": detail_clean,
     });
+    if pct > 0 {
+        event["pct"] = serde_json::json!(pct);
+    }
     let json_line = format!("{}\n", event);
     if std::env::var("SCANNER_PROGRESS_STDERR").ok().as_deref() == Some("1") {
         let desired = configured_level();
@@ -305,7 +313,12 @@ pub fn progress(stage: &str, detail: &str) {
             }
         }
     }
-    // Use cached file handle to avoid re-opening on every progress event.
+    write_progress_raw(&json_line);
+}
+
+/// Write a raw progress line to the NDJSON progress file. Used by both
+/// `progress_pct()` and the pipeline manifest emitter in `progress.rs`.
+pub fn write_progress_raw(json_line: &str) {
     let handle = PROGRESS_FILE_HANDLE.get_or_init(|| {
         if let Ok(path) = std::env::var("SCANNER_PROGRESS_FILE") {
             if let Ok(f) = OpenOptions::new().create(true).append(true).open(&path) {
