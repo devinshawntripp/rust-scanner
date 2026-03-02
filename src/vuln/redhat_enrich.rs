@@ -1538,56 +1538,104 @@ pub fn redhat_inject_unfixed_cves(
         }
     }
 
-    // Parallel fetch for cache misses.
+    // Fetch cache misses in batches with rate-limit protection.
     if !to_fetch.is_empty() {
+        let sleep_ms: u64 = std::env::var("SCANNER_REDHAT_SLEEP_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let max_fetch: usize = std::env::var("SCANNER_REDHAT_PKG_CVE_MAX_FETCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+
+        if to_fetch.len() > max_fetch {
+            progress(
+                "redhat.pkg.cve.fetch.cap",
+                &format!(
+                    "capping fetch from {} to {} (set SCANNER_REDHAT_PKG_CVE_MAX_FETCH to adjust)",
+                    to_fetch.len(),
+                    max_fetch
+                ),
+            );
+            to_fetch.truncate(max_fetch);
+        }
+
+        let total_to_fetch = to_fetch.len();
         progress(
             "redhat.pkg.cve.fetch",
-            &format!("fetching={}/{}", to_fetch.len(), total_new),
+            &format!("fetching={}/{}", total_to_fetch, total_new),
         );
-        let fetch_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(max_concurrent)
-            .build()
-            .ok();
 
-        let fetched: Vec<(String, Value, Option<DateTime<Utc>>)> = if let Some(pool) = fetch_pool {
-            pool.install(|| {
-                to_fetch
-                    .par_iter()
-                    .filter_map(|cve_id| {
-                        let cache_tag = cache_key(&["redhat_cve", cve_id]);
-                        let url = format!(
-                            "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
-                            cve_id
-                        );
-                        let local_client = build_http_client(timeout_secs);
-                        match local_client.get(&url).send() {
-                            Ok(resp) if resp.status().is_success() => match resp.json::<Value>() {
-                                Ok(v) => {
-                                    let lm = parse_redhat_cve_last_modified(&v);
-                                    let bytes = serde_json::to_vec(&v).unwrap_or_default();
-                                    if !bytes.is_empty() {
-                                        let cd = resolve_enrich_cache_dir();
-                                        cache_put(cd.as_deref(), &cache_tag, &bytes);
-                                    }
-                                    Some((cve_id.clone(), v, lm))
+        let fetched_count = std::sync::atomic::AtomicUsize::new(0);
+        let batch_size = 200;
+
+        for batch_start in (0..total_to_fetch).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(total_to_fetch);
+            let batch = &to_fetch[batch_start..batch_end];
+
+            let fetch_pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(max_concurrent)
+                .build()
+                .ok();
+
+            let batch_results: Vec<(String, Value, Option<DateTime<Utc>>)> =
+                if let Some(pool) = fetch_pool {
+                    pool.install(|| {
+                        batch
+                            .par_iter()
+                            .filter_map(|cve_id| {
+                                if sleep_ms > 0 {
+                                    sleep(Duration::from_millis(sleep_ms));
                                 }
-                                Err(_) => None,
-                            },
-                            _ => None,
-                        }
+                                let cache_tag = cache_key(&["redhat_cve", cve_id]);
+                                let url = format!(
+                                    "https://access.redhat.com/hydra/rest/securitydata/cve/{}.json",
+                                    cve_id
+                                );
+                                let local_client = build_http_client(timeout_secs);
+                                match local_client.get(&url).send() {
+                                    Ok(resp) if resp.status().is_success() => {
+                                        match resp.json::<Value>() {
+                                            Ok(v) => {
+                                                let lm = parse_redhat_cve_last_modified(&v);
+                                                let bytes =
+                                                    serde_json::to_vec(&v).unwrap_or_default();
+                                                if !bytes.is_empty() {
+                                                    let cd = resolve_enrich_cache_dir();
+                                                    cache_put(cd.as_deref(), &cache_tag, &bytes);
+                                                }
+                                                fetched_count.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                Some((cve_id.clone(), v, lm))
+                                            }
+                                            Err(_) => None,
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect()
                     })
-                    .collect()
-            })
-        } else {
-            Vec::new()
-        };
+                } else {
+                    Vec::new()
+                };
 
-        // Store to PG and merge results (sequential).
-        for (id, json, lm) in fetched {
-            if let Some(c) = pg.as_mut() {
-                pg_put_redhat_cve(c, &id, &json, lm);
+            // Store to PG and merge results (sequential).
+            for (id, json, lm) in batch_results {
+                if let Some(c) = pg.as_mut() {
+                    pg_put_redhat_cve(c, &id, &json, lm);
+                }
+                id_to_json.insert(id, json);
             }
-            id_to_json.insert(id, json);
+
+            let done = fetched_count.load(std::sync::atomic::Ordering::Relaxed);
+            progress(
+                "redhat.pkg.cve.fetch.progress",
+                &format!("{}/{} fetched", done, total_to_fetch),
+            );
         }
     }
 
