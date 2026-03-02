@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "scanrook"
-version = "1.8.2"
+version = "1.8.6"
 dependencies = [
  "anyhow",
  "bzip2 0.4.4",
