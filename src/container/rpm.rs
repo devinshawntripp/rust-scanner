@@ -1,6 +1,5 @@
 //! RPM package detection: SQLite, BerkeleyDB, and CLI fallback.
 
-use crate::container::PackageCoordinate;
 use crate::utils::progress;
 use std::fs;
 use std::path::Path;
