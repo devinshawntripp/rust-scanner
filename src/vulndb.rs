@@ -11,7 +11,7 @@ use flate2::Compression;
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 /// Current schema version — bump when adding tables or changing columns.
@@ -1166,15 +1166,57 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     );
 
     // The API returns a presigned S3 URL — follow redirect and download
-    let dl_resp = client.get(download_url).send()?;
+    let mut dl_resp = client.get(download_url).send()?;
     if !dl_resp.status().is_success() {
         anyhow::bail!("download failed: HTTP {}", dl_resp.status());
     }
-    let gz_bytes = dl_resp.bytes()?;
+    let total_bytes = dl_resp.content_length().unwrap_or(asset_size);
+    let is_tty = std::io::stderr().is_terminal();
+
+    // Stream download with progress bar
+    let mut gz_bytes = Vec::with_capacity(total_bytes as usize);
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u8 = 0;
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = dl_resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        gz_bytes.extend_from_slice(&buf[..n]);
+        downloaded += n as u64;
+        let pct = if total_bytes > 0 {
+            ((downloaded as f64 / total_bytes as f64) * 100.0).min(100.0) as u8
+        } else {
+            0
+        };
+        if pct > last_pct || n == 0 {
+            last_pct = pct;
+            if is_tty {
+                let filled = (pct as usize) / 3;
+                let empty = 33usize.saturating_sub(filled);
+                eprint!(
+                    "\r  [\x1b[36m{}\x1b[0m{}] {}% \u{2014} {:.0}/{:.0} MB",
+                    "\u{2588}".repeat(filled),
+                    "\u{2591}".repeat(empty),
+                    pct,
+                    downloaded as f64 / 1_048_576.0,
+                    total_bytes as f64 / 1_048_576.0,
+                );
+            }
+        }
+    }
+    if is_tty {
+        eprintln!(); // newline after progress bar
+    }
 
     // Decompress to temp file, then atomic rename
+    let gz_len = gz_bytes.len() as u64;
+    if is_tty {
+        eprint!("  Decompressing...");
+    }
     progress("vulndb.fetch.decompress", "decompressing vulndb");
-    let mut decoder = GzDecoder::new(&gz_bytes[..]);
+    let mut decoder = GzDecoder::new(std::io::Cursor::new(&gz_bytes));
     let parent = db_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid db path"))?;
@@ -1182,8 +1224,42 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     let tmp_path = parent.join(".scanrook.db.tmp");
     {
         let mut tmp_file = std::fs::File::create(&tmp_path)?;
-        std::io::copy(&mut decoder, &mut tmp_file)?;
+        let mut decompressed: u64 = 0;
+        let mut last_dpct: u8 = 0;
+        let mut dbuf = [0u8; 131072];
+        loop {
+            let n = decoder.read(&mut dbuf)?;
+            if n == 0 {
+                break;
+            }
+            tmp_file.write_all(&dbuf[..n])?;
+            decompressed += n as u64;
+            // Estimate progress from compressed bytes consumed vs total
+            let consumed = decoder.get_ref().position();
+            let dpct = if gz_len > 0 {
+                ((consumed as f64 / gz_len as f64) * 100.0).min(100.0) as u8
+            } else {
+                0
+            };
+            if dpct > last_dpct {
+                last_dpct = dpct;
+                if is_tty {
+                    let filled = (dpct as usize) / 3;
+                    let empty = 33usize.saturating_sub(filled);
+                    eprint!(
+                        "\r  [\x1b[33m{}\x1b[0m{}] {}% \u{2014} {:.0} MB decompressed",
+                        "\u{2588}".repeat(filled),
+                        "\u{2591}".repeat(empty),
+                        dpct,
+                        decompressed as f64 / 1_048_576.0,
+                    );
+                }
+            }
+        }
         tmp_file.flush()?;
+        if is_tty {
+            eprintln!();
+        }
     }
 
     // Atomic rename
