@@ -3778,9 +3778,16 @@ pub fn enrich_findings_with_nvd(
             }
         }
         if let Some(wrapper) = id_to_json.get(&f.id) {
-            if let Some(items) = wrapper["vulnerabilities"].as_array() {
-                if let Some(item) = items.first() {
-                    let cve = &item["cve"];
+            // Support both full NVD API format ({"vulnerabilities":[{"cve":{...}}]})
+            // and inner CVE object format ({"id":"CVE-...", "metrics":{...}}) from bulk import
+            let cve_ref = if let Some(items) = wrapper["vulnerabilities"].as_array() {
+                items.first().map(|item| &item["cve"])
+            } else if wrapper.get("id").and_then(|v| v.as_str()).is_some() {
+                Some(wrapper)
+            } else {
+                None
+            };
+            if let Some(cve) = cve_ref {
                     if let Some(cvss3) = cve["metrics"]["cvssMetricV31"]
                         .as_array()
                         .and_then(|a| a.first())
@@ -3859,7 +3866,6 @@ pub fn enrich_findings_with_nvd(
                             }
                         }
                     }
-                }
             }
         }
     }
