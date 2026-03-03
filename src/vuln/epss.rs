@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use crate::cache::{cache_get, cache_key, cache_put};
 use crate::report::Finding;
 use crate::utils::{progress, progress_timing};
+use postgres::Client as PgClient;
 use serde_json::Value;
 
 use super::http::enrich_http_client;
-use super::pg::pg_connect;
+use super::pg::{compute_jittered_ttl_days, pg_get_epss_scores, pg_put_epss_scores};
 
 fn epss_enrich_enabled() -> bool {
     std::env::var("SCANNER_EPSS_ENRICH")
@@ -16,7 +17,15 @@ fn epss_enrich_enabled() -> bool {
 
 /// Enrich findings with EPSS (Exploit Prediction Scoring System) scores.
 /// Batch queries the FIRST.org EPSS API in groups of 100 CVE IDs.
-pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::path::Path>) {
+///
+/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `epss_scores_cache`
+/// table before calling the FIRST.org API. API responses are written back to PG.
+/// In standalone mode, uses the file cache only — PG is never touched.
+pub fn epss_enrich_findings(
+    findings: &mut [Finding],
+    pg: &mut Option<PgClient>,
+    cache_dir: Option<&std::path::Path>,
+) {
     if !epss_enrich_enabled() {
         progress("epss.enrich.skip", "disabled by SCANNER_EPSS_ENRICH");
         return;
@@ -38,61 +47,34 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
     let started = std::time::Instant::now();
 
     let mut scores: HashMap<String, (f32, f32)> = HashMap::new();
+    let mut api_ids: Vec<String> = cve_ids.clone();
 
-    // Try PostgreSQL cache first (bulk-populated by vulndb-pg-import CronJob)
-    let mut pg_miss_ids: Vec<String> = Vec::new();
-    if let Some(mut client) = pg_connect() {
-        for chunk in cve_ids.chunks(500) {
-            let params_str: String = chunk
+    // Cluster mode: check PG cache before calling live API
+    if crate::vuln::cluster_mode() {
+        if let Some(client) = pg.as_mut() {
+            let ttl = compute_jittered_ttl_days(30, 7);
+            let id_refs: Vec<&str> = cve_ids.iter().map(|s| s.as_str()).collect();
+            let pg_scores = pg_get_epss_scores(client, &id_refs, ttl);
+            let hit_count = pg_scores.len();
+            scores.extend(pg_scores);
+            // Only request IDs that were not in PG
+            api_ids = cve_ids
                 .iter()
-                .enumerate()
-                .map(|(i, _)| format!("${}", i + 1))
-                .collect::<Vec<_>>()
-                .join(",");
-            let query = format!(
-                "SELECT cve_id, score, percentile FROM epss_scores_cache WHERE cve_id IN ({})",
-                params_str
-            );
-            let params: Vec<&(dyn postgres::types::ToSql + Sync)> = chunk
-                .iter()
-                .map(|s| s as &(dyn postgres::types::ToSql + Sync))
+                .filter(|id| !scores.contains_key(id.as_str()))
+                .cloned()
                 .collect();
-            match client.query(&*query, &params) {
-                Ok(rows) => {
-                    let found: HashSet<String> = rows
-                        .iter()
-                        .filter_map(|row| {
-                            let cve_id: String = row.get(0);
-                            let score: f32 = row.get(1);
-                            let percentile: f32 = row.get(2);
-                            scores.insert(cve_id.clone(), (score, percentile));
-                            Some(cve_id)
-                        })
-                        .collect();
-                    for id in chunk {
-                        if !found.contains(id) {
-                            pg_miss_ids.push(id.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    progress("epss.enrich.pg_error", &format!("{}", e));
-                    pg_miss_ids.extend(chunk.iter().cloned());
-                }
+            if hit_count > 0 {
+                progress(
+                    "epss.enrich.pg_hit",
+                    &format!("hit={} miss={}", hit_count, api_ids.len()),
+                );
             }
         }
-        if !scores.is_empty() {
-            progress(
-                "epss.enrich.pg_hit",
-                &format!("hit={} miss={}", scores.len(), pg_miss_ids.len()),
-            );
-        }
-    } else {
-        pg_miss_ids = cve_ids.clone();
     }
 
-    // Fall back to FIRST.org API for misses
-    for chunk in pg_miss_ids.chunks(100) {
+    // Fetch remaining IDs from FIRST.org API (or all IDs in standalone mode)
+    let mut api_fetched: Vec<(String, f32, f32)> = Vec::new();
+    for chunk in api_ids.chunks(100) {
         let cache_k = cache_key(
             &std::iter::once("epss_v1")
                 .chain(chunk.iter().map(|s| s.as_str()))
@@ -136,11 +118,15 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
                                 });
                             if let (Some(s), Some(p)) = (score, percentile) {
                                 chunk_scores.insert(cve.to_string(), (s, p));
+                                api_fetched.push((cve.to_string(), s, p));
                             }
                         }
                     }
-                    if let Ok(serialized) = serde_json::to_vec(&chunk_scores) {
-                        cache_put(cache_dir, &cache_k, &serialized);
+                    if !crate::vuln::cluster_mode() {
+                        // Standalone mode: write to file cache
+                        if let Ok(serialized) = serde_json::to_vec(&chunk_scores) {
+                            cache_put(cache_dir, &cache_k, &serialized);
+                        }
                     }
                     scores.extend(chunk_scores);
                 }
@@ -154,6 +140,13 @@ pub fn epss_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pa
             Err(e) => {
                 progress("epss.enrich.error", &format!("{}", e));
             }
+        }
+    }
+
+    // Cluster mode: write API-fetched scores back to PG
+    if crate::vuln::cluster_mode() && !api_fetched.is_empty() {
+        if let Some(client) = pg.as_mut() {
+            pg_put_epss_scores(client, &api_fetched);
         }
     }
 

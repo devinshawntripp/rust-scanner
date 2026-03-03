@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use crate::cache::{cache_get, cache_key, cache_put};
 use crate::report::Finding;
 use crate::utils::{progress, progress_timing};
+use postgres::Client as PgClient;
 use serde_json::Value;
 
 use super::http::enrich_http_client;
-use super::pg::pg_connect;
+use super::pg::{compute_jittered_ttl_days, pg_get_kev_entries, pg_put_kev_entries};
 
 fn kev_enrich_enabled() -> bool {
     std::env::var("SCANNER_KEV_ENRICH")
@@ -16,7 +17,15 @@ fn kev_enrich_enabled() -> bool {
 
 /// Enrich findings with CISA KEV (Known Exploited Vulnerabilities) data.
 /// Downloads the full KEV catalog JSON and marks matching findings.
-pub fn kev_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::path::Path>) {
+///
+/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `kev_entries_cache`
+/// table before calling the CISA API. API responses are written back to PG.
+/// In standalone mode, uses the file cache only — PG is never touched.
+pub fn kev_enrich_findings(
+    findings: &mut [Finding],
+    pg: &mut Option<PgClient>,
+    cache_dir: Option<&std::path::Path>,
+) {
     if !kev_enrich_enabled() {
         progress("kev.enrich.skip", "disabled by SCANNER_KEV_ENRICH");
         return;
@@ -28,22 +37,47 @@ pub fn kev_enrich_findings(findings: &mut [Finding], cache_dir: Option<&std::pat
     progress("kev.enrich.start", "checking KEV catalog");
     let started = std::time::Instant::now();
 
-    // Try PostgreSQL cache first (bulk-populated by vulndb-pg-import CronJob)
-    let kev_set: HashSet<String> = if let Some(mut client) = pg_connect() {
-        match client.query("SELECT cve_id FROM kev_entries_cache", &[]) {
-            Ok(rows) if !rows.is_empty() => {
-                let set: HashSet<String> = rows.iter().map(|r| r.get(0)).collect();
-                progress("kev.enrich.pg_hit", &format!("entries={}", set.len()));
-                set
-            }
-            _ => {
-                // PG table empty or error, fall back to file cache / API
-                kev_from_cache_or_api(cache_dir)
+    // Cluster mode: check PG cache before calling live API
+    if crate::vuln::cluster_mode() {
+        if let Some(client) = pg.as_mut() {
+            let ttl = compute_jittered_ttl_days(30, 7);
+            let kev_set = pg_get_kev_entries(client, ttl);
+            if !kev_set.is_empty() {
+                progress("kev.enrich.pg_hit", &format!("entries={}", kev_set.len()));
+                let mut enriched = 0usize;
+                for finding in findings.iter_mut() {
+                    if finding.id.starts_with("CVE-") && kev_set.contains(&finding.id) {
+                        finding.in_kev = Some(true);
+                        enriched += 1;
+                    }
+                }
+                progress_timing("kev.enrich", started);
+                progress(
+                    "kev.enrich.done",
+                    &format!(
+                        "kev_total={} matched={}/{}",
+                        kev_set.len(),
+                        enriched,
+                        findings.len()
+                    ),
+                );
+                return;
             }
         }
-    } else {
-        kev_from_cache_or_api(cache_dir)
-    };
+    }
+
+    // Standalone mode (or PG miss): use file cache / live API
+    let kev_set = kev_from_cache_or_api(cache_dir);
+
+    // Cluster mode: write API-fetched KEV entries back to PG
+    if crate::vuln::cluster_mode() {
+        if let Some(client) = pg.as_mut() {
+            let ids: Vec<String> = kev_set.iter().cloned().collect();
+            if !ids.is_empty() {
+                pg_put_kev_entries(client, &ids);
+            }
+        }
+    }
 
     let mut enriched = 0usize;
     for finding in findings.iter_mut() {
