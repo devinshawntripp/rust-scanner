@@ -1,6 +1,6 @@
-//! Container scan orchestration.
+//! CLI-facing container scan function (prints output directly).
 
-use crate::container::detect::{detect_os_packages, scan_go_binaries_in_rootfs};
+use crate::container::detect::detect_os_packages;
 use crate::container::extract::{
     extract_tar, merge_layers_docker_save, merge_layers_oci_layout,
     try_detect_os_packages_from_layout,
@@ -8,137 +8,67 @@ use crate::container::extract::{
 use crate::container::PackageCoordinate;
 use crate::redhat::apply_redhat_oval_enrichment;
 use crate::report::{
-    compute_summary, retag_findings, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
-    SbomInfo, ScanStatus, ScannerInfo, TargetInfo,
+    compute_summary, retag_findings, ConfidenceTier, EvidenceSource, Report,
+    SbomInfo, ScannerInfo, TargetInfo,
 };
 use crate::utils::parse_name_version_from_filename;
-use crate::utils::{progress, progress_timing, run_syft_generate_sbom};
+use crate::utils::{progress, progress_timing, run_syft_generate_sbom, write_output_if_needed};
 use super::source::detect_busybox_version_in_tree;
 use crate::vuln::{
     enrich_findings_with_nvd, map_osv_results_to_findings, nvd_cpe_findings, nvd_keyword_findings,
     nvd_keyword_findings_name, osv_batch_query, redhat_inject_unfixed_cves,
 };
-use crate::ScanMode;
+use crate::{OutputFormat, ScanMode};
 use std::collections::HashSet;
-use std::path::Path;
 use tempfile::tempdir;
 #[cfg(feature = "yara")]
 use walkdir::WalkDir;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
-pub(super) const IMAGE_HEURISTIC_NOTE: &str =
-    "Installed package inventory could not be fully determined for this image. Finding may be false positive.";
+use super::scan::{
+    collect_file_tree_if_enabled, deep_require_installed_inventory, heuristic_fallback_allowed,
+    include_file_tree, report_state_for_inventory, IMAGE_HEURISTIC_NOTE,
+};
 
-pub(super) fn report_state_for_inventory(
-    packages_detected: usize,
-    mode: &ScanMode,
-    heuristic_used: bool,
-) -> (ScanStatus, InventoryStatus, Option<String>) {
-    if packages_detected > 0 {
-        (ScanStatus::Complete, InventoryStatus::Complete, None)
-    } else if heuristic_used {
-        (
-            ScanStatus::PartialFailed,
-            InventoryStatus::Partial,
-            Some("runtime_inventory_unavailable_used_heuristics".into()),
-        )
-    } else if matches!(mode, ScanMode::Deep) && deep_require_installed_inventory() {
-        (
-            ScanStatus::PartialFailed,
-            InventoryStatus::Missing,
-            Some("deep_mode_requires_installed_inventory".into()),
-        )
-    } else {
-        (
-            ScanStatus::PartialFailed,
-            InventoryStatus::Missing,
-            Some("installed_package_inventory_missing".into()),
-        )
-    }
-}
-
-pub(super) fn light_allow_heuristic_fallback() -> bool {
-    std::env::var("SCANNER_LIGHT_ALLOW_HEURISTIC_FALLBACK")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true)
-}
-
-pub(super) fn deep_require_installed_inventory() -> bool {
-    std::env::var("SCANNER_DEEP_REQUIRE_INSTALLED_INVENTORY")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true)
-}
-
-pub(super) fn heuristic_fallback_allowed(mode: &ScanMode) -> bool {
-    match mode {
-        ScanMode::Light => light_allow_heuristic_fallback(),
-        ScanMode::Deep => !deep_require_installed_inventory(),
-    }
-}
-
-pub(super) fn include_file_tree() -> bool {
-    std::env::var("SCANNER_INCLUDE_FILE_TREE")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
-fn file_tree_limit() -> usize {
-    std::env::var("SCANNER_TREE_MAX_ENTRIES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20_000)
-}
-
-pub(super) fn collect_file_tree_if_enabled(root: &Path) -> Vec<crate::report::FileEntry> {
-    if !include_file_tree() {
-        progress(
-            "files.collect.skip",
-            "disabled by SCANNER_INCLUDE_FILE_TREE",
-        );
-        return Vec::new();
-    }
-    let started = std::time::Instant::now();
-    let limit = file_tree_limit();
-    progress("files.collect.start", &format!("limit={}", limit));
-    let files = crate::utils::collect_file_tree(root, limit);
-    progress_timing("files.collect", started);
-    progress("files.collect.done", &format!("entries={}", files.len()));
-    files
-}
-
-/// Build a container report (no printing)
-pub fn build_container_report(
+pub fn scan_container(
     tar_path: &str,
     mode: ScanMode,
+    format: OutputFormat,
+    _cache_dir: Option<String>,
+    yara_rules: Option<String>,
+    out: Option<String>,
     sbom: bool,
     nvd_api_key: Option<String>,
-    yara_rules: Option<String>,
     oval_redhat: Option<String>,
-) -> Option<Report> {
-    let tmp = tempdir().ok()?;
+) {
+    let tmp = match tempdir() {
+        Ok(td) => td,
+        Err(e) => {
+            eprintln!("Failed to create tempdir: {}", e);
+            return;
+        }
+    };
     #[cfg(not(feature = "yara"))]
     let _ = &yara_rules;
 
-    crate::progress::init_pipeline("container");
-    crate::progress::enter_stage("extract");
     let extract_started = std::time::Instant::now();
     progress("container.extract.start", tar_path);
+
     if let Err(e) = extract_tar(tar_path, tmp.path()) {
+        eprintln!("Failed to extract {}: {}", tar_path, e);
         progress("container.extract.error", &format!("{}", e));
-        return None;
+        return;
     }
     progress_timing("container.extract", extract_started);
     progress("container.extract.done", tar_path);
-    let manifest_path = tmp.path().join("manifest.json");
-    let oci_index_path = tmp.path().join("index.json");
-    let has_manifest = manifest_path.exists();
-    let has_oci_index = oci_index_path.exists();
+
     let needs_full_rootfs = include_file_tree()
         || sbom
         || matches!(mode, ScanMode::Deep) && yara_rules.as_deref().is_some();
 
-    crate::progress::enter_stage("inventory");
+    let manifest_path = tmp.path().join("manifest.json");
+    let oci_index_path = tmp.path().join("index.json");
     let mut packages = Vec::new();
     if !needs_full_rootfs {
         let fast_started = std::time::Instant::now();
@@ -163,10 +93,9 @@ pub fn build_container_report(
         }
     }
 
-    // Always merge layers to get a rootfs — needed for Go binary scanning and app detection.
     let rootfs;
     {
-        rootfs = if has_manifest {
+        rootfs = if manifest_path.exists() {
             progress("container.layers.merge.start", "layout=docker-save");
             match merge_layers_docker_save(tmp.path()) {
                 Ok(p) => {
@@ -174,11 +103,12 @@ pub fn build_container_report(
                     p
                 }
                 Err(e) => {
+                    eprintln!("Failed to merge docker-save layers: {}", e);
                     progress("container.layers.merge.error", &format!("{}", e));
                     tmp.path().to_path_buf()
                 }
             }
-        } else if has_oci_index {
+        } else if oci_index_path.exists() {
             progress("container.layers.merge.start", "layout=oci");
             match merge_layers_oci_layout(tmp.path()) {
                 Ok(p) => {
@@ -186,6 +116,7 @@ pub fn build_container_report(
                     p
                 }
                 Err(e) => {
+                    eprintln!("Failed to merge OCI layers: {}", e);
                     progress("container.layers.merge.error", &format!("{}", e));
                     tmp.path().to_path_buf()
                 }
@@ -213,33 +144,6 @@ pub fn build_container_report(
         }
     }
 
-    // Detect application-level packages (npm, pip, gem, go, maven, cargo, etc.)
-    let app_started = std::time::Instant::now();
-    progress(
-        "container.packages.app.start",
-        rootfs.to_string_lossy().as_ref(),
-    );
-    let app_packages = crate::archive::detect_app_packages(&rootfs);
-    progress_timing("container.packages.app", app_started);
-    progress(
-        "container.packages.app.done",
-        &format!("app_packages={}", app_packages.len()),
-    );
-    packages.extend(app_packages);
-
-    // Scan Go binaries in the rootfs for embedded buildinfo (Go modules + stdlib)
-    let go_started = std::time::Instant::now();
-    let go_packages = scan_go_binaries_in_rootfs(&rootfs);
-    if !go_packages.is_empty() {
-        progress(
-            "container.go.binaries.done",
-            &format!("go_packages={}", go_packages.len()),
-        );
-        packages.extend(go_packages);
-    }
-    progress_timing("container.go.binaries", go_started);
-
-    crate::progress::enter_stage("osv_query");
     progress(
         "container.osv.query.start",
         &format!("packages={}", packages.len()),
@@ -251,10 +155,7 @@ pub fn build_container_report(
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
     let mut heuristic_used = false;
 
-    // For RHEL-compatible distros (Rocky Linux, AlmaLinux, Oracle Linux, CentOS, Fedora),
-    // supplement with a "Red Hat" ecosystem query to capture RHSA advisory coverage for
-    // subpackages (e.g. openssl-libs, python3-libs, glibc-minimal-langpack) that are not
-    // indexed under distro-specific OSV ecosystems.
+    // RHEL supplement
     {
         let rhel_supp_pkgs: Vec<PackageCoordinate> = packages
             .iter()
@@ -312,7 +213,7 @@ pub fn build_container_report(
         }
     }
 
-    crate::progress::enter_stage("osv_enrich");
+    // Enrichment
     progress(
         "container.enrich.osv.start",
         &format!("findings_pre_enrich={}", findings_norm.len()),
@@ -329,10 +230,6 @@ pub fn build_container_report(
         &format!("findings={}", findings_norm.len()),
     );
 
-    // NOTE: Debian tracker enrichment already handled in osv_enrich_findings — see scan_container.
-
-    // Discover unfixed CVEs from the Red Hat per-package CVE list API (patch-only OVAL misses these).
-    // Must run BEFORE enrich_findings_with_nvd so redhat_enrich_cve_findings processes injected findings.
     if packages
         .iter()
         .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem))
@@ -340,7 +237,6 @@ pub fn build_container_report(
         redhat_inject_unfixed_cves(&mut findings_norm, &packages, &mut pg);
     }
 
-    crate::progress::enter_stage("nvd_enrich");
     let nvd_enrich_enabled = std::env::var("SCANNER_NVD_ENRICH")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(true);
@@ -365,18 +261,17 @@ pub fn build_container_report(
         );
     }
 
-    // Fallback heuristics when package DBs are absent (light mode by default).
+    // Heuristic fallback
     let allow_heuristic_fallback = heuristic_fallback_allowed(&mode);
-    if packages.is_empty() && (has_manifest || has_oci_index) && allow_heuristic_fallback {
+    if packages.is_empty()
+        && (manifest_path.exists() || oci_index_path.exists())
+        && allow_heuristic_fallback
+    {
         if let Some((name, ver)) = parse_name_version_from_filename(tar_path) {
             let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
             if extra.is_empty() {
                 extra = crate::vuln::nvd_findings_by_product_version(
-                    &name,
-                    &name,
-                    &ver,
-                    nvd_api_key.as_deref(),
-                    Some(tar_path),
+                    &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
                 );
             }
             if extra.is_empty() {
@@ -404,11 +299,7 @@ pub fn build_container_report(
                     nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
                 if extra.is_empty() {
                     extra = crate::vuln::nvd_findings_by_product_version(
-                        &name,
-                        &name,
-                        &ver,
-                        nvd_api_key.as_deref(),
-                        Some(tar_path),
+                        &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
                     );
                 }
                 if extra.is_empty() {
@@ -439,12 +330,11 @@ pub fn build_container_report(
         );
     }
 
-    crate::progress::enter_stage("redhat");
+    // OVAL
     let oval_redhat = oval_redhat
         .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
         .filter(|v| !v.trim().is_empty())
         .or_else(|| {
-            // Auto-download OVAL for RPM-based images when not explicitly provided
             let has_rpm = packages
                 .iter()
                 .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
@@ -477,19 +367,18 @@ pub fn build_container_report(
                 );
             }
             Err(e) => {
+                eprintln!("Failed Red Hat OVAL evaluation: {}", e);
                 progress_timing("container.enrich.redhat", redhat_started);
                 progress("container.enrich.redhat.error", &format!("{}", e));
             }
         }
     }
 
-    // If this doesn't look like a container and we still found nothing, let caller
-    // fall back to source/binary handlers.
-    if !has_manifest && !has_oci_index && packages.is_empty() && findings_norm.is_empty() {
-        return None;
-    }
-
-    // Optional YARA in deep mode (ignored if feature not enabled)
+    // YARA
+    #[cfg(feature = "yara")]
+    let mut yara_hits: Vec<String> = Vec::new();
+    #[cfg(not(feature = "yara"))]
+    let yara_hits: Vec<String> = Vec::new();
     if let ScanMode::Deep = mode {
         if packages.is_empty() && deep_require_installed_inventory() {
             progress(
@@ -500,40 +389,18 @@ pub fn build_container_report(
             #[cfg(feature = "yara")]
             if let Some(rule_path) = yara_rules.as_deref() {
                 if let Ok(mut compiler) = Compiler::new() {
-                    let _ = compiler.add_rules_file(rule_path);
-                    if let Ok(rules) = compiler.compile_rules() {
+                    if let Err(e) = compiler.add_rules_file(rule_path) {
+                        eprintln!("Failed to add YARA rules: {}", e);
+                    } else if let Ok(rules) = compiler.compile_rules() {
                         for entry in WalkDir::new(&rootfs).into_iter().filter_map(|e| e.ok()) {
                             if entry.file_type().is_file() {
                                 if let Ok(scan) = rules.scan_file(entry.path(), 5) {
                                     for m in scan.matches {
-                                        findings_norm.push(crate::report::Finding {
-                                        id: format!("YARA:{}", m.identifier),
-                                        source_ids: Vec::new(),
-                                        package: None,
-                                        confidence_tier: ConfidenceTier::HeuristicUnverified,
-                                        evidence_source: EvidenceSource::BinaryHeuristic,
-                                        accuracy_note: Some(
-                                            "Derived from binary pattern matching; package inventory is not available."
-                                                .into(),
-                                        ),
-                                        fixed: None,
-                                        fixed_in: None,
-                                        recommendation: None,
-                                        severity: None,
-                                        cvss: None,
-                                        description: None,
-                                        evidence: vec![crate::report::EvidenceItem {
-                                            evidence_type: "yara".into(),
-                                            path: Some(entry.path().display().to_string()),
-                                            detail: Some(m.identifier.to_string()),
-                                        }],
-                                        references: Vec::new(),
-                                        confidence: Some("MEDIUM".into()),
-                                        epss_score: None,
-                                        epss_percentile: None,
-                                        in_kev: None,
-                                    });
-                                        heuristic_used = true;
+                                        yara_hits.push(format!(
+                                            "{}: {}",
+                                            entry.path().display(),
+                                            m.identifier
+                                        ));
                                     }
                                 }
                             }
@@ -544,57 +411,70 @@ pub fn build_container_report(
         }
     }
 
-    let scanner = ScannerInfo {
-        name: "scanrook",
-        version: env!("CARGO_PKG_VERSION"),
-    };
-    let target = TargetInfo {
-        target_type: "container".into(),
-        source: tar_path.to_string(),
-        id: None,
-    };
-    let mut sbom_info: Option<SbomInfo> = None;
-    if sbom {
-        progress("container.sbom.start", rootfs.to_string_lossy().as_ref());
-        let sbom_started = std::time::Instant::now();
-        let sbom_path = tmp.path().join("sbom.cdx.json");
-        if run_syft_generate_sbom(
-            rootfs.to_str().unwrap_or("."),
-            sbom_path.to_str().unwrap_or("sbom.cdx.json"),
-        )
-        .is_ok()
-        {
-            sbom_info = Some(SbomInfo {
-                format: "cyclonedx".into(),
-                path: sbom_path.display().to_string(),
-            });
+    // Output
+    match format {
+        OutputFormat::Text => {
+            println!("Merged RootFS: {}", rootfs.display());
+            println!("Detected packages: {}", packages.len());
+            for p in &packages {
+                println!("- {}:{}@{}", p.ecosystem, p.name, p.version);
+            }
+            println!("Findings: {}", findings_norm.len());
+            if !yara_hits.is_empty() {
+                println!("YARA hits: {}", yara_hits.len());
+            }
         }
-        progress_timing("container.sbom", sbom_started);
-        progress("container.sbom.done", "ok");
+        OutputFormat::Json => {
+            let scanner = ScannerInfo {
+                name: "scanrook",
+                version: env!("CARGO_PKG_VERSION"),
+            };
+            let target = TargetInfo {
+                target_type: "container".into(),
+                source: tar_path.to_string(),
+                id: None,
+            };
+            let mut sbom_info: Option<SbomInfo> = None;
+            if sbom {
+                progress("container.sbom.start", rootfs.to_string_lossy().as_ref());
+                let sbom_started = std::time::Instant::now();
+                let sbom_path = tmp.path().join("sbom.cdx.json");
+                if let Err(e) = run_syft_generate_sbom(
+                    rootfs.to_str().unwrap_or("."),
+                    sbom_path.to_str().unwrap_or("sbom.cdx.json"),
+                ) {
+                    eprintln!("Syft SBOM generation failed: {}", e);
+                    progress("container.sbom.error", &format!("{}", e));
+                } else {
+                    sbom_info = Some(SbomInfo {
+                        format: "cyclonedx".into(),
+                        path: sbom_path.display().to_string(),
+                    });
+                    progress("container.sbom.done", "ok");
+                }
+                progress_timing("container.sbom", sbom_started);
+            }
+            let (scan_status, inventory_status, inventory_reason) =
+                report_state_for_inventory(packages.len(), &mode, heuristic_used);
+            let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+            crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+            crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+
+            let mut report = Report {
+                scanner,
+                target,
+                scan_status,
+                inventory_status,
+                inventory_reason,
+                sbom: sbom_info,
+                findings: findings_norm,
+                files: collect_file_tree_if_enabled(&rootfs),
+                summary: Default::default(),
+            };
+            report.summary = compute_summary(&report.findings);
+            let json = serde_json::to_string_pretty(&report).unwrap();
+            println!("{}", json);
+            write_output_if_needed(&out, &json);
+        }
     }
-
-    let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::progress::enter_stage("epss");
-    crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
-    crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
-    crate::progress::enter_stage("kev");
-
-    crate::progress::enter_stage("report");
-    let (scan_status, inventory_status, inventory_reason) =
-        report_state_for_inventory(packages.len(), &mode, heuristic_used);
-    let mut report = Report {
-        scanner,
-        target,
-        scan_status,
-        inventory_status,
-        inventory_reason,
-        sbom: sbom_info,
-        findings: findings_norm,
-        files: collect_file_tree_if_enabled(&rootfs),
-        summary: Default::default(),
-    };
-    report.summary = compute_summary(&report.findings);
-    crate::progress::finish_pipeline();
-    Some(report)
 }
-
