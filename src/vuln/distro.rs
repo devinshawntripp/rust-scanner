@@ -692,7 +692,7 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
             continue;
         };
         let pkg_name = pkg.name.to_ascii_lowercase();
-        if (pkg.ecosystem == "deb" || pkg.ecosystem == "ubuntu-deb") {
+        if pkg.ecosystem == "deb" || pkg.ecosystem == "ubuntu-deb" {
             needed_deb
                 .entry(pkg_name.clone())
                 .or_default()
@@ -771,7 +771,7 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
             continue;
         }
 
-        if (ecosystem != "deb" && ecosystem != "ubuntu-deb") {
+        if ecosystem != "deb" && ecosystem != "ubuntu-deb" {
             continue;
         }
 

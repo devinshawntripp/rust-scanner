@@ -6,58 +6,13 @@
 
 use crate::utils::progress;
 use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 
 /// Current schema version — bump when adding tables or changing columns.
 const SCHEMA_VERSION: &str = "2";
-
-/// Wrapper around a SQLite vulndb connection with optional zstd dictionaries
-/// for dictionary-compressed payloads (schema v2+).
-pub struct VulnDb {
-    pub conn: Connection,
-    nvd_dict: Option<Vec<u8>>,
-    osv_dict: Option<Vec<u8>>,
-}
-
-impl VulnDb {
-    /// Open vulndb and load any zstd dictionaries from metadata.
-    pub fn open() -> Option<Self> {
-        let conn = open_vulndb()?;
-        let nvd_dict = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'nvd_zstd_dict'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .ok();
-        let osv_dict = conn
-            .query_row(
-                "SELECT value FROM metadata WHERE key = 'osv_zstd_dict'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .ok();
-        Some(VulnDb {
-            conn,
-            nvd_dict,
-            osv_dict,
-        })
-    }
-
-    pub fn query_osv(&self, ecosystem: &str, name: &str) -> Vec<Value> {
-        query_osv_vulns_with_dict(&self.conn, ecosystem, name, self.osv_dict.as_deref())
-    }
-
-    pub fn query_nvd(&self, cve_id: &str) -> Option<Value> {
-        query_nvd_cve_with_dict(&self.conn, cve_id, self.nvd_dict.as_deref())
-    }
-}
 
 // ─── Path helpers ────────────────────────────────────────────────────
 
@@ -145,146 +100,6 @@ pub fn db_build_date(conn: &Connection) -> Option<String> {
     .ok()
 }
 
-/// Get schema version from metadata.
-pub fn db_schema_version(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'schema_version'",
-        [],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
-/// Check if a package is tracked in the DB (even if it has zero vulns).
-pub fn has_package(conn: &Connection, ecosystem: &str, name: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM osv_packages WHERE ecosystem = ?1 AND name = ?2",
-        params![ecosystem, name],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
-/// Query OSV vulnerabilities for a specific package. Returns decompressed JSON values.
-/// Handles both schema versions: new (osv_payloads JOIN) and old (payload in osv_vulns).
-pub fn query_osv_vulns(conn: &Connection, ecosystem: &str, name: &str) -> Vec<Value> {
-    // Try new schema first (osv_payloads table)
-    let new_query = "SELECT p.payload FROM osv_vulns v JOIN osv_payloads p ON v.id = p.id WHERE v.ecosystem = ?1 AND v.name = ?2";
-    if let Ok(mut stmt) = conn.prepare(new_query) {
-        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        }) {
-            let results: Vec<Value> = rows
-                .flatten()
-                .filter_map(|blob| decompress_json(&blob))
-                .collect();
-            if !results.is_empty() {
-                return results;
-            }
-        }
-    }
-    // Fallback: old schema (payload column directly in osv_vulns)
-    let old_query = "SELECT payload FROM osv_vulns WHERE ecosystem = ?1 AND name = ?2";
-    if let Ok(mut stmt) = conn.prepare(old_query) {
-        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        }) {
-            return rows
-                .flatten()
-                .filter_map(|blob| decompress_json(&blob))
-                .collect();
-        }
-    }
-    vec![]
-}
-
-/// Query a single NVD CVE. Returns decompressed JSON payload.
-pub fn query_nvd_cve(conn: &Connection, cve_id: &str) -> Option<Value> {
-    query_nvd_cve_with_dict(conn, cve_id, None)
-}
-
-fn query_nvd_cve_with_dict(conn: &Connection, cve_id: &str, dict: Option<&[u8]>) -> Option<Value> {
-    let blob: Vec<u8> = conn
-        .query_row(
-            "SELECT payload FROM nvd_cves WHERE cve_id = ?1",
-            params![cve_id],
-            |row| row.get(0),
-        )
-        .ok()?;
-    decompress_json_with_dict(&blob, dict)
-}
-
-fn query_osv_vulns_with_dict(
-    conn: &Connection,
-    ecosystem: &str,
-    name: &str,
-    dict: Option<&[u8]>,
-) -> Vec<Value> {
-    let new_query = "SELECT p.payload FROM osv_vulns v JOIN osv_payloads p ON v.id = p.id WHERE v.ecosystem = ?1 AND v.name = ?2";
-    if let Ok(mut stmt) = conn.prepare(new_query) {
-        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        }) {
-            let results: Vec<Value> = rows
-                .flatten()
-                .filter_map(|blob| decompress_json_with_dict(&blob, dict))
-                .collect();
-            if !results.is_empty() {
-                return results;
-            }
-        }
-    }
-    let old_query = "SELECT payload FROM osv_vulns WHERE ecosystem = ?1 AND name = ?2";
-    if let Ok(mut stmt) = conn.prepare(old_query) {
-        if let Ok(rows) = stmt.query_map(params![ecosystem, name], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(blob)
-        }) {
-            return rows
-                .flatten()
-                .filter_map(|blob| decompress_json_with_dict(&blob, dict))
-                .collect();
-        }
-    }
-    vec![]
-}
-
-/// Batch query EPSS scores. Returns map of cve_id -> (score, percentile).
-pub fn query_epss(conn: &Connection, cve_ids: &[String]) -> HashMap<String, (f32, f32)> {
-    let mut out = HashMap::new();
-    // Use individual queries — rusqlite doesn't support dynamic IN clauses easily
-    let mut stmt =
-        match conn.prepare("SELECT cve_id, score, percentile FROM epss_scores WHERE cve_id = ?1") {
-            Ok(s) => s,
-            Err(_) => return out,
-        };
-    for id in cve_ids {
-        if let Ok((score, pct)) = stmt.query_row(params![id], |row| {
-            Ok((row.get::<_, f64>(1)? as f32, row.get::<_, f64>(2)? as f32))
-        }) {
-            out.insert(id.clone(), (score, pct));
-        }
-    }
-    out
-}
-
-/// Batch check KEV entries. Returns set of CVE IDs present in KEV.
-pub fn query_kev(conn: &Connection, cve_ids: &[String]) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut stmt = match conn.prepare("SELECT 1 FROM kev_entries WHERE cve_id = ?1") {
-        Ok(s) => s,
-        Err(_) => return out,
-    };
-    for id in cve_ids {
-        if stmt.query_row(params![id], |_| Ok(())).is_ok() {
-            out.insert(id.clone());
-        }
-    }
-    out
-}
 
 // ─── DB creation & import functions (for `db build`) ─────────────────
 
@@ -520,55 +335,6 @@ pub fn import_debian_tracker(conn: &Connection, json_bytes: &[u8]) -> anyhow::Re
     Ok(count)
 }
 
-/// Import Ubuntu USN data (JSON array of notices). Returns number of entries imported.
-pub fn import_ubuntu_usn(conn: &Connection, json_bytes: &[u8]) -> anyhow::Result<usize> {
-    let val: Value = serde_json::from_slice(json_bytes)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-
-    // Ubuntu USN format from API: object with USN IDs as keys, each containing cves and packages
-    let obj = match val.as_object() {
-        Some(o) => o,
-        None => return Ok(0),
-    };
-    for (_usn_id, notice) in obj {
-        let cves = notice
-            .get("cves")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        let priority = notice
-            .get("priority")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        // Packages grouped by release
-        if let Some(pkgs_obj) = notice.get("packages").and_then(|p| p.as_object()) {
-            for (pkg_name, _pkg_info) in pkgs_obj {
-                // Get releases this package applies to
-                let releases: Vec<String> = notice
-                    .get("releases")
-                    .and_then(|r| r.as_object())
-                    .map(|r| r.keys().cloned().collect())
-                    .unwrap_or_default();
-                for cve_val in &cves {
-                    let cve_id = cve_val.as_str().unwrap_or_default();
-                    if cve_id.is_empty() || !cve_id.starts_with("CVE-") {
-                        continue;
-                    }
-                    for release in &releases {
-                        tx.execute(
-                            "INSERT OR REPLACE INTO ubuntu_usn (cve_id, package, release, status, priority) VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![cve_id, pkg_name, release, "fixed", priority],
-                        )?;
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-    tx.commit()?;
-    Ok(count)
-}
 
 /// Import Alpine SecDB data for a specific branch and repo. Returns number of entries imported.
 pub fn import_alpine_secdb(
@@ -631,16 +397,6 @@ pub fn set_metadata(conn: &Connection, key: &str, value: &str) -> anyhow::Result
         params![key, value],
     )?;
     Ok(())
-}
-
-/// Get metadata value.
-pub fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM metadata WHERE key = ?1",
-        params![key],
-        |row| row.get(0),
-    )
-    .ok()
 }
 
 /// VACUUM and optimize the database after bulk imports.
@@ -741,11 +497,10 @@ pub fn build_nvd(
     let mut start_index = 0u64;
     let results_per_page = 2000u64;
     loop {
-        let mut url = format!(
+        let url = format!(
             "https://services.nvd.nist.gov/rest/json/cves/2.0?startIndex={}&resultsPerPage={}",
             start_index, results_per_page
         );
-        let _ = url; // suppress unused warning in url building
         let mut req = client.get(&url);
         if let Some(key) = api_key {
             req = req.header("apiKey", key);
@@ -1285,43 +1040,6 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Print vulndb status information.
-pub fn print_db_status() {
-    let path = vulndb_path();
-    println!("vulndb_path={}", path.display());
-    if path.exists() {
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        println!("vulndb_size_mb={:.1}", size as f64 / 1_048_576.0);
-        if let Some(conn) = open_vulndb() {
-            if let Some(date) = db_build_date(&conn) {
-                println!("vulndb_build_date={}", date);
-            }
-            if let Some(ver) = db_schema_version(&conn) {
-                println!("vulndb_schema_version={}", ver);
-            }
-            // Print source counts from metadata
-            for key in &[
-                "osv_count",
-                "nvd_count",
-                "epss_count",
-                "kev_count",
-                "debian_count",
-                "ubuntu_count",
-                "alpine_count",
-            ] {
-                if let Some(val) = get_metadata(&conn, key) {
-                    println!("vulndb_{}={}", key, val);
-                }
-            }
-        }
-    } else {
-        println!("vulndb_status=not_found");
-        println!(
-            "hint: run `scanrook db fetch` to download the pre-compiled vulnerability database"
-        );
-    }
-}
-
 // ─── Compression helpers ─────────────────────────────────────────────
 
 /// Strip unused fields from OSV advisory JSON to reduce storage.
@@ -1407,41 +1125,3 @@ fn compress_json(data: &[u8]) -> Vec<u8> {
     zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
 }
 
-/// Decompress a payload blob (tries zstd, gzip, and raw JSON).
-pub fn decompress_payload(data: &[u8]) -> Option<Value> {
-    decompress_json(data)
-}
-
-fn decompress_json(data: &[u8]) -> Option<Value> {
-    decompress_json_with_dict(data, None)
-}
-
-fn decompress_json_with_dict(data: &[u8], dict: Option<&[u8]>) -> Option<Value> {
-    // Try zstd with dictionary first (schema v2)
-    if let Some(dict_bytes) = dict {
-        let mut decoder =
-            zstd::Decoder::with_dictionary(std::io::Cursor::new(data), dict_bytes).ok()?;
-        let mut buf = Vec::new();
-        if decoder.read_to_end(&mut buf).is_ok() {
-            if let Ok(v) = serde_json::from_slice(&buf) {
-                return Some(v);
-            }
-        }
-    }
-    // Try plain zstd (schema v1 / no dict)
-    if let Ok(decompressed) = zstd::decode_all(std::io::Cursor::new(data)) {
-        if let Ok(v) = serde_json::from_slice(&decompressed) {
-            return Some(v);
-        }
-    }
-    // Fallback: try gzip (old format / backwards compat)
-    let mut decoder = GzDecoder::new(data);
-    let mut buf = Vec::new();
-    if decoder.read_to_end(&mut buf).is_ok() {
-        if let Ok(v) = serde_json::from_slice(&buf) {
-            return Some(v);
-        }
-    }
-    // Fallback: uncompressed JSON
-    serde_json::from_slice(data).ok()
-}

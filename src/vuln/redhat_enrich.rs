@@ -12,7 +12,7 @@ use crate::cache::{cache_get, cache_key, cache_put};
 use crate::container::PackageCoordinate;
 use crate::redhat::{compare_evr, is_rpm_ecosystem};
 use crate::report::{
-    ConfidenceTier, CvssInfo, EvidenceItem, EvidenceSource, Finding, PackageInfo, ReferenceInfo,
+    ConfidenceTier, CvssInfo, EvidenceSource, Finding, PackageInfo, ReferenceInfo,
 };
 use crate::utils::{progress, progress_timing};
 
@@ -1257,7 +1257,6 @@ pub fn redhat_inject_unfixed_cves(
         .unwrap_or(4)
         .max(1);
 
-    let client = build_http_client(timeout_secs);
     let ttl_days: i64 = std::env::var("SCANNER_REDHAT_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())

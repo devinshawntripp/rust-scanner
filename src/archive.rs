@@ -5,7 +5,7 @@
 
 use crate::container::PackageCoordinate;
 use crate::report::{
-    compute_summary, ConfidenceTier, EvidenceItem, EvidenceSource, InventoryStatus, Report,
+    compute_summary, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
     ScanStatus, ScannerInfo, TargetInfo,
 };
 use crate::utils::{progress, progress_timing};
@@ -17,7 +17,7 @@ use crate::ScanMode;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tempfile::tempdir;
 use walkdir::WalkDir;
 
@@ -194,7 +194,7 @@ fn extract_zip(path: &str, dest: &Path) -> anyhow::Result<()> {
     let mut archive = zip::ZipArchive::new(file)?;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
+        let entry = archive.by_index(i)?;
         let name = entry.name().to_string();
 
         // Zip Slip protection: reject entries with path traversal
@@ -480,7 +480,7 @@ fn parse_yarn_lock(path: &Path, pkgs: &mut Vec<PackageCoordinate>, seen: &mut Ha
         if !line.starts_with(' ') && !line.starts_with('\t') {
             // Header line like: "lodash@^4.17.0, lodash@^4.17.21:"
             // Extract the package name from the first entry
-            if let Some(at) = trimmed.find('@') {
+            if let Some(_at) = trimmed.find('@') {
                 // Handle scoped packages (@scope/name@version)
                 let rest = &trimmed[..trimmed.len().saturating_sub(1)]; // remove trailing ':'
                 let name = if rest.starts_with('"') {

@@ -569,20 +569,6 @@ pub fn check_policy_from_value(
     check_policy_inner(policy, diff, critical, high, kev_count)
 }
 
-pub fn check_policy(
-    policy: &SbomPolicy,
-    diff: &SbomDiff,
-    current_report: Option<&crate::report::Report>,
-) -> PolicyCheckResult {
-    let (critical, high, kev_count) = current_report
-        .map(|r| {
-            let kev = r.findings.iter().filter(|f| f.in_kev == Some(true)).count();
-            (r.summary.critical, r.summary.high, kev)
-        })
-        .unwrap_or((0, 0, 0));
-    check_policy_inner(policy, diff, critical, high, kev_count)
-}
-
 fn check_policy_inner(
     policy: &SbomPolicy,
     diff: &SbomDiff,

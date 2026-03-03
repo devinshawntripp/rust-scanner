@@ -1,7 +1,7 @@
 use crate::cli::detect::build_scan_report_value;
 use crate::cli::helpers::{
     clear_scanrook_cache, collect_local_cache_stats, env_bool_default, fmt_epoch,
-    resolve_cache_dir, set_dir_permissions_0700, DataSourceDef, SCANROOK_DATA_SOURCES,
+    resolve_cache_dir, set_dir_permissions_0700, SCANROOK_DATA_SOURCES,
 };
 use crate::utils::progress;
 use crate::{cache, container, redhat, report, vuln, vulndb, DbCommands, DbSource, ScanMode};

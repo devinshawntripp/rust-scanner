@@ -12,7 +12,7 @@ mod redhat_enrich;
 mod version;
 
 // --- Public re-exports (used by container.rs, binary.rs, sbom.rs, archive.rs, iso.rs, main.rs) ---
-pub use debian_legacy::{debian_tracker_enrich, debian_tracker_enrich_seed};
+pub use debian_legacy::debian_tracker_enrich_seed;
 pub use distro::seed_distro_feeds;
 pub use epss::epss_enrich_findings;
 pub use kev::kev_enrich_findings;
@@ -24,16 +24,22 @@ pub use osv::{map_osv_results_to_findings, osv_batch_query, osv_enrich_findings}
 pub use pg::{pg_connect, pg_init_schema, resolve_enrich_cache_dir};
 pub use redhat_enrich::redhat_inject_unfixed_cves;
 
-// --- Internal re-exports (used by sibling submodules and tests via `use super::*`) ---
+// --- Internal re-exports used by sibling submodules via `super::` ---
+use distro::{distro_feed_enrich_findings, map_debian_advisory_to_cves};
+use redhat_enrich::{redhat_enrich_cve_findings, redhat_enrich_findings};
+
+// --- Internal re-exports for test access (only used by vuln/tests.rs via `use super::*`) ---
+#[cfg(test)]
 use distro::{
-    build_ubuntu_candidate_index, distro_feed_enrich_findings, map_debian_advisory_to_cves,
-    pkg_cve_key, select_best_candidate, DistroFixCandidate,
+    build_ubuntu_candidate_index, DistroFixCandidate, pkg_cve_key, select_best_candidate,
 };
+#[cfg(test)]
 use osv::drop_fixed_findings;
+#[cfg(test)]
 use redhat_enrich::{
     best_redhat_fixed_release, extract_el_tag, extract_redhat_errata_from_url,
-    package_name_matches, parse_redhat_release_package, redhat_enrich_cve_findings,
-    redhat_enrich_findings, retain_relevant_redhat_references, RedHatFixedRelease,
+    package_name_matches, parse_redhat_release_package,
+    retain_relevant_redhat_references, RedHatFixedRelease,
 };
 
 fn env_bool(name: &str, default: bool) -> bool {

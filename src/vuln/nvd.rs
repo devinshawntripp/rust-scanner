@@ -1,6 +1,4 @@
 use std::collections::HashSet;
-use std::thread::sleep;
-use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use postgres::Client as PgClient;

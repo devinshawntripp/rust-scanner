@@ -7,7 +7,6 @@ mod image;
 mod rpm;
 mod scan;
 
-pub use extract::extract_tar;
 pub use image::pull_and_save_image;
 pub use rpm::{parse_rpm_bdb, parse_rpm_sqlite};
 pub use scan::{build_container_report, build_source_report, scan_container, scan_source_tarball};

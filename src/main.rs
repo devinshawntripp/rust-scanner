@@ -15,7 +15,7 @@ mod vuln;
 mod vulndb;
 
 use crate::cli::{
-    build_scan_report_value, nudge_seed_if_empty, resolve_cache_dir, resolve_yara_rules,
+    build_scan_report_value, nudge_seed_if_empty, resolve_yara_rules,
     run_benchmark, run_db, run_diff, set_dir_permissions_0700, strip_references_in_findings,
 };
 use crate::utils::progress;

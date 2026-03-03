@@ -146,7 +146,6 @@ pub fn scan_container(
     // Try to merge layers from supported container layouts.
     let manifest_path = tmp.path().join("manifest.json");
     let oci_index_path = tmp.path().join("index.json");
-    let mut rootfs = tmp.path().to_path_buf();
     let mut packages = Vec::new();
     if !needs_full_rootfs {
         let fast_started = std::time::Instant::now();
@@ -173,6 +172,7 @@ pub fn scan_container(
 
     // Always merge layers to get a rootfs — needed for Go binary scanning,
     // app package detection, and deep analysis even when fast inventory succeeded.
+    let rootfs;
     {
         rootfs = if manifest_path.exists() {
             progress("container.layers.merge.start", "layout=docker-save");
@@ -612,7 +612,6 @@ pub fn build_container_report(
         || matches!(mode, ScanMode::Deep) && yara_rules.as_deref().is_some();
 
     crate::progress::enter_stage("inventory");
-    let mut rootfs = tmp.path().to_path_buf();
     let mut packages = Vec::new();
     if !needs_full_rootfs {
         let fast_started = std::time::Instant::now();
@@ -638,6 +637,7 @@ pub fn build_container_report(
     }
 
     // Always merge layers to get a rootfs — needed for Go binary scanning and app detection.
+    let rootfs;
     {
         rootfs = if has_manifest {
             progress("container.layers.merge.start", "layout=docker-save");

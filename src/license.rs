@@ -1,8 +1,6 @@
 use regex::Regex;
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
-use walkdir::WalkDir;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct LicenseDetection {
@@ -10,19 +8,6 @@ pub struct LicenseDetection {
     pub name: String,
     pub file: String,
     pub confidence: f32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LicenseReport {
-    pub detections: Vec<LicenseDetection>,
-    pub summary: LicenseSummary,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LicenseSummary {
-    pub total_files_scanned: usize,
-    pub total_licenses_found: usize,
-    pub unique_licenses: Vec<String>,
 }
 
 static LICENSE_PATTERNS: &[(&str, &str, &str)] = &[
@@ -103,22 +88,6 @@ static LICENSE_PATTERNS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-static LICENSE_FILE_NAMES: &[&str] = &[
-    "LICENSE",
-    "LICENSE.md",
-    "LICENSE.txt",
-    "LICENSE.rst",
-    "LICENCE",
-    "LICENCE.md",
-    "LICENCE.txt",
-    "COPYING",
-    "COPYING.md",
-    "COPYING.txt",
-    "NOTICE",
-    "NOTICE.md",
-    "NOTICE.txt",
-];
-
 /// Detect license from a single file and print human-readable output
 pub fn detect_license(path: &str) {
     let content = match fs::read_to_string(path) {
@@ -140,68 +109,6 @@ pub fn detect_license(path: &str) {
                 d.confidence * 100.0
             );
         }
-    }
-}
-
-/// Scan a directory tree for license files and return structured detections
-pub fn scan_licenses_in_tree(root: &Path) -> Vec<LicenseDetection> {
-    let mut all = Vec::new();
-    for entry in WalkDir::new(root)
-        .max_depth(5)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let file_name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or_default()
-            .to_uppercase();
-        let is_license_file = LICENSE_FILE_NAMES
-            .iter()
-            .any(|n| n.to_uppercase() == file_name);
-        if !is_license_file {
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(entry.path()) {
-            let rel = entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .to_string();
-            let detections = detect_licenses_in_text(&content, &rel);
-            all.extend(detections);
-        }
-    }
-    all
-}
-
-/// Build a full license report as JSON value
-pub fn build_license_report(root: &Path) -> LicenseReport {
-    let detections = scan_licenses_in_tree(root);
-    let mut unique: Vec<String> = detections.iter().map(|d| d.spdx_id.clone()).collect();
-    unique.sort();
-    unique.dedup();
-    let scanned = WalkDir::new(root)
-        .max_depth(5)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .filter(|e| {
-            let name = e.file_name().to_str().unwrap_or_default().to_uppercase();
-            LICENSE_FILE_NAMES.iter().any(|n| n.to_uppercase() == name)
-        })
-        .count();
-    LicenseReport {
-        summary: LicenseSummary {
-            total_files_scanned: scanned,
-            total_licenses_found: detections.len(),
-            unique_licenses: unique,
-        },
-        detections,
     }
 }
 

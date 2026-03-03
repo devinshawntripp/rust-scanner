@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use crate::utils::{progress, progress_pct};
+use crate::utils::progress_pct;
 
 /// A single stage in the scan pipeline.
 #[derive(Debug, Clone)]
@@ -169,27 +169,6 @@ pub fn enter_stage(stage_id: &str) {
     );
 }
 
-/// Report sub-stage progress within the current stage.
-/// `fraction` is 0.0..=1.0 representing progress within the current stage.
-pub fn stage_progress(detail: &str, fraction: f32) {
-    let pct = if let Ok(guard) = pipeline_lock().lock() {
-        if let Some(ref state) = *guard {
-            let stage_weight = state.stages
-                .get(state.current_idx)
-                .map(|s| s.weight)
-                .unwrap_or(0);
-            let within = (fraction.clamp(0.0, 1.0) * stage_weight as f32) as u8;
-            (state.base_pct + within).min(100)
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    progress_pct("pipeline.stage.progress", detail, pct);
-}
-
 /// Mark the scan pipeline as complete (100%).
 pub fn finish_pipeline() {
     progress_pct("pipeline.complete", "", 100);
@@ -198,12 +177,3 @@ pub fn finish_pipeline() {
     }
 }
 
-/// Get the current overall percentage (for progress bar rendering).
-pub fn current_pct() -> u8 {
-    if let Ok(guard) = pipeline_lock().lock() {
-        if let Some(ref state) = *guard {
-            return state.base_pct;
-        }
-    }
-    0
-}
