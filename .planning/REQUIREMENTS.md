@@ -10,7 +10,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 ### Scanning Reliability
 
 - [ ] **SCAN-01**: Scanner handles all supported image types (ISO, DMG, tar.gz, tar, OCI, docker-save) without crashing or hanging
-- [ ] **SCAN-02**: All HTTP API requests have timeouts and circuit breakers — no infinite hangs on API failures or rate limits
+- [x] **SCAN-02**: All HTTP API requests have timeouts and circuit breakers — no infinite hangs on API failures or rate limits
 
 ### Enrichment Pipeline
 
@@ -19,7 +19,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 - [x] **ENRICH-03**: Scanner stores all API responses back to PostgreSQL after fetching
 - [x] **ENRICH-04**: Scanner uses file cache -> PG -> live API fallback chain (check file first, then PG, then live)
 - [x] **ENRICH-05**: Scanner with existing PG enrichment data does not make redundant live API calls for cached CVEs
-- [ ] **ENRICH-06**: PG cache entries have a revalidation timestamp — scanner re-fetches when data is stale, not every time
+- [x] **ENRICH-06**: PG cache entries have a revalidation timestamp — scanner re-fetches when data is stale, not every time
 
 ### RHEL/Rocky Scanning
 
@@ -83,13 +83,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | SCAN-01 | Phase 4 | Pending |
-| SCAN-02 | Phase 2 | Pending |
+| SCAN-02 | Phase 2 | Complete |
 | ENRICH-01 | Phase 2 | Complete |
 | ENRICH-02 | Phase 2 | Complete |
 | ENRICH-03 | Phase 2 | Complete |
 | ENRICH-04 | Phase 2 | Complete |
 | ENRICH-05 | Phase 2 | Complete |
-| ENRICH-06 | Phase 2 | Pending |
+| ENRICH-06 | Phase 2 | Complete |
 | RHEL-01 | Phase 3 | Pending |
 | RHEL-02 | Phase 3 | Pending |
 | RHEL-03 | Phase 3 | Pending |
@@ -114,4 +114,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-03-02*
-*Last updated: 2026-03-03 — QUAL-01 marked complete (module splits done in 01-02)*
+*Last updated: 2026-03-03 — SCAN-02, ENRICH-06 marked complete (circuit breakers + jittered TTL done in 02-04); Phase 2 all requirements complete*

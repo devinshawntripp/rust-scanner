@@ -7,7 +7,7 @@ This milestone refactors and stabilizes ScanRook's vulnerability enrichment engi
 ## Phases
 
 - [x] **Phase 1: Code Audit and Module Refactor** - Remove dead code, break up monolithic modules so subsequent bug fixes are safe to make
-- [ ] **Phase 2: DB-First Enrichment Pipeline** - Fix the #1 bug: scanner checks PostgreSQL before any live API call, with HTTP timeouts and clean standalone/cluster separation
+- [x] **Phase 2: DB-First Enrichment Pipeline** - Fix the #1 bug: scanner checks PostgreSQL before any live API call, with HTTP timeouts and clean standalone/cluster separation
 - [ ] **Phase 3: RHEL/Rocky Consolidation** - Unify three fragmented RHEL enrichment codepaths into one accurate, deduplicated pipeline
 - [ ] **Phase 4: Multi-Format Scanning Reliability** - Scanner handles all image types (ISO, DMG, OCI, docker-save) without crashing or hanging
 - [ ] **Phase 5: Test Coverage and Cronjob Hardening** - Unit tests for core logic, daily cronjob imports to PG and exports to MinIO with full payloads
@@ -42,9 +42,9 @@ Plans:
 **Plans**: 4 plans
 Plans:
 - [x] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
-- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
-- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
-- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
+- [x] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [x] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [x] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ### Phase 3: RHEL/Rocky Consolidation
 **Goal**: Rocky Linux and RHEL container scans produce accurate findings through one unified enrichment path — no duplicate CVEs, no false positives from wrong-version CPE matches
@@ -115,7 +115,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
-| 2. DB-First Enrichment Pipeline | 2/4 | In Progress|  |
+| 2. DB-First Enrichment Pipeline | 4/4 | Complete | 2026-03-03 |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
 | 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
