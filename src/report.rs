@@ -157,6 +157,9 @@ pub struct Summary {
     pub heuristic_high: usize,
     pub heuristic_medium: usize,
     pub heuristic_low: usize,
+    /// User-facing warnings (e.g. circuit breaker trips). Absent from JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
