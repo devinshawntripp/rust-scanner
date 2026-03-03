@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.8
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-03T17:10:53Z"
+last_updated: "2026-03-03T17:42:22.355Z"
 progress:
   total_phases: 8
   completed_phases: 2
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 7
+  completed_plans: 7
 ---
 
 # Project State
@@ -23,9 +23,9 @@ See: .planning/PROJECT.md (updated 2026-03-02)
 ## Current Position
 
 Phase: 2 of 6 (DB-First Enrichment Pipeline) — COMPLETE
-Plan: 4 of 4 in current phase (COMPLETE — all Phase 2 plans done)
-Status: Phase 02 Complete — all 4 plans (01/02/03/04) done. Next: Phase 3 (RHEL/Rocky Consolidation)
-Last activity: 2026-03-03 — Completed 02-04 Circuit Breaker Wiring: 5 enrichment functions accept CircuitBreaker, 7 scan pipelines instantiate per-scan breakers, jittered TTL (30 +/- 7 days) in all PG cache checks, warnings in report.summary.warnings
+Plan: 5 of 5 in current phase (COMPLETE — all Phase 2 plans done including gap closure 02-05)
+Status: Phase 02 Complete — all 5 plans (01/02/03/04/05) done. Next: Phase 3 (RHEL/Rocky Consolidation)
+Last activity: 2026-03-03 — Completed 02-05 NVD Query Circuit Breaker Gap Closure: all 4 lower-level NVD query functions now accept CircuitBreaker; binary.rs, container/source.rs, container/scan.rs, container/cli.rs updated; 52/52 tests pass
 
 Progress: [██████████] 67%
 
@@ -41,7 +41,7 @@ Progress: [██████████] 67%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 2 | 66min | 33min |
-| 02 | 4 | 36min | 9min |
+| 02 | 5 | 39min | 8min |
 
 **Recent Trend:**
 - Last 5 plans: 12min, 54min, 5min, ~5min (02-02), 18min (02-03), 13min (02-04)
@@ -51,6 +51,7 @@ Progress: [██████████] 67%
 
 | Phase 02 P02 | 10min | 2 tasks | 2 files |
 | Phase 02 P04 | 13min | 2 tasks | 14 files |
+| Phase 02 P05 | 3 | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -78,7 +79,7 @@ Recent decisions affecting current work:
 - UI work (UIWK-01, UIWK-02) is Phase 6, in a separate repo, and can be worked independently
 - Benchmark validation (BENCH-01) is last — validates all other fixes together
 - CircuitBreaker is scan-scoped (NOT static/OnceLock) — created fresh per scan invocation, no cross-scan state sharing
-- #[allow(dead_code)] on Phase 2 forward-declared infrastructure (circuit.rs, pg.rs helpers) — used by plans 02-04
+- #[allow(dead_code)] on Phase 2 forward-declared infrastructure (pg.rs helpers) — circuit.rs dead_code removed in 02-05 (all methods now used)
 - Summary.warnings uses serde default + skip_serializing_if for full backward compatibility
 - epss_enrich_findings and kev_enrich_findings accept caller-provided pg parameter; no internal pg_connect()
 - KEV cluster-mode returns early on PG hit (avoids file-cache/API fallback when PG has fresh data)
@@ -92,6 +93,9 @@ Recent decisions affecting current work:
 - [Phase 02-04]: Jittered TTL (30 +/- 7 days) replaces compute_dynamic_ttl_days in OSV enrich and NVD enrich paths
 - [Phase 02-04]: Warning collection is post-enrichment: iterate all 4 breakers after enrichment pipeline, push to summary.warnings
 - [Phase 02-04]: Seed/benchmark paths use per-call breakers with &mut None pg (no PG overhead for seed operations)
+- [Phase 02-05]: breaker as last parameter on all 4 NVD query functions: consistent with enrichment function convention from Plan 04
+- [Phase 02-05]: binary.rs breakers moved before if !bytes.is_empty() block: ensures nvd_breaker in scope for both NVD loop and post-block enrichment calls
+- [Phase 02-05]: Separate named breakers in source.rs: nvd_breaker_build (initial query loop) and nvd_breaker_src (enrich step) to avoid shared state between function phases
 
 ### Pending Todos
 
@@ -107,5 +111,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Phase 2 plan 04 complete — all Phase 2 plans done. CircuitBreaker wired into all enrichment functions and scan pipelines, jittered TTL in all PG cache checks, warnings in report.summary.warnings. 52/52 tests pass.
+Stopped at: Phase 2 plan 05 complete — NVD query circuit breaker gap closure. All 4 lower-level NVD query functions now accept CircuitBreaker. All NVD API call paths are circuit-breaker-protected. 52/52 tests pass. Zero warnings in release build.
 Resume file: .planning/phases/03-rhel-rocky-consolidation/03-01-PLAN.md
