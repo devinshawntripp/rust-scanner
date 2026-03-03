@@ -329,6 +329,12 @@ pub fn build_binary_report(
         }
     }
 
+    // Connect to PG early so osv_batch_query can use cluster-mode chunk cache
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+
     // Go module OSV lookup via embedded buildinfo
     crate::progress::enter_stage("go_osv");
     {
@@ -347,7 +353,7 @@ pub fn build_binary_report(
                     source_name: None,
                 })
                 .collect();
-            let osv_results = osv_batch_query(&coords);
+            let osv_results = osv_batch_query(&coords, &mut pg);
             let go_findings = map_osv_results_to_findings(&coords, &osv_results);
             progress(
                 "binary.go.osv.done",
@@ -403,23 +409,19 @@ pub fn build_binary_report(
         }
     }
 
-    // Enrich with NVD using Postgres cache (single connection per binary report)
+    // NVD enrichment
     crate::progress::enter_stage("nvd_enrich");
     {
         let nvd_started = std::time::Instant::now();
-        let mut pg = crate::vuln::pg_connect();
-        if let Some(c) = pg.as_mut() {
-            crate::vuln::pg_init_schema(c);
-        }
         crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
         progress_timing("binary.enrich.nvd", nvd_started);
     }
 
     crate::progress::enter_stage("epss");
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
     crate::progress::enter_stage("kev");
-    crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
 
     crate::progress::enter_stage("report");
     let mut report = Report {

@@ -64,8 +64,8 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
-    crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
 
     let mut report = Report {
         scanner,
@@ -128,6 +128,12 @@ pub fn scan_source_tarball(
         findings.extend(extra);
     }
 
+    let mut pg2 = if crate::vuln::cluster_mode() {
+        crate::vuln::pg_connect()
+    } else {
+        None
+    };
+
     match format {
         OutputFormat::Text => {
             println!("Source: {}", tar_path);
@@ -135,8 +141,8 @@ pub fn scan_source_tarball(
         }
         OutputFormat::Json => {
             let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-            crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
-            crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
+            crate::vuln::epss_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref());
+            crate::vuln::kev_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref());
 
             let scanner = ScannerInfo {
                 name: "scanrook",

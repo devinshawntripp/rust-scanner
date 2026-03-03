@@ -30,19 +30,19 @@ pub fn build_sbom_report(
         ),
     );
 
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+
     let mut findings = if parsed.packages.is_empty() {
         Vec::new()
     } else {
-        let mut pg = crate::vuln::pg_connect();
-        if let Some(c) = pg.as_mut() {
-            crate::vuln::pg_init_schema(c);
-        }
-
         crate::utils::progress(
             "sbom.osv.query.start",
             &format!("packages={}", parsed.packages.len()),
         );
-        let osv_results = osv_batch_query(&parsed.packages);
+        let osv_results = osv_batch_query(&parsed.packages, &mut pg);
         let mut rows = map_osv_results_to_findings(&parsed.packages, &osv_results);
 
         crate::utils::progress(
@@ -88,8 +88,8 @@ pub fn build_sbom_report(
     });
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, cache_dir.as_deref());
-    crate::vuln::kev_enrich_findings(&mut findings, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
 
     let summary = compute_summary(&findings);
     let (scan_status, inventory_status, inventory_reason) = if parsed.packages.is_empty() {

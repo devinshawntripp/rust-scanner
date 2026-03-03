@@ -109,22 +109,22 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
     );
 
     // Enrichment pipeline
-    let osv_started = std::time::Instant::now();
-    let osv_results = osv_batch_query(&packages);
-    progress_timing("dmg.osv.query", osv_started);
-
-    let mut findings = map_osv_results_to_findings(&packages, &osv_results);
-
     let mut pg = crate::vuln::pg_connect();
     if let Some(c) = pg.as_mut() {
         crate::vuln::pg_init_schema(c);
     }
+    let osv_started = std::time::Instant::now();
+    let osv_results = osv_batch_query(&packages, &mut pg);
+    progress_timing("dmg.osv.query", osv_started);
+
+    let mut findings = map_osv_results_to_findings(&packages, &osv_results);
+
     osv_enrich_findings(&mut findings, &mut pg);
     enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    epss_enrich_findings(&mut findings, cache_dir.as_deref());
-    kev_enrich_findings(&mut findings, cache_dir.as_deref());
+    epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
 
     findings.extend(binary_findings);
 

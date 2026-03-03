@@ -141,7 +141,7 @@ pub fn build_iso_report(
             &format!("packages={}", packages.len()),
         );
         let osv_query_started = std::time::Instant::now();
-        let osv_results = osv_batch_query(&packages);
+        let osv_results = osv_batch_query(&packages, &mut pg);
         progress_timing("iso.osv.query", osv_query_started);
         progress("iso.osv.query.done", "ok");
         findings_norm = map_osv_results_to_findings(&packages, &osv_results);
@@ -274,9 +274,9 @@ pub fn build_iso_report(
     let files = iso_entries_to_file_rows(&entries, 20_000);
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
     crate::progress::enter_stage("epss");
-    crate::vuln::epss_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref());
     crate::progress::enter_stage("kev");
-    crate::vuln::kev_enrich_findings(&mut findings_norm, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref());
 
     let mut report = Report {
         scanner,

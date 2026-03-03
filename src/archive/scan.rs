@@ -117,23 +117,25 @@ pub fn build_archive_report(
         &format!("packages={}", packages.len()),
     );
 
+    // Connect to PG early so osv_batch_query can use cluster-mode chunk cache
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+
     // Enrichment pipeline -- same as container/sbom scans
     progress(
         "archive.osv.query.start",
         &format!("packages={}", packages.len()),
     );
     let osv_started = std::time::Instant::now();
-    let osv_results = osv_batch_query(&packages);
+    let osv_results = osv_batch_query(&packages, &mut pg);
     progress_timing("archive.osv.query", osv_started);
     progress("archive.osv.query.done", "ok");
 
     let mut findings = map_osv_results_to_findings(&packages, &osv_results);
 
     let osv_enrich_started = std::time::Instant::now();
-    let mut pg = crate::vuln::pg_connect();
-    if let Some(c) = pg.as_mut() {
-        crate::vuln::pg_init_schema(c);
-    }
     osv_enrich_findings(&mut findings, &mut pg);
     progress_timing("archive.enrich.osv", osv_enrich_started);
 
@@ -148,8 +150,8 @@ pub fn build_archive_report(
 
     // EPSS + KEV
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    epss_enrich_findings(&mut findings, cache_dir.as_deref());
-    kev_enrich_findings(&mut findings, cache_dir.as_deref());
+    epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
 
     // Merge binary findings
     findings.extend(binary_findings);

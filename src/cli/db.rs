@@ -512,8 +512,8 @@ pub fn run_db(
             if epss || all {
                 progress("db.seed.epss.start", "");
                 let mut dummy_findings = Vec::new();
-                vuln::epss_enrich_findings(&mut dummy_findings, Some(&cache_dir));
-                vuln::kev_enrich_findings(&mut dummy_findings, Some(&cache_dir));
+                vuln::epss_enrich_findings(&mut dummy_findings, &mut None, Some(&cache_dir));
+                vuln::kev_enrich_findings(&mut dummy_findings, &mut None, Some(&cache_dir));
                 progress("db.seed.epss.done", "ok");
                 seeded += 1;
             }
@@ -573,7 +573,7 @@ pub fn run_db(
                         source_name: None,
                     },
                 ];
-                let _results = vuln::osv_batch_query(&sample_pkgs);
+                let _results = vuln::osv_batch_query(&sample_pkgs, &mut None);
                 progress("db.seed.osv.done", "ok");
                 seeded += sample_pkgs.len();
             }
