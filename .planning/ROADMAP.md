@@ -39,7 +39,12 @@ Plans:
   3. PG cache entries carry a last_checked_at timestamp; the scanner re-fetches only entries older than the configured TTL
   4. Running the scanner with SCANROOK_CLUSTER_MODE=0 never touches PostgreSQL or Redis; running with SCANROOK_CLUSTER_MODE=1 skips the local file cache
   5. All HTTP API calls have a timeout; NVD 403 rate limit responses trigger a retry with backoff rather than an infinite hang
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ### Phase 3: RHEL/Rocky Consolidation
 **Goal**: Rocky Linux and RHEL container scans produce accurate findings through one unified enrichment path — no duplicate CVEs, no false positives from wrong-version CPE matches
@@ -50,7 +55,12 @@ Plans:
   2. CVE count for a known Rocky 9 test image stays within 10% of the v1.8.1 baseline (481 CVEs) across any code change
   3. No CVE from a RHEL 7 or RHEL 8 CPE entry appears in a RHEL 9 scan result
   4. Unfixed CVEs (will not fix, fix deferred) appear exactly once per package in the output
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ### Phase 4: Multi-Format Scanning Reliability
 **Goal**: The scanner accepts any supported input type — ISO, DMG, tar.gz, OCI tar, docker-save tar — and completes without crashing or hanging, even on malformed or edge-case files
@@ -60,7 +70,12 @@ Plans:
   1. Scanning an ISO image, an OCI image tar, a docker-save tar, a DMG, and a source tar.gz all complete without a panic or process hang
   2. Malformed or partially corrupted archives return a structured error (not a panic), emit an error progress event, and exit with non-zero status
   3. A test suite of at least three real image tarballs (different formats) passes through the full scan pipeline end-to-end
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ### Phase 5: Test Coverage and Cronjob Hardening
 **Goal**: Core scanning logic is covered by unit tests, and the daily CronJob imports complete payloads from all sources into PostgreSQL and exports a usable SQLite snapshot to MinIO
@@ -73,7 +88,12 @@ Plans:
   4. Package parsing unit tests cover RPM header (magic and no-magic formats), APK origin field extraction, and dpkg source name extraction
   5. The daily CronJob imports OSV, NVD, EPSS, KEV, Debian, Ubuntu, and Alpine data into PostgreSQL with all payload fields the scanner needs intact — verified by running a scan against PG-cached data and getting correct findings
   6. After the CronJob completes, a zstd-compressed SQLite snapshot is available at a known MinIO path that `scanrook db fetch` can download and use
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ### Phase 6: UI and Benchmark Validation
 **Goal**: The scan job UI displays pipeline stages without overflow, and a benchmark run confirms ScanRook finds >= vulnerabilities compared to Trivy and Grype across all test images
@@ -83,14 +103,19 @@ Plans:
   1. Each scanner pipeline stage is visible by name (extract, inventory, OSV, NVD, EPSS, KEV, report) with a running/done/pending indicator that updates in real-time via SSE
   2. The pipeline stage display handles 15 or more stages without any content being hidden or cut off — uses compaction, scrolling, or grouped stage display
   3. The benchmark suite runs against alpine:3.20, debian:12, nginx:1.27, and node:20 and ScanRook finds >= the vulnerability count reported by both Trivy and Grype for each image
-**Plans**: TBD
+**Plans**: 4 plans
+Plans:
+- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
+- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
+- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
 
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
-| 2. DB-First Enrichment Pipeline | 0/TBD | Not started | - |
+| 2. DB-First Enrichment Pipeline | 0/4 | Not started | - |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
 | 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
