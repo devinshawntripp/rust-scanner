@@ -90,6 +90,24 @@ pub(super) fn map_debian_advisory_to_cves(
         if let Ok(json_bytes) = serde_json::to_vec(&result) {
             cache_put(cache_dir.as_deref(), &cache_key_str, &json_bytes);
         }
+        // Also update osv_vuln_cache aliases in PG so future scans skip the HTTP fetch
+        if let Some(client_pg) = pg.as_mut() {
+            if let Some((mut payload, _lc, _lm)) = pg_get_osv(client_pg, advisory_id) {
+                let aliases_arr: Vec<serde_json::Value> = result
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect();
+                payload["aliases"] = serde_json::Value::Array(aliases_arr);
+                let _ = client_pg.execute(
+                    "UPDATE osv_vuln_cache SET payload = $1::jsonb WHERE vuln_id = $2",
+                    &[&payload.to_string(), &advisory_id],
+                );
+                progress(
+                    "osv.debian.map.pg_store",
+                    &format!("{} -> {} CVEs persisted to PG", advisory_id, result.len()),
+                );
+            }
+        }
     }
 
     Some(result)
