@@ -10,7 +10,13 @@ use std::io::BufReader;
 
 use xmltree::{Element, XMLNode};
 
-#[derive(Debug, Clone, Default)]
+use super::evr::{build_rpm_package_map, compare_evr, is_release_gating_package, is_rpm_ecosystem};
+use super::xml_helpers::{
+    attr_value, child_by_local, child_text_by_local, collect_children_by_local,
+    collect_descendants_by_local, element_text, extract_cves_from_definition, local_name,
+    parse_compare_op,
+};
+
 pub struct OvalFilterStats {
     pub definitions_total: usize,
     pub definitions_evaluable: usize,
@@ -29,7 +35,7 @@ enum TriState {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-enum CompareOp {
+pub(super) enum CompareOp {
     LessThan,
     LessThanOrEqual,
     Equal,
@@ -78,7 +84,6 @@ struct CachedOvalData {
     definitions: Vec<CachedDefinition>,
 }
 
-/// Resolve the cache directory for storing parsed OVAL data.
 fn resolve_oval_cache_dir() -> Option<std::path::PathBuf> {
     if let Ok(dir) = std::env::var("SCANNER_CACHE") {
         if !dir.is_empty() {
@@ -95,7 +100,6 @@ fn resolve_oval_cache_dir() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Try to load cached OVAL data for the given OVAL file.
 fn load_cached_oval(oval_path: &str) -> Option<CachedOvalData> {
     let file_hash = crate::utils::hash_file_stream(oval_path).ok()?;
     let cache_dir = resolve_oval_cache_dir()?;
@@ -104,7 +108,6 @@ fn load_cached_oval(oval_path: &str) -> Option<CachedOvalData> {
     serde_json::from_slice(&data).ok()
 }
 
-/// Store parsed OVAL data in the cache keyed by the OVAL file hash.
 fn store_cached_oval(oval_path: &str, cached: &CachedOvalData) {
     let file_hash = match crate::utils::hash_file_stream(oval_path) {
         Ok(h) => h,
@@ -120,7 +123,6 @@ fn store_cached_oval(oval_path: &str, cached: &CachedOvalData) {
     }
 }
 
-/// Build `CachedOvalData` from a fully parsed OVAL XML tree.
 fn build_cached_oval_data(
     root: &Element,
     test_constraints: HashMap<String, Vec<RpmConstraint>>,
@@ -151,9 +153,7 @@ fn build_cached_oval_data(
     }
 }
 
-/// Load OVAL data for enrichment, using the parsed-data cache when available.
-///
-/// On a cache miss, parses the full XML and stores the result for next time.
+/// Load OVAL data for enrichment using the parsed-data cache, falling back to XML parse.
 fn load_oval_data(oval_path: &str) -> anyhow::Result<CachedOvalData> {
     // Try cache first
     if let Some(cached) = load_cached_oval(oval_path) {
@@ -228,14 +228,8 @@ pub fn filter_findings_with_redhat_oval(
 }
 
 /// Generate new findings AND filter existing ones from RHEL OVAL data in a single parse.
-///
-/// Returns `(generated_count, filter_stats)`. New findings are appended to `findings`
-/// (deduplicated by `(cve_id, package_name)`) before the filter pass runs.
-///
-/// Optimization: `evaluate_oval_for_packages` is skipped because RHEL OVAL definitions
-/// are class="patch" and use `extend_definition` references that always resolve to
-/// `TriState::Unknown`, producing zero evaluable definitions. The filter logic that
-/// depends on `covered_cves`/`vulnerable_cves` is therefore a no-op and is omitted.
+/// Returns `(generated_count, filter_stats)`. Deduplicates by `(cve_id, package_name)`.
+/// Skips `evaluate_oval_for_packages` (RHEL OVAL class="patch" always evaluates Unknown).
 pub fn apply_redhat_oval_enrichment(
     findings: &mut Vec<Finding>,
     packages: &[PackageCoordinate],
@@ -271,17 +265,8 @@ pub fn apply_redhat_oval_enrichment(
         }
     }
 
-    // Step 2: Skip evaluate_oval_for_packages entirely.
-    //
-    // RHEL OVAL definitions are class="patch" and their top-level criteria trees
-    // contain `extend_definition` elements that reference OS version checks. Since
-    // `evaluate_criteria` maps `extend_definition` to `TriState::Unknown`, and the
-    // top-level operator is AND, every definition evaluates to `Unknown`. This means
-    // `definitions_evaluable` is always 0, `covered_cves` and `vulnerable_cves` are
-    // always empty, and the filter/retain loops below are no-ops.
-    //
-    // We report accurate stats: definitions_total = number of cached definitions,
-    // definitions_evaluable = 0 (the RHEL OVAL reality), covered/vulnerable = 0.
+    // Step 2: Skip evaluate_oval_for_packages — RHEL OVAL class="patch" definitions
+    // use extend_definition refs that resolve to Unknown, making evaluable=0 always.
     let findings_before = findings.len();
     let findings_after = findings_before;
 
@@ -298,10 +283,6 @@ pub fn apply_redhat_oval_enrichment(
     Ok((generated_count, stats))
 }
 
-/// Generate `Finding`s from cached OVAL data by iterating per-package test constraints.
-///
-/// This supplements OSV lookups by directly evaluating the RHEL OVAL advisory data.
-/// Package version comparisons use the same `compare_evr`/`rpmvercmp` logic as the filter.
 fn generate_from_cached_oval(
     cached: &CachedOvalData,
     package_map: &HashMap<String, Vec<String>>,
@@ -342,18 +323,9 @@ fn generate_from_cached_oval(
                     continue;
                 };
 
-                // Evaluate: does the installed version satisfy the vulnerability condition?
-                // Typically: LessThan means installed < fixed_evr -> vulnerable.
-                let is_vulnerable = installed_versions.iter().any(|installed| {
-                    let ord = compare_evr(installed, &constraint.evr);
-                    match constraint.op {
-                        CompareOp::LessThan => ord == Ordering::Less,
-                        CompareOp::LessThanOrEqual => ord != Ordering::Greater,
-                        CompareOp::Equal => ord == Ordering::Equal,
-                        CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
-                        CompareOp::GreaterThan => ord == Ordering::Greater,
-                    }
-                });
+                let is_vulnerable = installed_versions
+                    .iter()
+                    .any(|v| evr_matches_op(v, &constraint.evr, constraint.op));
 
                 if !is_vulnerable {
                     continue;
@@ -411,134 +383,6 @@ fn generate_from_cached_oval(
     findings
 }
 
-/// Generate `Finding`s from a pre-parsed OVAL file by iterating per-package test constraints.
-///
-/// This supplements OSV lookups by directly evaluating the RHEL OVAL advisory data.
-/// Package version comparisons use the same `compare_evr`/`rpmvercmp` logic as the filter.
-///
-/// Note: The primary enrichment path now uses `generate_from_cached_oval` which operates
-/// on the cached representation. This function is retained for `filter_findings_with_redhat_oval`
-/// and `check_redhat_cve` which still use the raw `ParsedOval`.
-#[allow(dead_code)]
-fn generate_from_parsed_oval(
-    parsed: &ParsedOval,
-    package_map: &HashMap<String, Vec<String>>,
-    packages: &[PackageCoordinate],
-) -> Vec<Finding> {
-    use crate::report::{ConfidenceTier, EvidenceSource, PackageInfo, ReferenceInfo};
-
-    if package_map.is_empty() {
-        return Vec::new();
-    }
-
-    let cve_re = Regex::new(r"CVE-\d{4}-\d+").expect("valid CVE regex");
-    let mut definitions = Vec::new();
-    collect_descendants_by_local(&parsed.root, "definition", &mut definitions);
-
-    // Build ecosystem lookup: package_name -> original distro ecosystem
-    let name_to_ecosystem: HashMap<String, String> = packages
-        .iter()
-        .filter(|p| is_rpm_ecosystem(&p.ecosystem))
-        .map(|p| (p.name.clone(), p.ecosystem.clone()))
-        .collect();
-
-    let mut findings: Vec<Finding> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new(); // keys: "cve|package_name"
-
-    for definition in definitions {
-        let cves = extract_cves_from_definition(definition, &cve_re);
-        if cves.is_empty() {
-            continue;
-        }
-
-        // Collect all test_refs referenced anywhere in this definition's criteria tree
-        let mut test_refs: Vec<String> = Vec::new();
-        collect_test_refs_from_element(definition, &mut test_refs);
-
-        for test_ref in &test_refs {
-            let Some(constraints) = parsed.test_constraints.get(test_ref) else {
-                continue;
-            };
-            for constraint in constraints {
-                // Skip OS/distro version-gating packages (e.g. redhat-release, rocky-release)
-                if is_release_gating_package(&constraint.package) {
-                    continue;
-                }
-
-                let Some(installed_versions) = package_map.get(&constraint.package) else {
-                    continue;
-                };
-
-                // Evaluate: does the installed version satisfy the vulnerability condition?
-                // Typically: LessThan means installed < fixed_evr -> vulnerable.
-                let is_vulnerable = installed_versions.iter().any(|installed| {
-                    let ord = compare_evr(installed, &constraint.evr);
-                    match constraint.op {
-                        CompareOp::LessThan => ord == Ordering::Less,
-                        CompareOp::LessThanOrEqual => ord != Ordering::Greater,
-                        CompareOp::Equal => ord == Ordering::Equal,
-                        CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
-                        CompareOp::GreaterThan => ord == Ordering::Greater,
-                    }
-                });
-
-                if !is_vulnerable {
-                    continue;
-                }
-
-                let ecosystem = name_to_ecosystem
-                    .get(&constraint.package)
-                    .cloned()
-                    .unwrap_or_else(|| "rpm".to_string());
-                let installed_version = installed_versions.first().cloned().unwrap_or_default();
-
-                for cve in &cves {
-                    let key = format!("{}|{}", cve, constraint.package);
-                    if seen.contains(&key) {
-                        continue;
-                    }
-                    seen.insert(key);
-
-                    let nvd_url = format!("https://nvd.nist.gov/vuln/detail/{}", cve);
-                    findings.push(Finding {
-                        id: cve.clone(),
-                        source_ids: vec!["redhat-oval".to_string()],
-                        package: Some(PackageInfo {
-                            name: constraint.package.clone(),
-                            ecosystem: ecosystem.clone(),
-                            version: installed_version.clone(),
-                        }),
-                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
-                        evidence_source: EvidenceSource::InstalledDb,
-                        accuracy_note: Some("redhat-oval".to_string()),
-                        fixed: Some(false),
-                        fixed_in: Some(constraint.evr.clone()),
-                        recommendation: Some(format!(
-                            "Update {} to {}",
-                            constraint.package, constraint.evr
-                        )),
-                        severity: None,
-                        cvss: None,
-                        description: None,
-                        evidence: vec![],
-                        references: vec![ReferenceInfo {
-                            reference_type: "WEB".to_string(),
-                            url: nvd_url,
-                        }],
-                        confidence: None,
-                        epss_score: None,
-                        epss_percentile: None,
-                        in_kev: None,
-                    });
-                }
-            }
-        }
-    }
-
-    findings
-}
-
-/// Collect all `test_ref` attribute values from all `criterion` elements in the subtree.
 fn collect_test_refs_from_element(el: &Element, out: &mut Vec<String>) {
     for node in &el.children {
         if let XMLNode::Element(child) = node {
@@ -550,16 +394,6 @@ fn collect_test_refs_from_element(el: &Element, out: &mut Vec<String>) {
             collect_test_refs_from_element(child, out);
         }
     }
-}
-
-/// Returns true for OS version-gating packages that should not generate findings.
-fn is_release_gating_package(name: &str) -> bool {
-    // e.g. redhat-release, redhat-release-server, rocky-release, centos-release, etc.
-    name.ends_with("-release")
-        || name.ends_with("-release-server")
-        || name == "redhat-release-workstation"
-        || name == "oraclelinux-release"
-        || name.starts_with("centos-linux-release")
 }
 
 /// Check if a CVE exists in a Red Hat OVAL XML file
@@ -824,24 +658,16 @@ fn build_rpm_state_map(root: &Element) -> HashMap<String, StateConstraint> {
     out
 }
 
-fn build_rpm_package_map(packages: &[PackageCoordinate]) -> HashMap<String, Vec<String>> {
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for pkg in packages {
-        if !is_rpm_ecosystem(&pkg.ecosystem) {
-            continue;
-        }
-        out.entry(pkg.name.clone())
-            .or_default()
-            .push(pkg.version.clone());
+/// Check if an installed version matches the given comparison operator against an EVR.
+fn evr_matches_op(installed: &str, evr: &str, op: CompareOp) -> bool {
+    let ord = compare_evr(installed, evr);
+    match op {
+        CompareOp::LessThan => ord == Ordering::Less,
+        CompareOp::LessThanOrEqual => ord != Ordering::Greater,
+        CompareOp::Equal => ord == Ordering::Equal,
+        CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
+        CompareOp::GreaterThan => ord == Ordering::Greater,
     }
-    out
-}
-
-pub fn is_rpm_ecosystem(ecosystem: &str) -> bool {
-    matches!(
-        ecosystem,
-        "redhat" | "rpm" | "rocky" | "almalinux" | "suse" | "opensuse" | "centos" | "fedora"
-    )
 }
 
 fn package_matches_constraint(
@@ -851,392 +677,14 @@ fn package_matches_constraint(
     let Some(installed_versions) = packages.get(&constraint.package) else {
         return false;
     };
-
-    installed_versions.iter().any(|installed| {
-        let ord = compare_evr(installed, &constraint.evr);
-        match constraint.op {
-            CompareOp::LessThan => ord == Ordering::Less,
-            CompareOp::LessThanOrEqual => ord != Ordering::Greater,
-            CompareOp::Equal => ord == Ordering::Equal,
-            CompareOp::GreaterThanOrEqual => ord != Ordering::Less,
-            CompareOp::GreaterThan => ord == Ordering::Greater,
-        }
-    })
-}
-
-fn parse_compare_op(op: &str) -> Option<CompareOp> {
-    let norm = op.trim().to_ascii_lowercase();
-    match norm.as_str() {
-        "less than" => Some(CompareOp::LessThan),
-        "less than or equal" => Some(CompareOp::LessThanOrEqual),
-        "greater than" => Some(CompareOp::GreaterThan),
-        "greater than or equal" => Some(CompareOp::GreaterThanOrEqual),
-        "equal" | "equals" => Some(CompareOp::Equal),
-        _ => None,
-    }
-}
-
-pub fn compare_evr(a: &str, b: &str) -> Ordering {
-    let (epoch_a, version_a, release_a) = split_evr(a);
-    let (epoch_b, version_b, release_b) = split_evr(b);
-    match epoch_a.cmp(&epoch_b) {
-        Ordering::Equal => {}
-        ord => return ord,
-    }
-    match rpmvercmp(version_a, version_b) {
-        Ordering::Equal => rpmvercmp(release_a, release_b),
-        ord => ord,
-    }
-}
-
-fn split_evr(evr: &str) -> (i64, &str, &str) {
-    let trimmed = evr.trim();
-    let (epoch, rest) = match trimmed.split_once(':') {
-        Some((lhs, rhs)) if lhs.chars().all(|c| c.is_ascii_digit()) => {
-            (lhs.parse::<i64>().unwrap_or(0), rhs)
-        }
-        _ => (0, trimmed),
-    };
-    match rest.rsplit_once('-') {
-        Some((version, release)) => (epoch, version, release),
-        None => (epoch, rest, ""),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TokenKind {
-    End,
-    Tilde,
-    Numeric,
-    Alpha,
-}
-
-fn rpmvercmp(a: &str, b: &str) -> Ordering {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
-    let mut ia = 0usize;
-    let mut ib = 0usize;
-
-    loop {
-        let (ka, sa) = next_token(ab, &mut ia);
-        let (kb, sb) = next_token(bb, &mut ib);
-
-        match (ka, kb) {
-            (TokenKind::End, TokenKind::End) => return Ordering::Equal,
-            (TokenKind::Tilde, TokenKind::Tilde) => continue,
-            (TokenKind::Tilde, _) => return Ordering::Less,
-            (_, TokenKind::Tilde) => return Ordering::Greater,
-            (TokenKind::End, _) => return Ordering::Less,
-            (_, TokenKind::End) => return Ordering::Greater,
-            (TokenKind::Numeric, TokenKind::Numeric) => {
-                let ord = compare_numeric_segments(sa, sb);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            (TokenKind::Alpha, TokenKind::Alpha) => {
-                let ord = sa.cmp(sb);
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            (TokenKind::Numeric, TokenKind::Alpha) => return Ordering::Greater,
-            (TokenKind::Alpha, TokenKind::Numeric) => return Ordering::Less,
-        }
-    }
-}
-
-fn next_token<'a>(bytes: &'a [u8], idx: &mut usize) -> (TokenKind, &'a [u8]) {
-    while *idx < bytes.len() && !bytes[*idx].is_ascii_alphanumeric() && bytes[*idx] != b'~' {
-        *idx += 1;
-    }
-    if *idx >= bytes.len() {
-        return (TokenKind::End, &[]);
-    }
-    if bytes[*idx] == b'~' {
-        *idx += 1;
-        return (TokenKind::Tilde, &[]);
-    }
-
-    let start = *idx;
-    if bytes[*idx].is_ascii_digit() {
-        while *idx < bytes.len() && bytes[*idx].is_ascii_digit() {
-            *idx += 1;
-        }
-        return (TokenKind::Numeric, &bytes[start..*idx]);
-    }
-
-    while *idx < bytes.len() && bytes[*idx].is_ascii_alphabetic() {
-        *idx += 1;
-    }
-    (TokenKind::Alpha, &bytes[start..*idx])
-}
-
-fn compare_numeric_segments(a: &[u8], b: &[u8]) -> Ordering {
-    let a_trim = trim_leading_zeroes(a);
-    let b_trim = trim_leading_zeroes(b);
-    match a_trim.len().cmp(&b_trim.len()) {
-        Ordering::Equal => a_trim.cmp(b_trim),
-        ord => ord,
-    }
-}
-
-fn trim_leading_zeroes(mut v: &[u8]) -> &[u8] {
-    while v.first().copied() == Some(b'0') {
-        v = &v[1..];
-    }
-    if v.is_empty() {
-        b"0"
-    } else {
-        v
-    }
-}
-
-fn extract_cves_from_definition(definition: &Element, cve_re: &Regex) -> HashSet<String> {
-    let mut out = HashSet::new();
-
-    let mut references = Vec::new();
-    collect_descendants_by_local(definition, "reference", &mut references);
-    for reference in references {
-        for value in reference.attributes.values() {
-            for m in cve_re.find_iter(value) {
-                out.insert(m.as_str().to_ascii_uppercase());
-            }
-        }
-        let txt = element_text(reference);
-        for m in cve_re.find_iter(&txt) {
-            out.insert(m.as_str().to_ascii_uppercase());
-        }
-    }
-
-    for field in ["title", "description"] {
-        let mut nodes = Vec::new();
-        collect_descendants_by_local(definition, field, &mut nodes);
-        for node in nodes {
-            let txt = element_text(node);
-            for m in cve_re.find_iter(&txt) {
-                out.insert(m.as_str().to_ascii_uppercase());
-            }
-        }
-    }
-
-    out
-}
-
-fn child_by_local<'a>(el: &'a Element, target: &str) -> Option<&'a Element> {
-    el.children.iter().find_map(|node| {
-        if let XMLNode::Element(child) = node {
-            if local_name(&child.name) == target {
-                return Some(child);
-            }
-        }
-        None
-    })
-}
-
-fn child_text_by_local(el: &Element, target: &str) -> Option<String> {
-    child_by_local(el, target).map(element_text)
-}
-
-fn attr_value<'a>(el: &'a Element, key: &str) -> Option<&'a str> {
-    if let Some(v) = el.attributes.get(key) {
-        return Some(v);
-    }
-    for (k, v) in &el.attributes {
-        if local_name(k).eq_ignore_ascii_case(key) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-fn collect_children_by_local<'a>(el: &'a Element, target: &str, out: &mut Vec<&'a Element>) {
-    for node in &el.children {
-        if let XMLNode::Element(child) = node {
-            if local_name(&child.name) == target {
-                out.push(child);
-            }
-        }
-    }
-}
-
-fn collect_descendants_by_local<'a>(el: &'a Element, target: &str, out: &mut Vec<&'a Element>) {
-    for node in &el.children {
-        if let XMLNode::Element(child) = node {
-            if local_name(&child.name) == target {
-                out.push(child);
-            }
-            collect_descendants_by_local(child, target, out);
-        }
-    }
-}
-
-fn local_name(name: &str) -> &str {
-    name.rsplit(':').next().unwrap_or(name)
-}
-
-fn element_text(el: &Element) -> String {
-    let mut out = String::new();
-    append_text(el, &mut out);
-    out.trim().to_string()
-}
-
-fn append_text(el: &Element, out: &mut String) {
-    for node in &el.children {
-        match node {
-            XMLNode::Element(child) => append_text(child, out),
-            XMLNode::Text(text) | XMLNode::CData(text) => {
-                let t = text.trim();
-                if t.is_empty() {
-                    continue;
-                }
-                if !out.is_empty() {
-                    out.push(' ');
-                }
-                out.push_str(t);
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Detect the Red Hat OVAL major version from an RPM ecosystem string and/or package metadata.
-pub fn detect_rhel_major_version(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
-    // Look at release tags in package versions: e.g. "5.1.8-6.el9" -> 9
-    let re = regex::Regex::new(r"\.el(\d+)").ok()?;
-    for pkg in packages {
-        if let Some(caps) = re.captures(&pkg.version) {
-            if let Some(m) = caps.get(1) {
-                if let Ok(n) = m.as_str().parse::<u32>() {
-                    return Some(n);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Auto-download and cache Red Hat OVAL data for the given RHEL major version.
-///
-/// Returns the path to the cached XML file, or None if download failed.
-pub fn fetch_redhat_oval(
-    packages: &[crate::container::PackageCoordinate],
-    cache_dir: Option<&std::path::Path>,
-) -> Option<String> {
-    let version = detect_rhel_major_version(packages)?;
-    if version < 6 || version > 10 {
-        crate::utils::progress(
-            "oval.auto.skip",
-            &format!("unsupported RHEL version {}", version),
-        );
-        return None;
-    }
-
-    let cache_dir = cache_dir.or_else(|| {
-        std::env::var("SCANNER_CACHE")
-            .ok()
-            .map(|_| std::path::Path::new(""))
-    });
-    let cache_base = if let Some(dir) = cache_dir {
-        dir.to_path_buf()
-    } else if let Some(home) = std::env::var_os("HOME") {
-        std::path::PathBuf::from(home)
-            .join(".scanrook")
-            .join("cache")
-    } else {
-        return None;
-    };
-
-    let oval_dir = cache_base.join("oval");
-    let _ = std::fs::create_dir_all(&oval_dir);
-    let oval_xml_path = oval_dir.join(format!("rhel-{}.oval.xml", version));
-
-    // Check cache freshness (7 days)
-    if oval_xml_path.exists() {
-        if let Ok(meta) = std::fs::metadata(&oval_xml_path) {
-            if let Ok(modified) = meta.modified() {
-                let age = std::time::SystemTime::now()
-                    .duration_since(modified)
-                    .unwrap_or_default();
-                if age < std::time::Duration::from_secs(7 * 24 * 3600) {
-                    crate::utils::progress("oval.auto.cache_hit", &oval_xml_path.to_string_lossy());
-                    return Some(oval_xml_path.to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-
-    let url = format!(
-        "https://www.redhat.com/security/data/oval/v2/RHEL{}/rhel-{}.oval.xml.bz2",
-        version, version
-    );
-    crate::utils::progress("oval.auto.download", &url);
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .ok()?;
-    let resp = match client.get(&url).send() {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            crate::utils::progress("oval.auto.download.error", &format!("HTTP {}", r.status()));
-            return None;
-        }
-        Err(e) => {
-            crate::utils::progress("oval.auto.download.error", &format!("{}", e));
-            return None;
-        }
-    };
-
-    let bz2_bytes = match resp.bytes() {
-        Ok(b) => b,
-        Err(e) => {
-            crate::utils::progress("oval.auto.download.error", &format!("{}", e));
-            return None;
-        }
-    };
-
-    // Decompress bzip2
-    let mut decoder = bzip2::read::BzDecoder::new(bz2_bytes.as_ref());
-    let mut xml_data = Vec::new();
-    if let Err(e) = std::io::Read::read_to_end(&mut decoder, &mut xml_data) {
-        crate::utils::progress("oval.auto.decompress.error", &format!("{}", e));
-        return None;
-    }
-
-    if let Err(e) = std::fs::write(&oval_xml_path, &xml_data) {
-        crate::utils::progress("oval.auto.write.error", &format!("{}", e));
-        return None;
-    }
-
-    crate::utils::progress(
-        "oval.auto.done",
-        &format!(
-            "version={} size={}KB path={}",
-            version,
-            xml_data.len() / 1024,
-            oval_xml_path.display()
-        ),
-    );
-    Some(oval_xml_path.to_string_lossy().to_string())
+    installed_versions
+        .iter()
+        .any(|v| evr_matches_op(v, &constraint.evr, constraint.op))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_compare_evr_epoch_and_release() {
-        assert_eq!(compare_evr("1:1.0-1", "0:9.9-9"), Ordering::Greater);
-        assert_eq!(compare_evr("0:1.2.3-4", "0:1.2.4-1"), Ordering::Less);
-        assert_eq!(compare_evr("1.0-10", "1.0-2"), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_rpmvercmp_tilde_ordering() {
-        assert_eq!(rpmvercmp("1.0~beta", "1.0"), Ordering::Less);
-        assert_eq!(rpmvercmp("1.0", "1.0~beta"), Ordering::Greater);
-    }
 
     #[test]
     fn test_oval_eval_with_rpm_constraints() {
