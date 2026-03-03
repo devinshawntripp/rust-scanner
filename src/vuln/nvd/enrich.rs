@@ -9,19 +9,27 @@ use crate::utils::{progress, progress_timing};
 use super::super::env_bool;
 use super::super::http::nvd_get_json;
 use super::super::pg::{
-    compute_dynamic_ttl_days, parse_nvd_last_modified, pg_get_cve, pg_init_schema, pg_put_cve,
+    compute_jittered_ttl_days, parse_nvd_last_modified, pg_get_cve, pg_init_schema, pg_put_cve,
 };
 
 pub fn enrich_findings_with_nvd(
     findings: &mut Vec<Finding>,
     api_key: Option<&str>,
     pg: &mut Option<PgClient>,
+    breaker: &crate::vuln::CircuitBreaker,
 ) {
     if !env_bool("SCANNER_NVD_ENRICH", true) {
         progress("nvd.fetch.skip", "disabled by SCANNER_NVD_ENRICH");
         return;
     }
     if findings.is_empty() {
+        return;
+    }
+    if breaker.is_open() {
+        progress(
+            "nvd.enrich.skip",
+            &format!("circuit_open source={}", breaker.source_name()),
+        );
         return;
     }
     // Only fetch CVEs that still need enrichment, unless explicitly disabled.
@@ -65,7 +73,7 @@ pub fn enrich_findings_with_nvd(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_ms);
-    let ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
+    let _ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
@@ -85,9 +93,8 @@ pub fn enrich_findings_with_nvd(
     for (idx, id) in unique_ids.into_iter().enumerate() {
         let mut served_from_cache = false;
         if let Some(client) = pg.as_mut() {
-            if let Some((payload, last_checked_at, nvd_last_modified)) = pg_get_cve(client, &id) {
-                let ttl_dyn_days =
-                    compute_dynamic_ttl_days(nvd_last_modified, ttl_days as i64) as i64;
+            if let Some((payload, last_checked_at, _nvd_last_modified)) = pg_get_cve(client, &id) {
+                let ttl_dyn_days = compute_jittered_ttl_days(30, 7);
                 if Utc::now() - last_checked_at < ChronoDuration::days(ttl_dyn_days) {
                     id_to_json.insert(id.clone(), payload);
                     progress("nvd.cache.pg.hit", &id);
@@ -116,6 +123,10 @@ pub fn enrich_findings_with_nvd(
             to_fetch
                 .par_iter()
                 .filter_map(|(idx, id)| {
+                    // Skip if circuit is open (checked per-thread using atomics)
+                    if breaker.is_open() {
+                        return None;
+                    }
                     progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
                     let url = format!(
                         "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
@@ -124,10 +135,12 @@ pub fn enrich_findings_with_nvd(
                     match nvd_get_json(&url, api_key, &format!("cveId:{}", id), sleep_ms) {
                         Some(json) => {
                             let lm = parse_nvd_last_modified(&json);
+                            breaker.record_success();
                             Some((id.clone(), json, lm))
                         }
                         None => {
                             progress("nvd.fetch.err", id);
+                            breaker.record_failure();
                             None
                         }
                     }
@@ -147,6 +160,14 @@ pub fn enrich_findings_with_nvd(
     } else {
         // Fallback sequential loop
         for (idx, id) in to_fetch.into_iter() {
+            // Check circuit before each attempt in sequential path
+            if breaker.is_open() {
+                progress(
+                    "nvd.fetch.skip",
+                    &format!("circuit_open source={} id={}", breaker.source_name(), id),
+                );
+                break;
+            }
             progress("nvd.fetch.start", &format!("{}/{} {}", idx + 1, total, id));
             let url = format!(
                 "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={}",
@@ -159,10 +180,12 @@ pub fn enrich_findings_with_nvd(
                         pg_put_cve(client, &id, &json, lm);
                     }
                     id_to_json.insert(id.clone(), json);
+                    breaker.record_success();
                     progress("nvd.fetch.ok", &id);
                 }
                 None => {
                     progress("nvd.fetch.err", &id);
+                    breaker.record_failure();
                 }
             }
         }

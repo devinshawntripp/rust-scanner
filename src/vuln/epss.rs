@@ -25,9 +25,17 @@ pub fn epss_enrich_findings(
     findings: &mut [Finding],
     pg: &mut Option<PgClient>,
     cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
 ) {
     if !epss_enrich_enabled() {
         progress("epss.enrich.skip", "disabled by SCANNER_EPSS_ENRICH");
+        return;
+    }
+    if breaker.is_open() {
+        progress(
+            "epss.enrich.skip",
+            &format!("circuit_open source={}", breaker.source_name()),
+        );
         return;
     }
     let mut cve_ids: Vec<String> = findings
@@ -89,6 +97,14 @@ pub fn epss_enrich_findings(
 
         let cve_param = chunk.join(",");
         let url = format!("https://api.first.org/data/v1/epss?cve={}", cve_param);
+        // Check circuit breaker before each chunk HTTP request
+        if breaker.is_open() {
+            progress(
+                "epss.enrich.chunk.skip",
+                &format!("circuit_open source={}", breaker.source_name()),
+            );
+            break;
+        }
         match enrich_http_client().get(&url).send() {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.json::<Value>() {
@@ -128,6 +144,7 @@ pub fn epss_enrich_findings(
                             cache_put(cache_dir, &cache_k, &serialized);
                         }
                     }
+                    breaker.record_success();
                     scores.extend(chunk_scores);
                 }
             }
@@ -136,9 +153,17 @@ pub fn epss_enrich_findings(
                     "epss.enrich.http_error",
                     &format!("status={}", resp.status()),
                 );
+                breaker.record_failure();
+                if breaker.is_open() {
+                    break;
+                }
             }
             Err(e) => {
                 progress("epss.enrich.error", &format!("{}", e));
+                breaker.record_failure();
+                if breaker.is_open() {
+                    break;
+                }
             }
         }
     }

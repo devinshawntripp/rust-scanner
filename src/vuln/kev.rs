@@ -25,9 +25,17 @@ pub fn kev_enrich_findings(
     findings: &mut [Finding],
     pg: &mut Option<PgClient>,
     cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
 ) {
     if !kev_enrich_enabled() {
         progress("kev.enrich.skip", "disabled by SCANNER_KEV_ENRICH");
+        return;
+    }
+    if breaker.is_open() {
+        progress(
+            "kev.enrich.skip",
+            &format!("circuit_open source={}", breaker.source_name()),
+        );
         return;
     }
     let has_cves = findings.iter().any(|f| f.id.starts_with("CVE-"));
@@ -67,7 +75,7 @@ pub fn kev_enrich_findings(
     }
 
     // Standalone mode (or PG miss): use file cache / live API
-    let kev_set = kev_from_cache_or_api(cache_dir);
+    let kev_set = kev_from_cache_or_api(cache_dir, breaker);
 
     // Cluster mode: write API-fetched KEV entries back to PG
     if crate::vuln::cluster_mode() {
@@ -98,7 +106,10 @@ pub fn kev_enrich_findings(
     );
 }
 
-fn kev_from_cache_or_api(cache_dir: Option<&std::path::Path>) -> HashSet<String> {
+fn kev_from_cache_or_api(
+    cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
+) -> HashSet<String> {
     let cache_k = cache_key(&["kev_catalog_v1"]);
     if let Some(cached) = cache_get(cache_dir, &cache_k) {
         if let Ok(set) = serde_json::from_slice::<HashSet<String>>(&cached) {
@@ -106,7 +117,7 @@ fn kev_from_cache_or_api(cache_dir: Option<&std::path::Path>) -> HashSet<String>
             return set;
         }
     }
-    match fetch_kev_catalog() {
+    match fetch_kev_catalog(breaker) {
         Some(set) => {
             if let Ok(serialized) = serde_json::to_vec(&set) {
                 cache_put(cache_dir, &cache_k, &serialized);
@@ -117,7 +128,10 @@ fn kev_from_cache_or_api(cache_dir: Option<&std::path::Path>) -> HashSet<String>
     }
 }
 
-fn fetch_kev_catalog() -> Option<HashSet<String>> {
+fn fetch_kev_catalog(breaker: &crate::vuln::CircuitBreaker) -> Option<HashSet<String>> {
+    if breaker.is_open() {
+        return None;
+    }
     let url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
     match enrich_http_client().get(url).send() {
         Ok(resp) if resp.status().is_success() => {
@@ -127,6 +141,7 @@ fn fetch_kev_catalog() -> Option<HashSet<String>> {
                 .iter()
                 .filter_map(|v| v.get("cveID").and_then(|c| c.as_str()).map(String::from))
                 .collect();
+            breaker.record_success();
             progress("kev.enrich.catalog_fetched", &format!("cves={}", set.len()));
             Some(set)
         }
@@ -135,10 +150,12 @@ fn fetch_kev_catalog() -> Option<HashSet<String>> {
                 "kev.enrich.http_error",
                 &format!("status={}", resp.status()),
             );
+            breaker.record_failure();
             None
         }
         Err(e) => {
             progress("kev.enrich.error", &format!("{}", e));
+            breaker.record_failure();
             None
         }
     }

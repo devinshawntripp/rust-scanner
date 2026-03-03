@@ -14,7 +14,7 @@ use super::super::cvss::parse_cvss_score;
 use super::super::env_bool;
 use super::super::http::build_http_client;
 use super::super::pg::{
-    compute_dynamic_ttl_days, parse_osv_last_modified, pg_get_osv, pg_init_schema, pg_put_osv,
+    compute_jittered_ttl_days, parse_osv_last_modified, pg_get_osv, pg_init_schema, pg_put_osv,
 };
 
 /// Apply a single OSV JSON payload to all matching findings in `findings`.
@@ -229,7 +229,14 @@ fn osv_apply_payload_to_findings(
 /// Returns a map of id -> parsed JSON for every id that could be resolved.
 /// PG-cache lookups are deliberately excluded here because `PgClient` is not `Send`;
 /// callers must handle PG separately before and after this function.
-fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::HashMap<String, Value> {
+///
+/// The `breaker` is checked before making each HTTP request and updated on success/failure.
+/// Since `CircuitBreaker` uses atomics internally it is `Sync` and can be shared across threads.
+fn osv_fetch_parallel(
+    ids: &[String],
+    client: &Client,
+    breaker: &crate::vuln::CircuitBreaker,
+) -> std::collections::HashMap<String, Value> {
     if ids.is_empty() {
         return std::collections::HashMap::new();
     }
@@ -250,6 +257,11 @@ fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::Hash
     let results: std::collections::HashMap<String, Value> = ids
         .par_iter()
         .filter_map(|id| {
+            // Skip if circuit is already open.
+            if breaker.is_open() {
+                return None;
+            }
+
             // File-cache hit fast path — no semaphore needed.
             let cache_tag = cache_key(&["osv_vuln", id]);
             if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
@@ -273,11 +285,18 @@ fn osv_fetch_parallel(ids: &[String], client: &Client) -> std::collections::Hash
                 Ok(r) if r.status().is_success() => match r.json::<Value>() {
                     Ok(v) => {
                         cache_put(cache_dir.as_deref(), &cache_tag, v.to_string().as_bytes());
+                        breaker.record_success();
                         Some((id.clone(), v))
                     }
-                    Err(_) => None,
+                    Err(_) => {
+                        breaker.record_failure();
+                        None
+                    }
                 },
-                _ => None,
+                _ => {
+                    breaker.record_failure();
+                    None
+                }
             };
 
             // Release the semaphore permit.
@@ -319,12 +338,23 @@ pub(in crate::vuln) fn dedupe_findings_by_id_and_package(findings: &mut Vec<Find
 }
 
 /// Enrich findings with details from OSV /v1/vulns/{id} (fills description, severity, references)
-pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+pub fn osv_enrich_findings(
+    findings: &mut Vec<Finding>,
+    pg: &mut Option<PgClient>,
+    breaker: &crate::vuln::CircuitBreaker,
+) {
     if !env_bool("SCANNER_OSV_ENRICH", true) {
         progress("osv.fetch.skip", "disabled by SCANNER_OSV_ENRICH");
         return;
     }
     if findings.is_empty() {
+        return;
+    }
+    if breaker.is_open() {
+        progress(
+            "osv.enrich.skip",
+            &format!("circuit_open source={}", breaker.source_name()),
+        );
         return;
     }
     // Deduplicate IDs to query
@@ -354,8 +384,8 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
         }
         let mut pg_hit = false;
         if let Some(client_pg) = pg.as_mut() {
-            if let Some((payload, last_checked, last_mod)) = pg_get_osv(client_pg, id) {
-                let ttl_days = compute_dynamic_ttl_days(last_mod, 14);
+            if let Some((payload, last_checked, _last_mod)) = pg_get_osv(client_pg, id) {
+                let ttl_days = compute_jittered_ttl_days(30, 7);
                 if Utc::now() - last_checked < ChronoDuration::days(ttl_days) {
                     pg_cache_hits.insert(id.clone(), payload);
                     pg_hit = true;
@@ -379,7 +409,7 @@ pub fn osv_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient
 
     // Phase 2: Parallel fetch for PG-cache misses (bounded concurrency)
     let phase_fetch_started = std::time::Instant::now();
-    let fetched = osv_fetch_parallel(&needs_fetch, &client);
+    let fetched = osv_fetch_parallel(&needs_fetch, &client, breaker);
     progress_timing("osv.enrich.fetch_parallel", phase_fetch_started);
     progress(
         "osv.fetch.parallel.done",

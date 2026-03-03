@@ -15,11 +15,22 @@ use super::super::pg::resolve_enrich_cache_dir;
 /// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the `osv_batch_chunk_cache` PostgreSQL
 /// table before making any API calls. Successful API responses are written back to PG.
 /// In standalone mode, the existing file-cache path is used unchanged.
+///
+/// The `breaker` is checked before each chunk HTTP request; on network failure
+/// `record_failure()` is called and the loop breaks if the circuit opens.
 pub fn osv_batch_query(
     packages: &Vec<PackageCoordinate>,
     pg: &mut Option<PgClient>,
+    breaker: &crate::vuln::CircuitBreaker,
 ) -> serde_json::Value {
     if packages.is_empty() {
+        return serde_json::json!([]);
+    }
+    if breaker.is_open() {
+        progress(
+            "osv.batch.skip",
+            &format!("circuit_open source={}", breaker.source_name()),
+        );
         return serde_json::json!([]);
     }
 
@@ -107,6 +118,18 @@ pub fn osv_batch_query(
         let mut attempt = 0;
         let mut done = false;
         while attempt < retries && !done {
+            // Check circuit breaker before each attempt
+            if breaker.is_open() {
+                progress(
+                    "osv.batch.chunk.skip",
+                    &format!(
+                        "circuit_open source={} offset={}",
+                        breaker.source_name(),
+                        chunk.first().map(|(i, _)| i).unwrap_or(&0)
+                    ),
+                );
+                break;
+            }
             attempt += 1;
             // In standalone mode: try file cache for this chunk first
             if !crate::vuln::cluster_mode() {
@@ -151,6 +174,10 @@ pub fn osv_batch_query(
                                 offset, attempt, status, preview
                             ),
                         );
+                        breaker.record_failure();
+                        if breaker.is_open() {
+                            break;
+                        }
                     } else {
                         // Capture raw body first so we can log it on failure
                         match r.text() {
@@ -177,6 +204,7 @@ pub fn osv_batch_query(
                                                 v.to_string().as_bytes(),
                                             );
                                         }
+                                        breaker.record_success();
                                         progress(
                                             "osv.query.chunk.done",
                                             &format!(
@@ -201,6 +229,10 @@ pub fn osv_batch_query(
                                                     offset, attempt, keys, preview
                                                 ),
                                             );
+                                        breaker.record_failure();
+                                        if breaker.is_open() {
+                                            break;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -212,6 +244,10 @@ pub fn osv_batch_query(
                                             offset, attempt, e, preview
                                         ),
                                     );
+                                    breaker.record_failure();
+                                    if breaker.is_open() {
+                                        break;
+                                    }
                                 }
                             },
                             Err(e) => {
@@ -222,6 +258,10 @@ pub fn osv_batch_query(
                                         offset, attempt, e
                                     ),
                                 );
+                                breaker.record_failure();
+                                if breaker.is_open() {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -236,14 +276,36 @@ pub fn osv_batch_query(
                             e
                         ),
                     );
+                    breaker.record_failure();
+                    if breaker.is_open() {
+                        break;
+                    }
                 }
             }
             std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt as u64));
         }
 
         if !done {
-            // Fallback: per-package
+            // Fallback: per-package (skip entirely if circuit is open)
+            if breaker.is_open() {
+                progress(
+                    "osv.batch.fallback.skip",
+                    &format!(
+                        "circuit_open source={} offset={}",
+                        breaker.source_name(),
+                        chunk.first().map(|(i, _)| i).unwrap_or(&0)
+                    ),
+                );
+            } else {
             for (orig_idx, q) in chunk {
+                // Check circuit breaker before each per-package attempt
+                if breaker.is_open() {
+                    progress(
+                        "osv.query.pkg.skip",
+                        &format!("circuit_open source={} idx={}", breaker.source_name(), orig_idx),
+                    );
+                    break;
+                }
                 let mut attempt_p = 0;
                 let single_cache = cache_key(&["osv_one", &q.to_string()]);
                 loop {
@@ -268,6 +330,7 @@ pub fn osv_batch_query(
                                     v.to_string().as_bytes(),
                                 );
                                 results[*orig_idx] = v;
+                                breaker.record_success();
                                 progress(
                                     "osv.query.pkg.ok",
                                     &format!("idx={} attempts={}", orig_idx, attempt_p),
@@ -279,6 +342,7 @@ pub fn osv_batch_query(
                                     "osv.query.pkg.error",
                                     &format!("idx={} json err={}", orig_idx, e),
                                 );
+                                breaker.record_failure();
                             }
                         },
                         Err(e) => {
@@ -286,13 +350,15 @@ pub fn osv_batch_query(
                                 "osv.query.pkg.error",
                                 &format!("idx={} http err={}", orig_idx, e),
                             );
+                            breaker.record_failure();
                         }
                     }
-                    if attempt_p >= retries {
+                    if attempt_p >= retries || breaker.is_open() {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt_p as u64));
                 }
+            }
             }
             progress(
                 "osv.query.chunk.fallback",
