@@ -234,6 +234,18 @@ pub fn build_binary_report(
         }
     }
 
+    // Connect to PG early so osv_batch_query can use cluster-mode chunk cache
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+
+    // Create per-scan circuit breakers (one per API source, not static/shared)
+    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
+    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+
     if !bytes.is_empty() {
         let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
         let text_budget = if file_size > full_limit {
@@ -296,6 +308,10 @@ pub fn build_binary_report(
 
         crate::progress::enter_stage("nvd_lookup");
         for (idx, (product, version)) in pairs.iter().enumerate() {
+            if nvd_breaker.is_open() {
+                progress("binary.nvd.lookup.skip", "circuit breaker open");
+                break;
+            }
             let step = format!("{}/{} {} {}", idx + 1, total, product, version);
             progress("binary.nvd.lookup.start", &step);
 
@@ -305,12 +321,13 @@ pub fn build_binary_report(
                 version,
                 nvd_api_key.as_deref(),
                 Some(path),
+                &nvd_breaker,
             );
             if extra.is_empty() {
-                extra = nvd_cpe_findings(product, version, nvd_api_key.as_deref(), Some(path));
+                extra = nvd_cpe_findings(product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
             if extra.is_empty() {
-                extra = nvd_keyword_findings(product, version, nvd_api_key.as_deref(), Some(path));
+                extra = nvd_keyword_findings(product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
 
             let found = extra.len();
@@ -328,18 +345,6 @@ pub fn build_binary_report(
             findings.extend(extra);
         }
     }
-
-    // Connect to PG early so osv_batch_query can use cluster-mode chunk cache
-    let mut pg = crate::vuln::pg_connect();
-    if let Some(c) = pg.as_mut() {
-        crate::vuln::pg_init_schema(c);
-    }
-
-    // Create per-scan circuit breakers (one per API source, not static/shared)
-    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
-    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
-    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
 
     // Go module OSV lookup via embedded buildinfo
     crate::progress::enter_stage("go_osv");

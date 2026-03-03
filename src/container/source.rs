@@ -32,18 +32,22 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     }
 
     let mut findings = Vec::new();
+    let nvd_breaker_build = crate::vuln::CircuitBreaker::new("nvd", 5);
     for (name, ver) in candidates {
-        let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+        if nvd_breaker_build.is_open() {
+            break;
+        }
+        let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_build);
         if extra.is_empty() {
             extra = crate::vuln::nvd_findings_by_product_version(
-                &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
+                &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_build,
             );
         }
         if extra.is_empty() {
-            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_build);
         }
         if extra.is_empty() {
-            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_build);
         }
         findings.extend(extra);
     }
@@ -115,18 +119,22 @@ pub fn scan_source_tarball(
     }
 
     let mut findings = Vec::new();
+    let nvd_breaker_scan = crate::vuln::CircuitBreaker::new("nvd", 5);
     for (name, ver) in candidates {
-        let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+        if nvd_breaker_scan.is_open() {
+            break;
+        }
+        let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_scan);
         if extra.is_empty() {
             extra = crate::vuln::nvd_findings_by_product_version(
-                &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
+                &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_scan,
             );
         }
         if extra.is_empty() {
-            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_scan);
         }
         if extra.is_empty() {
-            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+            extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker_scan);
         }
         findings.extend(extra);
     }

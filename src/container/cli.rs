@@ -284,17 +284,17 @@ pub fn scan_container(
         && allow_heuristic_fallback
     {
         if let Some((name, ver)) = parse_name_version_from_filename(tar_path) {
-            let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+            let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
             if extra.is_empty() {
                 extra = crate::vuln::nvd_findings_by_product_version(
-                    &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
+                    &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker,
                 );
             }
             if extra.is_empty() {
-                extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                extra = nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
             }
             if extra.is_empty() {
-                extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+                extra = nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
             }
             let start = findings_norm.len();
             findings_norm.append(&mut extra);
@@ -312,19 +312,19 @@ pub fn scan_container(
             if let Some((name, ver)) = detect_busybox_version_in_tree(&rootfs) {
                 progress("container.filename.heuristic", &format!("{} {}", name, ver));
                 let mut extra =
-                    nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                    nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
                 if extra.is_empty() {
                     extra = crate::vuln::nvd_findings_by_product_version(
-                        &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path),
+                        &name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker,
                     );
                 }
                 if extra.is_empty() {
                     extra =
-                        nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path));
+                        nvd_keyword_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
                 }
                 if extra.is_empty() {
                     extra =
-                        nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path));
+                        nvd_keyword_findings_name(&name, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
                 }
                 let start = findings_norm.len();
                 findings_norm.append(&mut extra);
