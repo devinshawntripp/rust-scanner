@@ -1,413 +1,11 @@
-//! Pre-compiled SQLite vulnerability database for offline/fast scanning.
-//!
-//! The DB is downloaded via `scanrook db fetch` or built via `scanrook db build`.
-//! During scans, the enrichment pipeline checks SQLite first, falling back to
-//! live APIs for any misses.
+//! Build and fetch functions for downloading bulk data sources and creating the vulndb.
 
+use super::import::*;
+use super::schema::*;
 use crate::utils::progress;
 use flate2::read::GzDecoder;
-use rusqlite::{params, Connection, OpenFlags};
 use serde_json::Value;
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
-
-/// Current schema version — bump when adding tables or changing columns.
-const SCHEMA_VERSION: &str = "2";
-
-// ─── Path helpers ────────────────────────────────────────────────────
-
-/// Default vulndb path: `~/.scanrook/db/scanrook.db`
-pub fn vulndb_path() -> PathBuf {
-    if let Ok(p) = std::env::var("SCANROOK_DB") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".scanrook")
-        .join("db")
-        .join("scanrook.db")
-}
-
-/// Open the vulndb if it exists on disk. Returns None if absent or corrupt.
-pub fn open_vulndb() -> Option<Connection> {
-    let path = vulndb_path();
-    if !path.exists() {
-        return None;
-    }
-    Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
-}
-
-// ─── Schema ──────────────────────────────────────────────────────────
-
-const CREATE_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-
-CREATE TABLE IF NOT EXISTS osv_packages (ecosystem TEXT, name TEXT, PRIMARY KEY (ecosystem, name));
-
-CREATE TABLE IF NOT EXISTS osv_vulns (
-    id TEXT, ecosystem TEXT, name TEXT,
-    modified TEXT,
-    PRIMARY KEY (id, ecosystem, name)
-);
-CREATE INDEX IF NOT EXISTS idx_osv_eco_name ON osv_vulns (ecosystem, name);
-
-CREATE TABLE IF NOT EXISTS osv_payloads (
-    id TEXT PRIMARY KEY,
-    payload BLOB NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS nvd_cves (
-    cve_id TEXT PRIMARY KEY,
-    payload BLOB NOT NULL,
-    last_modified TEXT
-);
-
-CREATE TABLE IF NOT EXISTS epss_scores (cve_id TEXT PRIMARY KEY, score REAL, percentile REAL);
-
-CREATE TABLE IF NOT EXISTS kev_entries (cve_id TEXT PRIMARY KEY);
-
-CREATE TABLE IF NOT EXISTS debian_tracker (
-    cve_id TEXT, package TEXT, release TEXT,
-    status TEXT, urgency TEXT, fixed_version TEXT,
-    PRIMARY KEY (cve_id, package, release)
-);
-CREATE INDEX IF NOT EXISTS idx_debian_pkg_release ON debian_tracker (package, release);
-
-CREATE TABLE IF NOT EXISTS ubuntu_usn (
-    cve_id TEXT NOT NULL, package TEXT NOT NULL, release TEXT NOT NULL,
-    status TEXT, priority TEXT,
-    PRIMARY KEY (cve_id, package, release)
-);
-CREATE INDEX IF NOT EXISTS idx_ubuntu_pkg_release ON ubuntu_usn (package, release);
-
-CREATE TABLE IF NOT EXISTS alpine_secdb (
-    cve_id TEXT NOT NULL, package TEXT NOT NULL, branch TEXT NOT NULL,
-    repo TEXT NOT NULL, fixed_version TEXT,
-    PRIMARY KEY (cve_id, package, branch, repo)
-);
-CREATE INDEX IF NOT EXISTS idx_alpine_pkg_branch ON alpine_secdb (package, branch);
-"#;
-
-// ─── Query functions ─────────────────────────────────────────────────
-
-/// Get the build date from metadata.
-pub fn db_build_date(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'build_date'",
-        [],
-        |row| row.get(0),
-    )
-    .ok()
-}
-
-
-// ─── DB creation & import functions (for `db build`) ─────────────────
-
-/// Create a new empty vulndb at the given path with the full schema.
-pub fn create_db(path: &std::path::Path) -> anyhow::Result<Connection> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Remove existing file to start fresh
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    let conn = Connection::open(path)?;
-    // Use DELETE journal mode for bulk builds — WAL creates a separate file that can grow to 20GB+.
-    // After build completes, optimize_db() will switch to WAL for read performance.
-    conn.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-64000;")?;
-    conn.execute_batch(CREATE_SCHEMA)?;
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', ?1)",
-        params![SCHEMA_VERSION],
-    )?;
-    Ok(conn)
-}
-
-/// Import a single OSV ecosystem zip (one vuln per JSON file inside the zip).
-/// Returns the number of vulnerabilities imported.
-pub fn import_osv_ecosystem(
-    conn: &Connection,
-    ecosystem: &str,
-    zip_bytes: &[u8],
-) -> anyhow::Result<usize> {
-    let reader = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(reader)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        if file.is_dir() || !file.name().ends_with(".json") {
-            continue;
-        }
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        let val: Value = match serde_json::from_slice(&buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let vuln_id = val.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        if vuln_id.is_empty() {
-            continue;
-        }
-        let modified = val
-            .get("modified")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        // Store payload ONCE per vuln ID (not per package — saves 50-100x space)
-        // Strip unused fields to reduce payload size by ~50-70%
-        let stripped = strip_osv_unused_fields(&val);
-        let stripped_bytes = serde_json::to_vec(&stripped).unwrap_or_else(|_| buf.clone());
-        let compressed = compress_json(&stripped_bytes);
-        tx.execute(
-            "INSERT OR IGNORE INTO osv_payloads (id, payload) VALUES (?1, ?2)",
-            params![vuln_id, compressed],
-        )?;
-        // Extract affected packages — lightweight mapping rows only
-        let affected = val.get("affected").and_then(|a| a.as_array());
-        if let Some(affected_arr) = affected {
-            for aff in affected_arr {
-                let pkg = aff.get("package");
-                let pkg_eco = pkg
-                    .and_then(|p| p.get("ecosystem"))
-                    .and_then(|e| e.as_str())
-                    .unwrap_or(ecosystem);
-                let pkg_name = pkg
-                    .and_then(|p| p.get("name"))
-                    .and_then(|n| n.as_str())
-                    .unwrap_or_default();
-                if pkg_name.is_empty() {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT OR IGNORE INTO osv_packages (ecosystem, name) VALUES (?1, ?2)",
-                    params![pkg_eco, pkg_name],
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO osv_vulns (id, ecosystem, name, modified) VALUES (?1, ?2, ?3, ?4)",
-                    params![vuln_id, pkg_eco, pkg_name, modified],
-                )?;
-            }
-        }
-        count += 1;
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-/// Import NVD CVEs from a paginated API response JSON (the `vulnerabilities` array).
-/// Returns the number of CVEs imported.
-pub fn import_nvd_page(conn: &Connection, json_bytes: &[u8]) -> anyhow::Result<usize> {
-    let val: Value = serde_json::from_slice(json_bytes)?;
-    let vulns = val
-        .get("vulnerabilities")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("missing vulnerabilities array"))?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-    for item in vulns {
-        let cve = match item.get("cve") {
-            Some(c) => c,
-            None => continue,
-        };
-        let cve_id = cve.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-        if cve_id.is_empty() {
-            continue;
-        }
-        let last_mod = cve
-            .get("lastModified")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let payload = serde_json::to_vec(cve)?;
-        let compressed = compress_json(&payload);
-        tx.execute(
-            "INSERT OR REPLACE INTO nvd_cves (cve_id, payload, last_modified) VALUES (?1, ?2, ?3)",
-            params![cve_id, compressed, last_mod],
-        )?;
-        count += 1;
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-/// Import EPSS CSV data. The CSV has headers: cve,epss,percentile.
-/// Returns the number of scores imported.
-pub fn import_epss_csv(conn: &Connection, csv_bytes: &[u8]) -> anyhow::Result<usize> {
-    let text = std::str::from_utf8(csv_bytes)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-    for line in text.lines() {
-        // Skip comment lines and header
-        if line.starts_with('#') || line.starts_with("cve,") || line.trim().is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-        let cve_id = parts[0].trim();
-        let score: f64 = match parts[1].trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let percentile: f64 = match parts[2].trim().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        tx.execute(
-            "INSERT OR REPLACE INTO epss_scores (cve_id, score, percentile) VALUES (?1, ?2, ?3)",
-            params![cve_id, score, percentile],
-        )?;
-        count += 1;
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-/// Import KEV JSON (CISA catalog). Returns number of entries imported.
-pub fn import_kev_json(conn: &Connection, json_bytes: &[u8]) -> anyhow::Result<usize> {
-    let val: Value = serde_json::from_slice(json_bytes)?;
-    let vulns = val
-        .get("vulnerabilities")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("missing vulnerabilities array"))?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-    for item in vulns {
-        let cve_id = item
-            .get("cveID")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        if cve_id.is_empty() {
-            continue;
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO kev_entries (cve_id) VALUES (?1)",
-            params![cve_id],
-        )?;
-        count += 1;
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-/// Import Debian Security Tracker JSON. Returns number of entries imported.
-pub fn import_debian_tracker(conn: &Connection, json_bytes: &[u8]) -> anyhow::Result<usize> {
-    let val: Value = serde_json::from_slice(json_bytes)?;
-    let obj = val
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("expected JSON object"))?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-    // Debian tracker format: { "package_name": { "CVE-xxxx": { "releases": { "bookworm": { "status": ..., "urgency": ..., "fixed_version": ... } } } } }
-    for (pkg, cves_val) in obj {
-        let cves = match cves_val.as_object() {
-            Some(c) => c,
-            None => continue,
-        };
-        for (cve_id, info) in cves {
-            let releases = match info.get("releases").and_then(|r| r.as_object()) {
-                Some(r) => r,
-                None => continue,
-            };
-            for (release, details) in releases {
-                let status = details
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let urgency = details
-                    .get("urgency")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                let fixed_version = details
-                    .get("fixed_version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                tx.execute(
-                    "INSERT OR REPLACE INTO debian_tracker (cve_id, package, release, status, urgency, fixed_version) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![cve_id, pkg, release, status, urgency, fixed_version],
-                )?;
-                count += 1;
-            }
-        }
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-
-/// Import Alpine SecDB data for a specific branch and repo. Returns number of entries imported.
-pub fn import_alpine_secdb(
-    conn: &Connection,
-    branch: &str,
-    repo: &str,
-    json_bytes: &[u8],
-) -> anyhow::Result<usize> {
-    let val: Value = serde_json::from_slice(json_bytes)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut count = 0usize;
-
-    // Alpine SecDB format: { "packages": [ { "pkg": { "name": ..., "secfixes": { "version": ["CVE-..."] } } } ] }
-    let packages = val
-        .get("packages")
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
-    for pkg_entry in &packages {
-        let pkg = match pkg_entry.get("pkg") {
-            Some(p) => p,
-            None => continue,
-        };
-        let pkg_name = pkg.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-        if pkg_name.is_empty() {
-            continue;
-        }
-        let secfixes = match pkg.get("secfixes").and_then(|s| s.as_object()) {
-            Some(s) => s,
-            None => continue,
-        };
-        for (fixed_version, cves_val) in secfixes {
-            let cves = match cves_val.as_array() {
-                Some(c) => c,
-                None => continue,
-            };
-            for cve_val in cves {
-                let cve_id = cve_val.as_str().unwrap_or_default();
-                // Some entries are just comments or references, skip those
-                if cve_id.is_empty() || (!cve_id.starts_with("CVE-") && !cve_id.starts_with("XSA-"))
-                {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT OR REPLACE INTO alpine_secdb (cve_id, package, branch, repo, fixed_version) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![cve_id, pkg_name, branch, repo, fixed_version],
-                )?;
-                count += 1;
-            }
-        }
-    }
-    tx.commit()?;
-    Ok(count)
-}
-
-/// Set metadata key/value pair.
-pub fn set_metadata(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-/// VACUUM and optimize the database after bulk imports.
-pub fn optimize_db(conn: &Connection) -> anyhow::Result<()> {
-    // Skip VACUUM — it rewrites the entire multi-GB DB and can OOM nodes.
-    // The DB works fine without it, just slightly larger on disk.
-    conn.execute_batch("PRAGMA optimize; PRAGMA journal_mode=WAL;")?;
-    Ok(())
-}
-
-// ─── Build helpers ───────────────────────────────────────────────────
 
 /// Known OSV ecosystem GCS zip names mapped to our ecosystem identifiers.
 pub fn osv_ecosystem_zips() -> Vec<(&'static str, &'static str)> {
@@ -439,8 +37,13 @@ pub fn osv_ecosystem_zips() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// Alpine SecDB branches to fetch.
+pub fn alpine_branches() -> Vec<&'static str> {
+    vec!["v3.17", "v3.18", "v3.19", "v3.20", "v3.21", "edge"]
+}
+
 /// Download all OSV ecosystems from GCS and import them.
-pub fn build_osv(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_osv(conn: &rusqlite::Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
     let mut total = 0usize;
     for (eco_name, eco_id) in osv_ecosystem_zips() {
         let url = format!(
@@ -489,7 +92,7 @@ pub fn build_osv(conn: &Connection, client: &reqwest::blocking::Client) -> anyho
 
 /// Download all NVD CVEs via paginated API and import them.
 pub fn build_nvd(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     client: &reqwest::blocking::Client,
     api_key: Option<&str>,
 ) -> anyhow::Result<usize> {
@@ -514,7 +117,6 @@ pub fn build_nvd(
                 let bytes = resp.bytes()?;
                 let page_count = import_nvd_page(conn, &bytes)?;
                 total += page_count;
-                // Check if there are more pages
                 let val: Value = serde_json::from_slice(&bytes)?;
                 let total_results = val
                     .get("totalResults")
@@ -524,7 +126,6 @@ pub fn build_nvd(
                 if start_index >= total_results {
                     break;
                 }
-                // Rate limit: 0.6s with key, 6s without
                 let sleep_ms = if api_key.is_some() { 600 } else { 6000 };
                 std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
             }
@@ -536,7 +137,7 @@ pub fn build_nvd(
                         &format!("status={} sleeping 30s", status),
                     );
                     std::thread::sleep(std::time::Duration::from_secs(30));
-                    continue; // retry same page
+                    continue;
                 }
                 progress("vulndb.build.nvd.error", &format!("status={}", status));
                 break;
@@ -551,7 +152,7 @@ pub fn build_nvd(
 }
 
 /// Download EPSS CSV and import.
-pub fn build_epss(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_epss(conn: &rusqlite::Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
     let url = "https://epss.cyentia.com/epss_scores-current.csv.gz";
     progress("vulndb.build.epss.download", url);
     let resp = client.get(url).send()?;
@@ -568,7 +169,7 @@ pub fn build_epss(conn: &Connection, client: &reqwest::blocking::Client) -> anyh
 }
 
 /// Download KEV catalog and import.
-pub fn build_kev(conn: &Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
+pub fn build_kev(conn: &rusqlite::Connection, client: &reqwest::blocking::Client) -> anyhow::Result<usize> {
     let url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
     progress("vulndb.build.kev.download", url);
     let resp = client.get(url).send()?;
@@ -583,7 +184,7 @@ pub fn build_kev(conn: &Connection, client: &reqwest::blocking::Client) -> anyho
 
 /// Download Debian Security Tracker and import.
 pub fn build_debian(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     client: &reqwest::blocking::Client,
 ) -> anyhow::Result<usize> {
     let url = "https://security-tracker.debian.org/tracker/data/json";
@@ -600,12 +201,9 @@ pub fn build_debian(
 
 /// Download Ubuntu USN data and import.
 pub fn build_ubuntu(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     client: &reqwest::blocking::Client,
 ) -> anyhow::Result<usize> {
-    // Ubuntu Security Notices API — paginated, we fetch a reasonable amount
-    let url = "https://ubuntu.com/security/notices.json?limit=10000&offset=0";
-    progress("vulndb.build.ubuntu.download", url);
     let mut total = 0usize;
     let mut offset = 0u64;
     loop {
@@ -617,7 +215,6 @@ pub fn build_ubuntu(
             Ok(resp) if resp.status().is_success() => {
                 let bytes = resp.bytes()?;
                 let val: Value = serde_json::from_slice(&bytes)?;
-                // The API returns {"notices": [...], "total_results": N}
                 let notices = val.get("notices").and_then(|n| n.as_array());
                 if let Some(notices_arr) = notices {
                     if notices_arr.is_empty() {
@@ -673,7 +270,7 @@ pub fn build_ubuntu(
                                     }
                                     tx.execute(
                                         "INSERT OR REPLACE INTO ubuntu_usn (cve_id, package, release, status, priority) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                        params![cve_id, pkg_name, release, "fixed", priority],
+                                        rusqlite::params![cve_id, pkg_name, release, "fixed", priority],
                                     )?;
                                     total += 1;
                                 }
@@ -701,14 +298,9 @@ pub fn build_ubuntu(
     Ok(total)
 }
 
-/// Alpine SecDB branches to fetch.
-pub fn alpine_branches() -> Vec<&'static str> {
-    vec!["v3.17", "v3.18", "v3.19", "v3.20", "v3.21", "edge"]
-}
-
 /// Download Alpine SecDB and import.
 pub fn build_alpine(
-    conn: &Connection,
+    conn: &rusqlite::Connection,
     client: &reqwest::blocking::Client,
 ) -> anyhow::Result<usize> {
     let mut total = 0usize;
@@ -747,7 +339,7 @@ pub fn build_alpine(
     Ok(total)
 }
 
-/// Build the full vulndb — downloads all bulk sources and creates the SQLite file.
+/// Build the full vulndb -- downloads all bulk sources and creates the SQLite file.
 pub fn build_full_db(output: &str, nvd_api_key: Option<&str>) -> anyhow::Result<()> {
     let path = std::path::Path::new(output);
     let conn = create_db(path)?;
@@ -799,7 +391,7 @@ pub fn build_full_db(output: &str, nvd_api_key: Option<&str>) -> anyhow::Result<
     // Set metadata
     let build_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     set_metadata(&conn, "build_date", &build_date)?;
-    set_metadata(&conn, "schema_version", SCHEMA_VERSION)?;
+    set_metadata(&conn, "schema_version", super::schema::SCHEMA_VERSION)?;
     set_metadata(&conn, "osv_count", &osv_count.to_string())?;
     set_metadata(&conn, "nvd_count", &nvd_count.to_string())?;
     set_metadata(&conn, "epss_count", &epss_count.to_string())?;
@@ -846,7 +438,7 @@ pub fn build_full_db(output: &str, nvd_api_key: Option<&str>) -> anyhow::Result<
     Ok(())
 }
 
-/// Fetch the latest vulndb release from GitHub and install it.
+/// Fetch the latest vulndb release from the API and install it.
 pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     let db_path = vulndb_path();
 
@@ -920,7 +512,7 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
         ),
     );
 
-    // The API returns a presigned S3 URL — follow redirect and download
+    // The API returns a presigned S3 URL -- follow redirect and download
     let mut dl_resp = client.get(download_url).send()?;
     if !dl_resp.status().is_success() {
         anyhow::bail!("download failed: HTTP {}", dl_resp.status());
@@ -989,7 +581,6 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
             }
             tmp_file.write_all(&dbuf[..n])?;
             decompressed += n as u64;
-            // Estimate progress from compressed bytes consumed vs total
             let consumed = decoder.get_ref().position();
             let dpct = if gz_len > 0 {
                 ((consumed as f64 / gz_len as f64) * 100.0).min(100.0) as u8
@@ -1039,89 +630,3 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
-
-// ─── Compression helpers ─────────────────────────────────────────────
-
-/// Strip unused fields from OSV advisory JSON to reduce storage.
-/// Keeps: id, modified, summary, details, aliases, severity, references, affected, database_specific.severity
-/// Drops: published, withdrawn, schema_version, related, credits, affected[].versions,
-///        affected[].ecosystem_specific, affected[].database_specific, affected[].ranges[].repo, etc.
-fn strip_osv_unused_fields(val: &Value) -> Value {
-    let obj = match val.as_object() {
-        Some(o) => o,
-        None => return val.clone(),
-    };
-    let mut out = serde_json::Map::new();
-    // Keep only the fields the scanner actually reads
-    for key in &[
-        "id",
-        "modified",
-        "summary",
-        "details",
-        "aliases",
-        "severity",
-        "references",
-    ] {
-        if let Some(v) = obj.get(*key) {
-            out.insert(key.to_string(), v.clone());
-        }
-    }
-    // Keep database_specific.severity only
-    if let Some(db_spec) = obj.get("database_specific").and_then(|d| d.as_object()) {
-        if let Some(sev) = db_spec.get("severity") {
-            out.insert(
-                "database_specific".to_string(),
-                serde_json::json!({ "severity": sev }),
-            );
-        }
-    }
-    // Strip affected[] — keep package, ranges (with only type + events.fixed), drop versions/ecosystem_specific/etc
-    if let Some(affected) = obj.get("affected").and_then(|a| a.as_array()) {
-        let stripped_affected: Vec<Value> = affected
-            .iter()
-            .map(|aff| {
-                let mut stripped = serde_json::Map::new();
-                if let Some(pkg) = aff.get("package") {
-                    stripped.insert("package".to_string(), pkg.clone());
-                }
-                if let Some(ranges) = aff.get("ranges").and_then(|r| r.as_array()) {
-                    let stripped_ranges: Vec<Value> = ranges
-                        .iter()
-                        .map(|range| {
-                            let mut sr = serde_json::Map::new();
-                            if let Some(t) = range.get("type") {
-                                sr.insert("type".to_string(), t.clone());
-                            }
-                            if let Some(events) = range.get("events").and_then(|e| e.as_array()) {
-                                let stripped_events: Vec<Value> = events
-                                    .iter()
-                                    .filter_map(|e| {
-                                        if e.get("fixed").is_some() {
-                                            Some(e.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect();
-                                if !stripped_events.is_empty() {
-                                    sr.insert("events".to_string(), Value::Array(stripped_events));
-                                }
-                            }
-                            Value::Object(sr)
-                        })
-                        .collect();
-                    stripped.insert("ranges".to_string(), Value::Array(stripped_ranges));
-                }
-                Value::Object(stripped)
-            })
-            .collect();
-        out.insert("affected".to_string(), Value::Array(stripped_affected));
-    }
-    Value::Object(out)
-}
-
-fn compress_json(data: &[u8]) -> Vec<u8> {
-    // Use zstd level 3 — 30-40% smaller than gzip with faster compression
-    zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
-}
-
