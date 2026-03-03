@@ -335,6 +335,12 @@ pub fn build_binary_report(
         crate::vuln::pg_init_schema(c);
     }
 
+    // Create per-scan circuit breakers (one per API source, not static/shared)
+    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
+    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+
     // Go module OSV lookup via embedded buildinfo
     crate::progress::enter_stage("go_osv");
     {
@@ -353,7 +359,7 @@ pub fn build_binary_report(
                     source_name: None,
                 })
                 .collect();
-            let osv_results = osv_batch_query(&coords, &mut pg);
+            let osv_results = osv_batch_query(&coords, &mut pg, &osv_breaker);
             let go_findings = map_osv_results_to_findings(&coords, &osv_results);
             progress(
                 "binary.go.osv.done",
@@ -413,15 +419,15 @@ pub fn build_binary_report(
     crate::progress::enter_stage("nvd_enrich");
     {
         let nvd_started = std::time::Instant::now();
-        crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
+        crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg, &nvd_breaker);
         progress_timing("binary.enrich.nvd", nvd_started);
     }
 
     crate::progress::enter_stage("epss");
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &epss_breaker);
     crate::progress::enter_stage("kev");
-    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &kev_breaker);
 
     crate::progress::enter_stage("report");
     let mut report = Report {
@@ -451,6 +457,19 @@ pub fn build_binary_report(
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
+
+    // Collect warnings from tripped circuit breakers into report.summary.warnings
+    let all_breakers: [&crate::vuln::CircuitBreaker; 4] =
+        [&osv_breaker, &nvd_breaker, &epss_breaker, &kev_breaker];
+    for b in &all_breakers {
+        if b.is_open() {
+            report.summary.warnings.push(format!(
+                "{} unavailable — results may be incomplete (5 consecutive failures)",
+                b.source_name()
+            ));
+        }
+    }
+
     crate::progress::finish_pipeline();
     Some(report)
 }

@@ -245,13 +245,19 @@ pub fn build_container_report(
         crate::vuln::pg_init_schema(c);
     }
 
+    // Create per-scan circuit breakers (one per API source, not static/shared)
+    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
+    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+
     crate::progress::enter_stage("osv_query");
     progress(
         "container.osv.query.start",
         &format!("packages={}", packages.len()),
     );
     let osv_query_started = std::time::Instant::now();
-    let osv_results = osv_batch_query(&packages, &mut pg);
+    let osv_results = osv_batch_query(&packages, &mut pg, &osv_breaker);
     progress_timing("container.osv.query", osv_query_started);
     progress("container.osv.query.done", "ok");
     let mut findings_norm = map_osv_results_to_findings(&packages, &osv_results);
@@ -282,7 +288,7 @@ pub fn build_container_report(
                 "container.osv.rhel_supplement.start",
                 &format!("pkg_count={}", rhel_supp_pkgs.len()),
             );
-            let rhel_supp_results = osv_batch_query(&rhel_supp_pkgs, &mut pg);
+            let rhel_supp_results = osv_batch_query(&rhel_supp_pkgs, &mut pg, &osv_breaker);
             let mut supp_findings =
                 map_osv_results_to_findings(&rhel_supp_pkgs, &rhel_supp_results);
             let name_to_ecosystem: std::collections::HashMap<String, String> = packages
@@ -324,7 +330,7 @@ pub fn build_container_report(
         &format!("findings_pre_enrich={}", findings_norm.len()),
     );
     let osv_enrich_started = std::time::Instant::now();
-    crate::vuln::osv_enrich_findings(&mut findings_norm, &mut pg);
+    crate::vuln::osv_enrich_findings(&mut findings_norm, &mut pg, &osv_breaker);
     progress_timing("container.enrich.osv", osv_enrich_started);
     progress(
         "container.enrich.osv.done",
@@ -357,7 +363,7 @@ pub fn build_container_report(
             &format!("cves={}", unique.len()),
         );
         let nvd_enrich_started = std::time::Instant::now();
-        enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg);
+        enrich_findings_with_nvd(&mut findings_norm, nvd_api_key.as_deref(), &mut pg, &nvd_breaker);
         progress_timing("container.enrich.nvd", nvd_enrich_started);
         progress("container.enrich.nvd.done", "ok");
     } else {
@@ -577,9 +583,9 @@ pub fn build_container_report(
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
     crate::progress::enter_stage("epss");
-    crate::vuln::epss_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref(), &epss_breaker);
     crate::progress::enter_stage("kev");
-    crate::vuln::kev_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref());
+    crate::vuln::kev_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref(), &kev_breaker);
 
     crate::progress::enter_stage("report");
     let (scan_status, inventory_status, inventory_reason) =
@@ -596,6 +602,19 @@ pub fn build_container_report(
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
+
+    // Collect warnings from tripped circuit breakers into report.summary.warnings
+    let all_breakers: [&crate::vuln::CircuitBreaker; 4] =
+        [&osv_breaker, &nvd_breaker, &epss_breaker, &kev_breaker];
+    for b in &all_breakers {
+        if b.is_open() {
+            report.summary.warnings.push(format!(
+                "{} unavailable — results may be incomplete (5 consecutive failures)",
+                b.source_name()
+            ));
+        }
+    }
+
     crate::progress::finish_pipeline();
     Some(report)
 }

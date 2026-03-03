@@ -113,22 +113,41 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
     if let Some(c) = pg.as_mut() {
         crate::vuln::pg_init_schema(c);
     }
+
+    // Create per-scan circuit breakers (one per API source, not static/shared)
+    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
+    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+
     let osv_started = std::time::Instant::now();
-    let osv_results = osv_batch_query(&packages, &mut pg);
+    let osv_results = osv_batch_query(&packages, &mut pg, &osv_breaker);
     progress_timing("dmg.osv.query", osv_started);
 
     let mut findings = map_osv_results_to_findings(&packages, &osv_results);
 
-    osv_enrich_findings(&mut findings, &mut pg);
-    enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
+    osv_enrich_findings(&mut findings, &mut pg, &osv_breaker);
+    enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg, &nvd_breaker);
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
-    kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &epss_breaker);
+    kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &kev_breaker);
 
     findings.extend(binary_findings);
 
-    let summary = compute_summary(&findings);
+    let mut summary = compute_summary(&findings);
+
+    // Collect warnings from tripped circuit breakers into summary.warnings
+    let all_breakers: [&crate::vuln::CircuitBreaker; 4] =
+        [&osv_breaker, &nvd_breaker, &epss_breaker, &kev_breaker];
+    for b in &all_breakers {
+        if b.is_open() {
+            summary.warnings.push(format!(
+                "{} unavailable — results may be incomplete (5 consecutive failures)",
+                b.source_name()
+            ));
+        }
+    }
     progress_timing("dmg.scan", started);
 
     Some(Report {

@@ -61,11 +61,14 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     if let Some(c) = pg.as_mut() {
         crate::vuln::pg_init_schema(c);
     }
-    crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg);
+    let nvd_breaker_src = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker_src = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker_src = crate::vuln::CircuitBreaker::new("kev", 5);
+    crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg, &nvd_breaker_src);
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
-    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &epss_breaker_src);
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &kev_breaker_src);
 
     let mut report = Report {
         scanner,
@@ -133,6 +136,8 @@ pub fn scan_source_tarball(
     } else {
         None
     };
+    let epss_breaker_scan = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker_scan = crate::vuln::CircuitBreaker::new("kev", 5);
 
     match format {
         OutputFormat::Text => {
@@ -141,8 +146,8 @@ pub fn scan_source_tarball(
         }
         OutputFormat::Json => {
             let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-            crate::vuln::epss_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref());
-            crate::vuln::kev_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref());
+            crate::vuln::epss_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref(), &epss_breaker_scan);
+            crate::vuln::kev_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref(), &kev_breaker_scan);
 
             let scanner = ScannerInfo {
                 name: "scanrook",

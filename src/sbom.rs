@@ -35,6 +35,12 @@ pub fn build_sbom_report(
         crate::vuln::pg_init_schema(c);
     }
 
+    // Create per-scan circuit breakers (one per API source, not static/shared)
+    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
+    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
+    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+
     let mut findings = if parsed.packages.is_empty() {
         Vec::new()
     } else {
@@ -42,14 +48,14 @@ pub fn build_sbom_report(
             "sbom.osv.query.start",
             &format!("packages={}", parsed.packages.len()),
         );
-        let osv_results = osv_batch_query(&parsed.packages, &mut pg);
+        let osv_results = osv_batch_query(&parsed.packages, &mut pg, &osv_breaker);
         let mut rows = map_osv_results_to_findings(&parsed.packages, &osv_results);
 
         crate::utils::progress(
             "sbom.enrich.osv.start",
             &format!("findings_pre_enrich={}", rows.len()),
         );
-        osv_enrich_findings(&mut rows, &mut pg);
+        osv_enrich_findings(&mut rows, &mut pg, &osv_breaker);
 
         let nvd_enabled = std::env::var("SCANNER_NVD_ENRICH")
             .map(|v| v != "0")
@@ -59,7 +65,7 @@ pub fn build_sbom_report(
                 "sbom.enrich.nvd.start",
                 &format!("findings_pre_nvd={}", rows.len()),
             );
-            enrich_findings_with_nvd(&mut rows, nvd_api_key.as_deref(), &mut pg);
+            enrich_findings_with_nvd(&mut rows, nvd_api_key.as_deref(), &mut pg, &nvd_breaker);
         } else {
             crate::utils::progress("sbom.enrich.nvd.skip", "disabled by SCANNER_NVD_ENRICH");
         }
@@ -88,10 +94,22 @@ pub fn build_sbom_report(
     });
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
-    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref());
+    crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &epss_breaker);
+    crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &kev_breaker);
 
-    let summary = compute_summary(&findings);
+    let mut summary = compute_summary(&findings);
+
+    // Collect warnings from tripped circuit breakers into summary.warnings
+    let all_breakers: [&crate::vuln::CircuitBreaker; 4] =
+        [&osv_breaker, &nvd_breaker, &epss_breaker, &kev_breaker];
+    for b in &all_breakers {
+        if b.is_open() {
+            summary.warnings.push(format!(
+                "{} unavailable — results may be incomplete (5 consecutive failures)",
+                b.source_name()
+            ));
+        }
+    }
     let (scan_status, inventory_status, inventory_reason) = if parsed.packages.is_empty() {
         (
             ScanStatus::Unsupported,
