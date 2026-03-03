@@ -1,3 +1,16 @@
+---
+gsd_state_version: 1.0
+milestone: v1.8
+milestone_name: milestone
+status: unknown
+last_updated: "2026-03-03T16:55:08.008Z"
+progress:
+  total_phases: 8
+  completed_phases: 1
+  total_plans: 6
+  completed_plans: 5
+---
+
 # Project State
 
 ## Project Reference
@@ -10,9 +23,9 @@ See: .planning/PROJECT.md (updated 2026-03-02)
 ## Current Position
 
 Phase: 2 of 6 (DB-First Enrichment Pipeline)
-Plan: 3 of 4 in current phase (COMPLETE)
-Status: Phase 02 Plan 03 Complete
-Last activity: 2026-03-03 — Completed 02-03 EPSS and KEV PG cache support (caller-provided pg, cluster/standalone separation, all 10 call sites updated)
+Plan: 2 of 4 in current phase (COMPLETE — Plan 03 also complete, see below)
+Status: Phase 02 Plans 01/02/03 Complete
+Last activity: 2026-03-03 — Completed 02-02 OSV batch query PG cache (cluster mode checks osv_batch_chunk_cache, standalone uses file cache, jittered TTL)
 
 Progress: [█████░░░░░] 50%
 
@@ -35,6 +48,8 @@ Progress: [█████░░░░░] 50%
 - Trend: Phase 2 plans are fast (focused enrichment pipeline changes)
 
 *Updated after each plan completion*
+
+| Phase 02 P02 | 10min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -68,6 +83,9 @@ Recent decisions affecting current work:
 - KEV cluster-mode returns early on PG hit (avoids file-cache/API fallback when PG has fresh data)
 - cli/db.rs seed path uses &mut None (benchmark/seed path should not incur PG overhead)
 - Promoted pg to outer scope in sbom.rs and binary.rs (both had pg inside inner blocks unreachable by post-block epss/kev calls)
+- [Phase 02]: PG check in osv_batch_query happens before retry loop — cache hits never count as retry attempts
+- [Phase 02]: File cache skipped entirely in cluster mode (gated by !cluster_mode()) — not just bypassed
+- [Phase 02]: pg helpers promoted to pub(crate) so osv/batch.rs submodule can access crate::vuln::pg directly
 
 ### Pending Todos
 
@@ -83,5 +101,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Phase 2 plan 03 complete (EPSS/KEV PG cache support, all call sites updated, 52/52 tests pass)
+Stopped at: Phase 2 plan 02 complete (OSV batch PG cache support in batch.rs, call sites verified, 52/52 tests pass)
 Resume file: .planning/phases/02-db-first-enrichment-pipeline/02-04-PLAN.md

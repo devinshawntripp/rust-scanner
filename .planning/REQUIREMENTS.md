@@ -14,11 +14,11 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Enrichment Pipeline
 
-- [ ] **ENRICH-01**: Scanner checks PostgreSQL cache before making any live OSV API call
+- [x] **ENRICH-01**: Scanner checks PostgreSQL cache before making any live OSV API call
 - [x] **ENRICH-02**: Scanner checks PostgreSQL cache before making any live NVD API call
 - [x] **ENRICH-03**: Scanner stores all API responses back to PostgreSQL after fetching
 - [x] **ENRICH-04**: Scanner uses file cache -> PG -> live API fallback chain (check file first, then PG, then live)
-- [ ] **ENRICH-05**: Scanner with existing PG enrichment data does not make redundant live API calls for cached CVEs
+- [x] **ENRICH-05**: Scanner with existing PG enrichment data does not make redundant live API calls for cached CVEs
 - [ ] **ENRICH-06**: PG cache entries have a revalidation timestamp — scanner re-fetches when data is stale, not every time
 
 ### RHEL/Rocky Scanning
@@ -40,7 +40,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 - [ ] **INFR-01**: Daily CronJob downloads bulk data from OSV, NVD, EPSS, KEV, Debian, Ubuntu, Alpine into PostgreSQL
 - [ ] **INFR-02**: CronJob exports zstd-compressed SQLite DB to MinIO for standalone CLI users to download
-- [ ] **INFR-03**: Clean separation between standalone mode (file cache only) and cluster mode (PG + Redis) with no cross-contamination
+- [x] **INFR-03**: Clean separation between standalone mode (file cache only) and cluster mode (PG + Redis) with no cross-contamination
 - [ ] **INFR-04**: CronJob preserves all payload fields the scanner needs — no stripping that causes format mismatches
 
 ### UI/Worker
@@ -84,11 +84,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | SCAN-01 | Phase 4 | Pending |
 | SCAN-02 | Phase 2 | Pending |
-| ENRICH-01 | Phase 2 | Pending |
+| ENRICH-01 | Phase 2 | Complete |
 | ENRICH-02 | Phase 2 | Complete |
 | ENRICH-03 | Phase 2 | Complete |
 | ENRICH-04 | Phase 2 | Complete |
-| ENRICH-05 | Phase 2 | Pending |
+| ENRICH-05 | Phase 2 | Complete |
 | ENRICH-06 | Phase 2 | Pending |
 | RHEL-01 | Phase 3 | Pending |
 | RHEL-02 | Phase 3 | Pending |
@@ -101,7 +101,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | QUAL-06 | Phase 1 | Complete |
 | INFR-01 | Phase 5 | Pending |
 | INFR-02 | Phase 5 | Pending |
-| INFR-03 | Phase 2 | Pending |
+| INFR-03 | Phase 2 | Complete |
 | INFR-04 | Phase 5 | Pending |
 | UIWK-01 | Phase 6 | Pending |
 | UIWK-02 | Phase 6 | Pending |
