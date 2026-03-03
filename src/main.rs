@@ -15,8 +15,8 @@ mod vuln;
 mod vulndb;
 
 use crate::cli::{
-    build_scan_report_value, nudge_seed_if_empty, resolve_yara_rules,
-    run_benchmark, run_db, run_diff, set_dir_permissions_0700, strip_references_in_findings,
+    build_scan_report_value, nudge_seed_if_empty, resolve_yara_rules, run_benchmark, run_db,
+    run_diff, run_sbom, run_upgrade, set_dir_permissions_0700, strip_references_in_findings,
 };
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -104,7 +104,7 @@ pub enum DbSource {
 }
 
 #[derive(Subcommand)]
-enum SbomCommands {
+pub(crate) enum SbomCommands {
     /// Import and scan an SBOM (CycloneDX JSON, SPDX JSON, or Syft JSON)
     Import {
         /// Path to SBOM JSON
@@ -715,239 +715,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Sbom { command } => match command {
-            SbomCommands::Import {
-                file,
-                format,
-                out,
-                mode,
-                refs,
-            } => {
-                std::env::set_var("SCANNER_OSV_ENRICH", "1");
-                if std::env::var("SCANNER_NVD_ENRICH").is_err() {
-                    let nvd_on = if nvd_api_key.is_some() { "1" } else { "0" };
-                    std::env::set_var("SCANNER_NVD_ENRICH", nvd_on);
-                }
-                progress("sbom.scan.start", &file);
-                if let Some(mut report) = sbom::build_sbom_report(&file, mode, nvd_api_key.clone())
-                    .and_then(|r| serde_json::to_value(r).ok())
-                {
-                    if !refs {
-                        strip_references_in_findings(&mut report);
-                    }
-                    let summary = report
-                        .get("summary")
-                        .and_then(|s| s.as_object())
-                        .and_then(|o| o.get("total_findings"))
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    progress(
-                        "sbom.scan.done",
-                        &format!("file={} findings={}", file, summary),
-                    );
-                    utils::progress_panel_finish(&format!(
-                        "sbom import complete findings={}",
-                        summary
-                    ));
-
-                    let text = if matches!(format, OutputFormat::Json) {
-                        serde_json::to_string_pretty(&report).unwrap()
-                    } else {
-                        format!("{}", report)
-                    };
-                    println!("{}", text);
-                    utils::write_output_if_needed(&out, &text);
-                } else {
-                    progress("sbom.scan.error", &file);
-                    utils::progress_panel_finish("sbom import failed");
-                    eprintln!("failed to import SBOM: {}", file);
-                    std::process::exit(1);
-                }
-            }
-            SbomCommands::Diff {
-                baseline,
-                current,
-                json,
-                out,
-            } => {
-                let diff = match sbom::build_sbom_diff(&baseline, &current) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("sbom diff failed: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                if json {
-                    let payload = serde_json::to_string_pretty(&diff).unwrap_or_default();
-                    println!("{}", payload);
-                    utils::write_output_if_needed(&out, &payload);
-                } else {
-                    println!(
-                        "sbom_diff baseline={} current={} baseline_pkgs={} current_pkgs={} added={} removed={} changed={}",
-                        baseline,
-                        current,
-                        diff.summary.baseline_packages,
-                        diff.summary.current_packages,
-                        diff.summary.added,
-                        diff.summary.removed,
-                        diff.summary.changed
-                    );
-                    for c in diff.changed.iter().take(20) {
-                        println!(
-                            "changed\t{}\t{}\t{} -> {}",
-                            c.ecosystem, c.name, c.from_version, c.to_version
-                        );
-                    }
-                    for a in diff.added.iter().take(20) {
-                        println!("added\t{}\t{}\t{}", a.ecosystem, a.name, a.version);
-                    }
-                    for r in diff.removed.iter().take(20) {
-                        println!("removed\t{}\t{}\t{}", r.ecosystem, r.name, r.version);
-                    }
-                }
-            }
-            SbomCommands::Policy {
-                policy,
-                diff,
-                report,
-            } => {
-                let pol = match sbom::load_policy(&policy) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("failed to load policy: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let diff_json: sbom::SbomDiff = match std::fs::read_to_string(&diff)
-                    .map_err(|e| anyhow::anyhow!("{}", e))
-                    .and_then(|s| serde_json::from_str(&s).map_err(|e| anyhow::anyhow!("{}", e)))
-                {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("failed to parse diff JSON: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let report_value: Option<serde_json::Value> = report.and_then(|p| {
-                    std::fs::read_to_string(&p)
-                        .ok()
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                });
-                let result = sbom::check_policy_from_value(&pol, &diff_json, report_value.as_ref());
-                let output = serde_json::to_string_pretty(&result).unwrap_or_default();
-                println!("{}", output);
-                if !result.passed {
-                    std::process::exit(1);
-                }
-            }
-        },
+        Commands::Sbom { command } => {
+            run_sbom(command, nvd_api_key.clone());
+        }
         Commands::Upgrade { check } => {
-            let current = env!("CARGO_PKG_VERSION");
-            let repo = "devinshawntripp/rust-scanner";
-            let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
-            let client = reqwest::blocking::Client::builder()
-                .user_agent(format!("scanrook-cli/{}", current))
-                .timeout(std::time::Duration::from_secs(15))
-                .build()
-                .expect("failed to build HTTP client");
-            let resp = match client.get(&url).send() {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("Failed to check for updates: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let body: serde_json::Value = match resp.json() {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("Failed to parse release metadata: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let latest = body["tag_name"]
-                .as_str()
-                .unwrap_or("")
-                .trim_start_matches('v');
-            if latest.is_empty() {
-                eprintln!("No published release found for {}", repo);
+            if let Err(e) = run_upgrade(check) {
+                eprintln!("upgrade failed: {}", e);
                 std::process::exit(1);
             }
-            if latest == current {
-                println!("scanrook {} is already up to date", current);
-                std::process::exit(0);
-            }
-            println!("Current version: {}", current);
-            println!("Latest version:  {}", latest);
-            if check {
-                println!("Update available. Run `scanrook upgrade` to install.");
-                std::process::exit(0);
-            }
-            // Determine platform
-            let os = if cfg!(target_os = "macos") {
-                "darwin"
-            } else {
-                "linux"
-            };
-            let arch = if cfg!(target_arch = "aarch64") {
-                "arm64"
-            } else {
-                "amd64"
-            };
-            let asset = format!("scanrook-{}-{}-{}.tar.gz", latest, os, arch);
-            let asset_url = format!(
-                "https://github.com/{}/releases/download/v{}/{}",
-                repo, latest, asset
-            );
-            println!("Downloading {} ...", asset);
-            let dl = match client.get(&asset_url).send() {
-                Ok(r) if r.status().is_success() => r.bytes().unwrap_or_default(),
-                Ok(r) => {
-                    eprintln!("Download failed: HTTP {}", r.status());
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Download failed: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            // Extract tarball to temp dir
-            let tmp = tempfile::tempdir().expect("failed to create temp dir");
-            let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&dl));
-            let mut archive = tar::Archive::new(gz);
-            if let Err(e) = archive.unpack(tmp.path()) {
-                eprintln!("Failed to extract archive: {}", e);
-                std::process::exit(1);
-            }
-            let new_bin = tmp.path().join("scanrook");
-            if !new_bin.exists() {
-                eprintln!("Archive missing scanrook binary");
-                std::process::exit(1);
-            }
-            // Replace current binary
-            let current_exe =
-                std::env::current_exe().expect("cannot determine current executable path");
-            let backup = current_exe.with_extension("old");
-            if let Err(e) = std::fs::rename(&current_exe, &backup) {
-                eprintln!("Failed to backup current binary: {}", e);
-                eprintln!("Try running with sudo: sudo scanrook upgrade");
-                std::process::exit(1);
-            }
-            if let Err(e) = std::fs::copy(&new_bin, &current_exe) {
-                // Restore backup
-                let _ = std::fs::rename(&backup, &current_exe);
-                eprintln!("Failed to install new binary: {}", e);
-                eprintln!("Try running with sudo: sudo scanrook upgrade");
-                std::process::exit(1);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&current_exe, std::fs::Permissions::from_mode(0o755));
-            }
-            let _ = std::fs::remove_file(&backup);
-            println!("Upgraded scanrook {} -> {}", current, latest);
         }
     }
 }
