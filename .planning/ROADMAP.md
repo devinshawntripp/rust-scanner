@@ -89,7 +89,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Code Audit and Module Refactor | 0/2 | Not started | - |
+| 1. Code Audit and Module Refactor | 1/2 | In progress | - |
 | 2. DB-First Enrichment Pipeline | 0/TBD | Not started | - |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
 | 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |
