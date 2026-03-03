@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-03-02)
 ## Current Position
 
 Phase: 1 of 6 (Code Audit and Module Refactor)
-Plan: 1 of 2 in current phase
-Status: Executing
-Last activity: 2026-03-03 — Completed 01-01 dead code audit (53 warnings -> 0)
+Plan: 2 of 2 in current phase (COMPLETE)
+Status: Phase 01 Complete
+Last activity: 2026-03-03 — Completed 01-02 module splits (9 modules split, all under 800 lines)
 
-Progress: [█░░░░░░░░░] 8%
+Progress: [██░░░░░░░░] 17%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 12min
-- Total execution time: 0.2 hours
+- Total plans completed: 2
+- Average duration: 33min
+- Total execution time: 1.1 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01 | 1 | 12min | 12min |
+| 01 | 2 | 66min | 33min |
 
 **Recent Trend:**
-- Last 5 plans: 12min
-- Trend: N/A (first plan)
+- Last 5 plans: 12min, 54min
+- Trend: Second plan larger scope (10 splits vs 1 audit)
 
 *Updated after each plan completion*
 
@@ -46,6 +46,10 @@ Recent decisions affecting current work:
 - Sibling submodule re-exports split into production (use) and test-only (#[cfg(test)] use) in vuln/mod.rs
 - All production unwrap/expect calls assessed as provably safe -- no conversions needed
 - Regex OnceLock conversion deferred -- no hot-path compilations found
+- main.rs split by extracting upgrade and sbom handlers to cli/ (953 -> 728 lines)
+- Directory module pattern: flat .rs -> directory/ with mod.rs for files over 800 lines
+- Minimal re-exports: only pub use items actually used externally to avoid warnings
+- Container scan split as sibling files (cli.rs, source.rs) rather than subdirectory
 - Refactor before feature work: monolithic modules and dead code make bug fixes risky
 - DB-first enrichment: 5GB of data exists in PG but scanner still hits live APIs on every scan
 - osv_batch_query() in src/vuln/osv.rs has zero PG cache support — this is the #1 bug, fixed in Phase 2
@@ -63,12 +67,12 @@ Recent decisions affecting current work:
 
 ### Blockers/Concerns
 
-- vuln/redhat_enrich.rs is 1,858 lines — the largest single file to tackle in Phase 1
+- (RESOLVED) vuln/redhat_enrich.rs split into inject.rs (700), cve_enrich.rs (519), helpers.rs (456)
 - Three RHEL codepaths have overlapping but non-identical results; regression risk is high without Phase 1 refactor complete before Phase 3
 - INFR-04 (cronjob payload stripping) — the Python cronjob strips fields from OSV/NVD payloads; this must be verified and fixed in Phase 5 or the PG cache will contain broken data
 
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Completed 01-01-PLAN.md
+Stopped at: Completed 01-02-PLAN.md (Phase 01 complete)
 Resume file: None

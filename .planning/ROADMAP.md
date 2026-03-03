@@ -6,7 +6,7 @@ This milestone refactors and stabilizes ScanRook's vulnerability enrichment engi
 
 ## Phases
 
-- [ ] **Phase 1: Code Audit and Module Refactor** - Remove dead code, break up monolithic modules so subsequent bug fixes are safe to make
+- [x] **Phase 1: Code Audit and Module Refactor** - Remove dead code, break up monolithic modules so subsequent bug fixes are safe to make
 - [ ] **Phase 2: DB-First Enrichment Pipeline** - Fix the #1 bug: scanner checks PostgreSQL before any live API call, with HTTP timeouts and clean standalone/cluster separation
 - [ ] **Phase 3: RHEL/Rocky Consolidation** - Unify three fragmented RHEL enrichment codepaths into one accurate, deduplicated pipeline
 - [ ] **Phase 4: Multi-Format Scanning Reliability** - Scanner handles all image types (ISO, DMG, OCI, docker-save) without crashing or hanging
@@ -26,8 +26,8 @@ This milestone refactors and stabilizes ScanRook's vulnerability enrichment engi
   4. `cargo test` passes without regression after all restructuring
 **Plans**: 2 plans
 Plans:
-- [ ] 01-01-PLAN.md — Dead code audit: remove all unused functions, structs, imports; fix dangerous unwraps
-- [ ] 01-02-PLAN.md — Module splits: break all >800-line files into focused submodules
+- [x] 01-01-PLAN.md — Dead code audit: remove all unused functions, structs, imports; fix dangerous unwraps
+- [x] 01-02-PLAN.md — Module splits: break all >800-line files into focused submodules
 
 ### Phase 2: DB-First Enrichment Pipeline
 **Goal**: Every scan checks the PostgreSQL cache before making any live API call, stores all API responses back to PG, and uses strict standalone/cluster mode separation with no cross-contamination — with no infinite hangs on API failures
@@ -89,7 +89,7 @@ Plans:
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Code Audit and Module Refactor | 1/2 | In progress | - |
+| 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
 | 2. DB-First Enrichment Pipeline | 0/TBD | Not started | - |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
 | 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |

@@ -29,7 +29,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Code Quality
 
-- [ ] **QUAL-01**: vuln.rs broken into focused submodules, each under 800 lines
+- [x] **QUAL-01**: vuln.rs broken into focused submodules, each under 800 lines
 - [ ] **QUAL-02**: Version comparison logic (cmp_versions, is_version_in_range) has unit tests covering edge cases
 - [ ] **QUAL-03**: CPE matching logic (cpe_parts, nvd_findings_by_product_version) has unit tests
 - [ ] **QUAL-04**: OVAL evaluation (compare_evr, evaluate_oval_for_packages) has unit tests
@@ -93,7 +93,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | RHEL-01 | Phase 3 | Pending |
 | RHEL-02 | Phase 3 | Pending |
 | RHEL-03 | Phase 3 | Pending |
-| QUAL-01 | Phase 1 | Pending |
+| QUAL-01 | Phase 1 | Complete |
 | QUAL-02 | Phase 5 | Pending |
 | QUAL-03 | Phase 5 | Pending |
 | QUAL-04 | Phase 5 | Pending |
@@ -114,4 +114,4 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 ---
 *Requirements defined: 2026-03-02*
-*Last updated: 2026-03-02 — traceability table completed, all 24 requirements mapped across 6 phases*
+*Last updated: 2026-03-03 — QUAL-01 marked complete (module splits done in 01-02)*
