@@ -469,12 +469,11 @@ pub fn resolve_enrich_cache_dir() -> Option<PathBuf> {
 
 /// Compute a TTL in days with a random jitter to prevent thundering herd
 /// cache invalidation. Returns `(base_days + jitter).max(1)`.
-#[allow(dead_code)]
 ///
 /// # Arguments
 /// * `base_days`   — The nominal TTL (e.g. 30 for monthly refresh)
 /// * `jitter_days` — Maximum absolute jitter (e.g. 7 for ±7 days)
-pub(super) fn compute_jittered_ttl_days(base_days: i64, jitter_days: i64) -> i64 {
+pub(crate) fn compute_jittered_ttl_days(base_days: i64, jitter_days: i64) -> i64 {
     let jitter = rand::thread_rng().gen_range(-jitter_days..=jitter_days);
     (base_days + jitter).max(1)
 }
@@ -486,8 +485,7 @@ pub(super) fn compute_jittered_ttl_days(base_days: i64, jitter_days: i64) -> i64
 /// Retrieve a cached OSV batch query response for a sorted chunk of package
 /// coordinates identified by `digest` (SHA256 of the sorted package list).
 /// Returns None when the entry is missing or older than `ttl_days`.
-#[allow(dead_code)]
-pub(super) fn pg_get_osv_batch_chunk(
+pub(crate) fn pg_get_osv_batch_chunk(
     client: &mut PgClient,
     digest: &str,
     ttl_days: i64,
@@ -505,8 +503,7 @@ pub(super) fn pg_get_osv_batch_chunk(
 }
 
 /// Upsert an OSV batch chunk response into the cache.
-#[allow(dead_code)]
-pub(super) fn pg_put_osv_batch_chunk(client: &mut PgClient, digest: &str, payload: &Value) {
+pub(crate) fn pg_put_osv_batch_chunk(client: &mut PgClient, digest: &str, payload: &Value) {
     let res = client.execute(
         "INSERT INTO osv_batch_chunk_cache (chunk_digest, payload, last_checked_at) \
          VALUES ($1, $2, NOW()) \

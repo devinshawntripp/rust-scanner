@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use postgres::Client as PgClient;
 use serde_json::Value;
 
 use crate::cache::{cache_get, cache_key, cache_put};
@@ -9,8 +10,15 @@ use crate::utils::progress;
 use super::super::http::build_http_client;
 use super::super::pg::resolve_enrich_cache_dir;
 
-/// Batch query OSV with package coordinates. Returns a JSON value (array of results)
-pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
+/// Batch query OSV with package coordinates. Returns a JSON value (array of results).
+///
+/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the `osv_batch_chunk_cache` PostgreSQL
+/// table before making any API calls. Successful API responses are written back to PG.
+/// In standalone mode, the existing file-cache path is used unchanged.
+pub fn osv_batch_query(
+    packages: &Vec<PackageCoordinate>,
+    pg: &mut Option<PgClient>,
+) -> serde_json::Value {
     if packages.is_empty() {
         return serde_json::json!([]);
     }
@@ -75,28 +83,51 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
             ),
         );
 
+        // Cluster mode: check PG chunk cache BEFORE the retry loop (outside attempt counting)
+        if crate::vuln::cluster_mode() {
+            if let Some(c) = pg.as_mut() {
+                let ttl = crate::vuln::pg::compute_jittered_ttl_days(30, 7);
+                if let Some(cached) = crate::vuln::pg::pg_get_osv_batch_chunk(c, &body_digest, ttl) {
+                    if let Some(arr) = cached["results"].as_array() {
+                        for (idx_in_chunk, item) in arr.iter().enumerate() {
+                            if idx_in_chunk < chunk.len() {
+                                results[chunk[idx_in_chunk].0] = item.clone();
+                            }
+                        }
+                        progress(
+                            "osv.query.chunk.pg_cache",
+                            &format!("digest={}", &body_digest[..8.min(body_digest.len())]),
+                        );
+                        continue; // skip to next chunk
+                    }
+                }
+            }
+        }
+
         let mut attempt = 0;
         let mut done = false;
         while attempt < retries && !done {
             attempt += 1;
-            // Try cache for this chunk first
-            if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
-                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                    if let Some(arr) = v["results"].as_array() {
-                        for (idx_in_chunk, item) in arr.iter().enumerate() {
-                            let orig_idx = chunk[idx_in_chunk].0;
-                            results[orig_idx] = item.clone();
+            // In standalone mode: try file cache for this chunk first
+            if !crate::vuln::cluster_mode() {
+                if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(arr) = v["results"].as_array() {
+                            for (idx_in_chunk, item) in arr.iter().enumerate() {
+                                let orig_idx = chunk[idx_in_chunk].0;
+                                results[orig_idx] = item.clone();
+                            }
+                            progress(
+                                "osv.query.chunk.cache",
+                                &format!(
+                                    "offset={} size={}",
+                                    chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                                    chunk.len()
+                                ),
+                            );
+                            done = true;
+                            break;
                         }
-                        progress(
-                            "osv.query.chunk.cache",
-                            &format!(
-                                "offset={} size={}",
-                                chunk.first().map(|(i, _)| i).unwrap_or(&0),
-                                chunk.len()
-                            ),
-                        );
-                        done = true;
-                        break;
                     }
                 }
             }
@@ -130,11 +161,22 @@ pub fn osv_batch_query(packages: &Vec<PackageCoordinate>) -> serde_json::Value {
                                             let orig_idx = chunk[idx_in_chunk].0;
                                             results[orig_idx] = item.clone();
                                         }
-                                        cache_put(
-                                            cache_dir.as_deref(),
-                                            &cache_tag,
-                                            v.to_string().as_bytes(),
-                                        );
+                                        // Write back to appropriate cache based on mode
+                                        if crate::vuln::cluster_mode() {
+                                            if let Some(c) = pg.as_mut() {
+                                                crate::vuln::pg::pg_put_osv_batch_chunk(
+                                                    c,
+                                                    &body_digest,
+                                                    &v,
+                                                );
+                                            }
+                                        } else {
+                                            cache_put(
+                                                cache_dir.as_deref(),
+                                                &cache_tag,
+                                                v.to_string().as_bytes(),
+                                            );
+                                        }
                                         progress(
                                             "osv.query.chunk.done",
                                             &format!(
