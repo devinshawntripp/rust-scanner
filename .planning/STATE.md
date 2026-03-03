@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-03-02)
 ## Current Position
 
 Phase: 2 of 6 (DB-First Enrichment Pipeline)
-Plan: 1 of 4 in current phase (COMPLETE)
-Status: Phase 02 Plan 01 Complete
-Last activity: 2026-03-03 — Completed 02-01 foundation infrastructure (CircuitBreaker, PG schema, jittered TTL, Summary.warnings)
+Plan: 3 of 4 in current phase (COMPLETE)
+Status: Phase 02 Plan 03 Complete
+Last activity: 2026-03-03 — Completed 02-03 EPSS and KEV PG cache support (caller-provided pg, cluster/standalone separation, all 10 call sites updated)
 
-Progress: [███░░░░░░░] 25%
+Progress: [█████░░░░░] 50%
 
 ## Performance Metrics
 
@@ -28,11 +28,11 @@ Progress: [███░░░░░░░] 25%
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01 | 2 | 66min | 33min |
-| 02 | 1 | 5min | 5min |
+| 02 | 3 | 23min | 8min |
 
 **Recent Trend:**
-- Last 5 plans: 12min, 54min, 5min
-- Trend: Foundation plan was fast (new files only, no complex refactors)
+- Last 5 plans: 12min, 54min, 5min, ~5min (02-02), 18min (02-03)
+- Trend: Phase 2 plans are fast (focused enrichment pipeline changes)
 
 *Updated after each plan completion*
 
@@ -64,6 +64,10 @@ Recent decisions affecting current work:
 - CircuitBreaker is scan-scoped (NOT static/OnceLock) — created fresh per scan invocation, no cross-scan state sharing
 - #[allow(dead_code)] on Phase 2 forward-declared infrastructure (circuit.rs, pg.rs helpers) — used by plans 02-04
 - Summary.warnings uses serde default + skip_serializing_if for full backward compatibility
+- epss_enrich_findings and kev_enrich_findings accept caller-provided pg parameter; no internal pg_connect()
+- KEV cluster-mode returns early on PG hit (avoids file-cache/API fallback when PG has fresh data)
+- cli/db.rs seed path uses &mut None (benchmark/seed path should not incur PG overhead)
+- Promoted pg to outer scope in sbom.rs and binary.rs (both had pg inside inner blocks unreachable by post-block epss/kev calls)
 
 ### Pending Todos
 
@@ -79,6 +83,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-03
-Stopped at: Phase 2 plan 01 complete (CircuitBreaker, PG schema extensions, Summary.warnings, 6 new tests)
-Resume file: .planning/phases/02-db-first-enrichment-pipeline/02-02-PLAN.md
-Resume file: None
+Stopped at: Phase 2 plan 03 complete (EPSS/KEV PG cache support, all call sites updated, 52/52 tests pass)
+Resume file: .planning/phases/02-db-first-enrichment-pipeline/02-04-PLAN.md

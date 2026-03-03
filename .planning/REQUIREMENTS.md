@@ -15,9 +15,9 @@ Requirements for this milestone. Each maps to roadmap phases.
 ### Enrichment Pipeline
 
 - [ ] **ENRICH-01**: Scanner checks PostgreSQL cache before making any live OSV API call
-- [ ] **ENRICH-02**: Scanner checks PostgreSQL cache before making any live NVD API call
-- [ ] **ENRICH-03**: Scanner stores all API responses back to PostgreSQL after fetching
-- [ ] **ENRICH-04**: Scanner uses file cache -> PG -> live API fallback chain (check file first, then PG, then live)
+- [x] **ENRICH-02**: Scanner checks PostgreSQL cache before making any live NVD API call
+- [x] **ENRICH-03**: Scanner stores all API responses back to PostgreSQL after fetching
+- [x] **ENRICH-04**: Scanner uses file cache -> PG -> live API fallback chain (check file first, then PG, then live)
 - [ ] **ENRICH-05**: Scanner with existing PG enrichment data does not make redundant live API calls for cached CVEs
 - [ ] **ENRICH-06**: PG cache entries have a revalidation timestamp — scanner re-fetches when data is stale, not every time
 
@@ -85,9 +85,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SCAN-01 | Phase 4 | Pending |
 | SCAN-02 | Phase 2 | Pending |
 | ENRICH-01 | Phase 2 | Pending |
-| ENRICH-02 | Phase 2 | Pending |
-| ENRICH-03 | Phase 2 | Pending |
-| ENRICH-04 | Phase 2 | Pending |
+| ENRICH-02 | Phase 2 | Complete |
+| ENRICH-03 | Phase 2 | Complete |
+| ENRICH-04 | Phase 2 | Complete |
 | ENRICH-05 | Phase 2 | Pending |
 | ENRICH-06 | Phase 2 | Pending |
 | RHEL-01 | Phase 3 | Pending |
