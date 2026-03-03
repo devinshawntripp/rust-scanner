@@ -1,5 +1,4 @@
 //! Circuit breaker for HTTP vulnerability enrichment sources.
-#![allow(dead_code)]
 //!
 //! Each CircuitBreaker tracks consecutive failures for a single API source.
 //! Once the failure count reaches the threshold the circuit opens and

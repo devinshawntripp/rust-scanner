@@ -8,6 +8,7 @@ use crate::report::{
 };
 use super::super::http::{build_http_client, nvd_get_json};
 use super::super::version::{cmp_versions, cpe_parts, is_version_in_range};
+use super::super::circuit::CircuitBreaker;
 
 /// Queries the NVD API for a given component + version (CLI interactive output)
 pub fn match_vuln(component: &str, version: &str) {
@@ -150,7 +151,11 @@ pub fn nvd_keyword_findings(
     version: &str,
     api_key: Option<&str>,
     evidence_path: Option<&str>,
+    breaker: &CircuitBreaker,
 ) -> Vec<Finding> {
+    if breaker.is_open() {
+        return Vec::new();
+    }
     let keyword = format!("{} {}", component, version);
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=50",
@@ -158,8 +163,8 @@ pub fn nvd_keyword_findings(
     );
     let sleep_ms = nvd_sleep_ms(api_key);
     let json = match nvd_get_json(&url, api_key, &format!("kw:{}", keyword), sleep_ms) {
-        Some(j) => j,
-        None => return Vec::new(),
+        Some(j) => { breaker.record_success(); j }
+        None => { breaker.record_failure(); return Vec::new(); }
     };
 
     let mut out = Vec::new();
@@ -213,7 +218,11 @@ pub fn nvd_cpe_findings(
     version: &str,
     api_key: Option<&str>,
     evidence_path: Option<&str>,
+    breaker: &CircuitBreaker,
 ) -> Vec<Finding> {
+    if breaker.is_open() {
+        return Vec::new();
+    }
     let vendor = component.to_lowercase();
     let product = component.to_lowercase();
     let cpe = format!("cpe:2.3:a:{}:{}:{}:*:*:*:*:*:*:*", vendor, product, version);
@@ -223,8 +232,8 @@ pub fn nvd_cpe_findings(
     );
     let sleep_ms = nvd_sleep_ms(api_key);
     let json = match nvd_get_json(&url, api_key, &format!("cpe:{}", cpe), sleep_ms) {
-        Some(j) => j,
-        None => return Vec::new(),
+        Some(j) => { breaker.record_success(); j }
+        None => { breaker.record_failure(); return Vec::new(); }
     };
 
     let mut out = Vec::new();
@@ -276,15 +285,19 @@ pub fn nvd_keyword_findings_name(
     component: &str,
     api_key: Option<&str>,
     evidence_path: Option<&str>,
+    breaker: &CircuitBreaker,
 ) -> Vec<Finding> {
+    if breaker.is_open() {
+        return Vec::new();
+    }
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=50",
         urlencoding::encode(component)
     );
     let sleep_ms = nvd_sleep_ms(api_key);
     let json = match nvd_get_json(&url, api_key, &format!("kw_only:{}", component), sleep_ms) {
-        Some(j) => j,
-        None => return Vec::new(),
+        Some(j) => { breaker.record_success(); j }
+        None => { breaker.record_failure(); return Vec::new(); }
     };
 
     let mut out = Vec::new();
@@ -339,15 +352,19 @@ pub fn nvd_findings_by_product_version(
     version: &str,
     api_key: Option<&str>,
     evidence_path: Option<&str>,
+    breaker: &CircuitBreaker,
 ) -> Vec<Finding> {
+    if breaker.is_open() {
+        return Vec::new();
+    }
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch={}&resultsPerPage=2000",
         urlencoding::encode(product)
     );
     let sleep_ms = nvd_sleep_ms(api_key);
     let json = match nvd_get_json(&url, api_key, &format!("prod:{}", product), sleep_ms) {
-        Some(j) => j,
-        None => return Vec::new(),
+        Some(j) => { breaker.record_success(); j }
+        None => { breaker.record_failure(); return Vec::new(); }
     };
 
     let mut out = Vec::new();
