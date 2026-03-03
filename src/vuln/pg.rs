@@ -5,7 +5,9 @@
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use postgres::{Client as PgClient, NoTls};
+use rand::Rng;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::utils::progress;
@@ -40,7 +42,13 @@ pub fn pg_connect() -> Option<PgClient> {
 
 pub fn pg_init_schema(client: &mut PgClient) {
     let res = client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS rhel_cves (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            rhel_version TEXT NOT NULL,\n            state TEXT,\n            fix_state TEXT,\n            advisory TEXT,\n            fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n            PRIMARY KEY (cve_id, package, rhel_version)\n        );\n        CREATE INDEX IF NOT EXISTS idx_nvd_cve_cache_last_checked ON nvd_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_osv_vuln_cache_last_checked ON osv_vuln_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_csaf_cache_last_checked ON redhat_csaf_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_cve_cache_last_checked ON redhat_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_package ON rhel_cves (package);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_fetched_at ON rhel_cves (fetched_at);\n        CREATE TABLE IF NOT EXISTS epss_scores_cache (\n            cve_id TEXT PRIMARY KEY,\n            score REAL NOT NULL,\n            percentile REAL NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS kev_entries_cache (\n            cve_id TEXT PRIMARY KEY,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS debian_tracker_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            urgency TEXT,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS ubuntu_usn_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            priority TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS alpine_secdb_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            branch TEXT NOT NULL,\n            repo TEXT NOT NULL,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, branch, repo)\n        );\n        CREATE INDEX IF NOT EXISTS idx_debian_cache_pkg ON debian_tracker_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_ubuntu_cache_pkg ON ubuntu_usn_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_alpine_cache_pkg ON alpine_secdb_cache (package, branch);\n        ALTER TABLE ubuntu_usn_cache ADD COLUMN IF NOT EXISTS fixed_version TEXT;"
+        "CREATE TABLE IF NOT EXISTS nvd_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            nvd_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS osv_vuln_cache (\n            vuln_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            osv_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_csaf_cache (\n            errata_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS redhat_cve_cache (\n            cve_id TEXT PRIMARY KEY,\n            payload JSONB NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            redhat_last_modified TIMESTAMPTZ\n        );\n        CREATE TABLE IF NOT EXISTS rhel_cves (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            rhel_version TEXT NOT NULL,\n            state TEXT,\n            fix_state TEXT,\n            advisory TEXT,\n            fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n            PRIMARY KEY (cve_id, package, rhel_version)\n        );\n        CREATE INDEX IF NOT EXISTS idx_nvd_cve_cache_last_checked ON nvd_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_osv_vuln_cache_last_checked ON osv_vuln_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_csaf_cache_last_checked ON redhat_csaf_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_redhat_cve_cache_last_checked ON redhat_cve_cache (last_checked_at);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_package ON rhel_cves (package);\n        CREATE INDEX IF NOT EXISTS idx_rhel_cves_fetched_at ON rhel_cves (fetched_at);\n        CREATE TABLE IF NOT EXISTS epss_scores_cache (\n            cve_id TEXT PRIMARY KEY,\n            score REAL NOT NULL,\n            percentile REAL NOT NULL,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS kev_entries_cache (\n            cve_id TEXT PRIMARY KEY,\n            last_checked_at TIMESTAMPTZ NOT NULL\n        );\n        CREATE TABLE IF NOT EXISTS debian_tracker_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            urgency TEXT,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS ubuntu_usn_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            release TEXT NOT NULL,\n            status TEXT,\n            priority TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, release)\n        );\n        CREATE TABLE IF NOT EXISTS alpine_secdb_cache (\n            cve_id TEXT NOT NULL,\n            package TEXT NOT NULL,\n            branch TEXT NOT NULL,\n            repo TEXT NOT NULL,\n            fixed_version TEXT,\n            last_checked_at TIMESTAMPTZ NOT NULL,\n            PRIMARY KEY (cve_id, package, branch, repo)\n        );\n        CREATE INDEX IF NOT EXISTS idx_debian_cache_pkg ON debian_tracker_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_ubuntu_cache_pkg ON ubuntu_usn_cache (package, release);\n        CREATE INDEX IF NOT EXISTS idx_alpine_cache_pkg ON alpine_secdb_cache (package, branch);\n        ALTER TABLE ubuntu_usn_cache ADD COLUMN IF NOT EXISTS fixed_version TEXT;\
+        CREATE TABLE IF NOT EXISTS osv_batch_chunk_cache (\
+            chunk_digest TEXT PRIMARY KEY,\
+            payload JSONB NOT NULL,\
+            last_checked_at TIMESTAMPTZ NOT NULL\
+        );\
+        CREATE INDEX IF NOT EXISTS idx_osv_batch_chunk_cache_last_checked ON osv_batch_chunk_cache (last_checked_at);"
     );
     match res {
         Ok(_) => progress("nvd.cache.pg.init.ok", ""),
@@ -453,4 +461,177 @@ pub fn resolve_enrich_cache_dir() -> Option<PathBuf> {
         return Some(default_dir);
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Jittered TTL computation (Phase 2 foundation)
+// ---------------------------------------------------------------------------
+
+/// Compute a TTL in days with a random jitter to prevent thundering herd
+/// cache invalidation. Returns `(base_days + jitter).max(1)`.
+#[allow(dead_code)]
+///
+/// # Arguments
+/// * `base_days`   — The nominal TTL (e.g. 30 for monthly refresh)
+/// * `jitter_days` — Maximum absolute jitter (e.g. 7 for ±7 days)
+pub(super) fn compute_jittered_ttl_days(base_days: i64, jitter_days: i64) -> i64 {
+    let jitter = rand::thread_rng().gen_range(-jitter_days..=jitter_days);
+    (base_days + jitter).max(1)
+}
+
+// ---------------------------------------------------------------------------
+// OSV batch chunk cache helpers (Phase 2 foundation)
+// ---------------------------------------------------------------------------
+
+/// Retrieve a cached OSV batch query response for a sorted chunk of package
+/// coordinates identified by `digest` (SHA256 of the sorted package list).
+/// Returns None when the entry is missing or older than `ttl_days`.
+#[allow(dead_code)]
+pub(super) fn pg_get_osv_batch_chunk(
+    client: &mut PgClient,
+    digest: &str,
+    ttl_days: i64,
+) -> Option<Value> {
+    let row = client
+        .query_opt(
+            "SELECT payload FROM osv_batch_chunk_cache \
+             WHERE chunk_digest = $1 \
+             AND last_checked_at > NOW() - make_interval(days => $2)",
+            &[&digest, &(ttl_days as i32)],
+        )
+        .ok()??;
+    let payload: Value = row.get(0);
+    Some(payload)
+}
+
+/// Upsert an OSV batch chunk response into the cache.
+#[allow(dead_code)]
+pub(super) fn pg_put_osv_batch_chunk(client: &mut PgClient, digest: &str, payload: &Value) {
+    let res = client.execute(
+        "INSERT INTO osv_batch_chunk_cache (chunk_digest, payload, last_checked_at) \
+         VALUES ($1, $2, NOW()) \
+         ON CONFLICT (chunk_digest) DO UPDATE SET payload = EXCLUDED.payload, last_checked_at = NOW()",
+        &[&digest, payload],
+    );
+    match res {
+        Ok(_) => progress("osv.batch_chunk.pg.put", digest),
+        Err(e) => progress("osv.batch_chunk.pg.put.err", &format!("{} {}", digest, e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EPSS cache helpers (Phase 2 foundation)
+// ---------------------------------------------------------------------------
+
+/// Upsert a batch of EPSS scores into the `epss_scores_cache` table.
+/// Each tuple is `(cve_id, score, percentile)`.
+#[allow(dead_code)]
+pub(super) fn pg_put_epss_scores(client: &mut PgClient, scores: &[(String, f32, f32)]) {
+    for (cve_id, score, percentile) in scores {
+        let res = client.execute(
+            "INSERT INTO epss_scores_cache (cve_id, score, percentile, last_checked_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (cve_id) DO UPDATE SET score = EXCLUDED.score, \
+               percentile = EXCLUDED.percentile, last_checked_at = NOW()",
+            &[cve_id, score, percentile],
+        );
+        if let Err(e) = res {
+            progress(
+                "epss.cache.pg.put.err",
+                &format!("{} {}", cve_id, e),
+            );
+        }
+    }
+}
+
+/// Query EPSS scores for a batch of CVE IDs. Returns only entries whose
+/// `last_checked_at` is within `ttl_days`. Missing CVEs are absent from the map.
+#[allow(dead_code)]
+pub(super) fn pg_get_epss_scores(
+    client: &mut PgClient,
+    cve_ids: &[&str],
+    ttl_days: i64,
+) -> HashMap<String, (f32, f32)> {
+    if cve_ids.is_empty() {
+        return HashMap::new();
+    }
+    let ids_owned: Vec<String> = cve_ids.iter().map(|s| s.to_string()).collect();
+    let rows = client
+        .query(
+            "SELECT cve_id, score, percentile FROM epss_scores_cache \
+             WHERE cve_id = ANY($1) \
+             AND last_checked_at > NOW() - make_interval(days => $2)",
+            &[&ids_owned, &(ttl_days as i32)],
+        )
+        .unwrap_or_default();
+    rows.iter()
+        .map(|row| {
+            let cve_id: String = row.get(0);
+            let score: f32 = row.get(1);
+            let percentile: f32 = row.get(2);
+            (cve_id, (score, percentile))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// KEV cache helpers (Phase 2 foundation)
+// ---------------------------------------------------------------------------
+
+/// Upsert a batch of CISA KEV CVE IDs into the `kev_entries_cache` table.
+#[allow(dead_code)]
+pub(super) fn pg_put_kev_entries(client: &mut PgClient, cve_ids: &[String]) {
+    for cve_id in cve_ids {
+        let res = client.execute(
+            "INSERT INTO kev_entries_cache (cve_id, last_checked_at) \
+             VALUES ($1, NOW()) \
+             ON CONFLICT (cve_id) DO NOTHING",
+            &[cve_id],
+        );
+        if let Err(e) = res {
+            progress(
+                "kev.cache.pg.put.err",
+                &format!("{} {}", cve_id, e),
+            );
+        }
+    }
+}
+
+/// Retrieve all KEV CVE IDs whose cache entry is still within `ttl_days`.
+/// Returns an empty set when no entries exist or all are stale.
+#[allow(dead_code)]
+pub(super) fn pg_get_kev_entries(client: &mut PgClient, ttl_days: i64) -> HashSet<String> {
+    let rows = client
+        .query(
+            "SELECT cve_id FROM kev_entries_cache \
+             WHERE last_checked_at > NOW() - make_interval(days => $1)",
+            &[&(ttl_days as i32)],
+        )
+        .unwrap_or_default();
+    rows.iter().map(|row| row.get::<_, String>(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_jittered_ttl_days_range() {
+        for _ in 0..100 {
+            let result = compute_jittered_ttl_days(30, 7);
+            assert!(
+                result >= 23 && result <= 37,
+                "expected [23,37], got {}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_jittered_ttl_days_min_clamp() {
+        for _ in 0..100 {
+            let result = compute_jittered_ttl_days(1, 5);
+            assert!(result >= 1, "expected >= 1, got {}", result);
+        }
+    }
 }
