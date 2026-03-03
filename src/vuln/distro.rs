@@ -56,7 +56,60 @@ pub(super) fn map_debian_advisory_to_cves(
         }
     }
 
-    // 2. Check file cache
+    // 2. Cross-reference: extract package name from OSV payload, look up CVEs
+    //    in debian_tracker_cache (bulk-imported from Debian tracker JSON).
+    //    This avoids expensive HTTP scraping of security-tracker.debian.org.
+    if let Some(client_pg) = pg.as_mut() {
+        // Get the package name(s) from the advisory's OSV affected[] field
+        let mut pkg_names: Vec<String> = Vec::new();
+        if let Some((payload, _, _)) = pg_get_osv(client_pg, advisory_id) {
+            if let Some(affected) = payload["affected"].as_array() {
+                for aff in affected {
+                    if let Some(name) = aff["package"]["name"].as_str() {
+                        if !name.is_empty() && !pkg_names.contains(&name.to_string()) {
+                            pkg_names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if !pkg_names.is_empty() {
+            let mut cves: HashSet<String> = HashSet::new();
+            for pkg in &pkg_names {
+                if let Ok(rows) = client_pg.query(
+                    "SELECT DISTINCT cve_id FROM debian_tracker_cache WHERE package = $1",
+                    &[pkg],
+                ) {
+                    for row in &rows {
+                        let cve_id: String = row.get(0);
+                        cves.insert(cve_id);
+                    }
+                }
+            }
+            if !cves.is_empty() {
+                let result: Vec<String> = cves.into_iter().collect();
+                progress(
+                    "osv.debian.map.tracker_cache",
+                    &format!("{} ({}) -> {} CVEs", advisory_id, pkg_names.join(","), result.len()),
+                );
+                // Update osv_vuln_cache aliases so step 1 hits next time
+                if let Some((mut payload, _, _)) = pg_get_osv(client_pg, advisory_id) {
+                    let aliases_arr: Vec<serde_json::Value> = result
+                        .iter()
+                        .map(|s| serde_json::Value::String(s.clone()))
+                        .collect();
+                    payload["aliases"] = serde_json::Value::Array(aliases_arr);
+                    let _ = client_pg.execute(
+                        "UPDATE osv_vuln_cache SET payload = $1::jsonb WHERE vuln_id = $2",
+                        &[&payload.to_string(), &advisory_id],
+                    );
+                }
+                return Some(result);
+            }
+        }
+    }
+
+    // 3. Check file cache
     let cache_dir = resolve_enrich_cache_dir();
     let cache_key_str = cache_key(&["debian_advisory_map", advisory_id]);
     if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_key_str) {
@@ -67,7 +120,7 @@ pub(super) fn map_debian_advisory_to_cves(
         }
     }
 
-    // 3. Fallback: fetch Debian tracker HTML page
+    // 4. Last resort: fetch Debian tracker HTML page
     let url = format!(
         "https://security-tracker.debian.org/tracker/{}",
         advisory_id
@@ -79,34 +132,15 @@ pub(super) fn map_debian_advisory_to_cves(
     }
     let body = resp.text().ok()?;
     let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok()?;
-    let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut set: HashSet<String> = HashSet::new();
     for m in re.find_iter(&body) {
         set.insert(m.as_str().to_string());
     }
     let result: Vec<String> = set.into_iter().collect();
 
-    // Store in file cache for future runs
     if !result.is_empty() {
         if let Ok(json_bytes) = serde_json::to_vec(&result) {
             cache_put(cache_dir.as_deref(), &cache_key_str, &json_bytes);
-        }
-        // Also update osv_vuln_cache aliases in PG so future scans skip the HTTP fetch
-        if let Some(client_pg) = pg.as_mut() {
-            if let Some((mut payload, _lc, _lm)) = pg_get_osv(client_pg, advisory_id) {
-                let aliases_arr: Vec<serde_json::Value> = result
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.clone()))
-                    .collect();
-                payload["aliases"] = serde_json::Value::Array(aliases_arr);
-                let _ = client_pg.execute(
-                    "UPDATE osv_vuln_cache SET payload = $1::jsonb WHERE vuln_id = $2",
-                    &[&payload.to_string(), &advisory_id],
-                );
-                progress(
-                    "osv.debian.map.pg_store",
-                    &format!("{} -> {} CVEs persisted to PG", advisory_id, result.len()),
-                );
-            }
         }
     }
 
