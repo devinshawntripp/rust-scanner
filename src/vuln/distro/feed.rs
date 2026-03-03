@@ -3,156 +3,19 @@ use std::collections::{HashMap, HashSet};
 use postgres::Client as PgClient;
 use serde_json::Value;
 
-use crate::cache::{cache_get, cache_key, cache_put};
 use crate::report::{Finding, ReferenceInfo};
 use crate::utils::{progress, progress_timing};
 
-use super::env_bool;
-use super::http::{build_http_client, cached_http_json};
-use super::pg::{pg_get_osv, resolve_enrich_cache_dir};
-use super::version::cmp_versions;
-
-pub(super) fn map_debian_advisory_to_cves(
-    advisory_id: &str,
-    pg: &mut Option<PgClient>,
-) -> Option<Vec<String>> {
-    // 1. Check PG osv_vuln_cache for aliases (populated by bulk import)
-    if let Some(client_pg) = pg.as_mut() {
-        if let Some((payload, _last_checked, _last_mod)) = pg_get_osv(client_pg, advisory_id) {
-            let mut cves: std::collections::HashSet<String> = std::collections::HashSet::new();
-            if let Some(arr) = payload["aliases"].as_array() {
-                for a in arr.iter().filter_map(|x| x.as_str()) {
-                    if a.starts_with("CVE-") {
-                        cves.insert(a.to_string());
-                    }
-                }
-            }
-            // Also check references and text for CVE IDs
-            if let Ok(re) = regex::Regex::new(r"CVE-\d{4}-\d+") {
-                if let Some(arr) = payload["references"].as_array() {
-                    for r in arr {
-                        if let Some(u) = r["url"].as_str() {
-                            for m in re.find_iter(u) {
-                                cves.insert(m.as_str().to_string());
-                            }
-                        }
-                    }
-                }
-                for field in ["summary", "details"] {
-                    if let Some(text) = payload[field].as_str() {
-                        for m in re.find_iter(text) {
-                            cves.insert(m.as_str().to_string());
-                        }
-                    }
-                }
-            }
-            if !cves.is_empty() {
-                progress(
-                    "osv.debian.map.pg_hit",
-                    &format!("{} -> {} CVEs", advisory_id, cves.len()),
-                );
-                return Some(cves.into_iter().collect());
-            }
-        }
-    }
-
-    // 2. Cross-reference: extract package name from OSV payload, look up CVEs
-    //    in debian_tracker_cache (bulk-imported from Debian tracker JSON).
-    //    This avoids expensive HTTP scraping of security-tracker.debian.org.
-    if let Some(client_pg) = pg.as_mut() {
-        // Get the package name(s) from the advisory's OSV affected[] field
-        let mut pkg_names: Vec<String> = Vec::new();
-        if let Some((payload, _, _)) = pg_get_osv(client_pg, advisory_id) {
-            if let Some(affected) = payload["affected"].as_array() {
-                for aff in affected {
-                    if let Some(name) = aff["package"]["name"].as_str() {
-                        if !name.is_empty() && !pkg_names.contains(&name.to_string()) {
-                            pkg_names.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        if !pkg_names.is_empty() {
-            let mut cves: HashSet<String> = HashSet::new();
-            for pkg in &pkg_names {
-                if let Ok(rows) = client_pg.query(
-                    "SELECT DISTINCT cve_id FROM debian_tracker_cache WHERE package = $1",
-                    &[pkg],
-                ) {
-                    for row in &rows {
-                        let cve_id: String = row.get(0);
-                        cves.insert(cve_id);
-                    }
-                }
-            }
-            if !cves.is_empty() {
-                let result: Vec<String> = cves.into_iter().collect();
-                progress(
-                    "osv.debian.map.tracker_cache",
-                    &format!("{} ({}) -> {} CVEs", advisory_id, pkg_names.join(","), result.len()),
-                );
-                // Update osv_vuln_cache aliases so step 1 hits next time
-                if let Some((mut payload, _, _)) = pg_get_osv(client_pg, advisory_id) {
-                    let aliases_arr: Vec<serde_json::Value> = result
-                        .iter()
-                        .map(|s| serde_json::Value::String(s.clone()))
-                        .collect();
-                    payload["aliases"] = serde_json::Value::Array(aliases_arr);
-                    let _ = client_pg.execute(
-                        "UPDATE osv_vuln_cache SET payload = $1::jsonb WHERE vuln_id = $2",
-                        &[&payload.to_string(), &advisory_id],
-                    );
-                }
-                return Some(result);
-            }
-        }
-    }
-
-    // 3. Check file cache
-    let cache_dir = resolve_enrich_cache_dir();
-    let cache_key_str = cache_key(&["debian_advisory_map", advisory_id]);
-    if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_key_str) {
-        if let Ok(arr) = serde_json::from_slice::<Vec<String>>(&bytes) {
-            if !arr.is_empty() {
-                return Some(arr);
-            }
-        }
-    }
-
-    // 4. Last resort: fetch Debian tracker HTML page
-    let url = format!(
-        "https://security-tracker.debian.org/tracker/{}",
-        advisory_id
-    );
-    let client = build_http_client(10);
-    let resp = client.get(&url).send().ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body = resp.text().ok()?;
-    let re = regex::Regex::new(r"CVE-\d{4}-\d+").ok()?;
-    let mut set: HashSet<String> = HashSet::new();
-    for m in re.find_iter(&body) {
-        set.insert(m.as_str().to_string());
-    }
-    let result: Vec<String> = set.into_iter().collect();
-
-    if !result.is_empty() {
-        if let Ok(json_bytes) = serde_json::to_vec(&result) {
-            cache_put(cache_dir.as_deref(), &cache_key_str, &json_bytes);
-        }
-    }
-
-    Some(result)
-}
+use super::super::env_bool;
+use super::super::http::cached_http_json;
+use super::super::version::cmp_versions;
 
 #[derive(Debug, Clone)]
-pub(super) struct DistroFixCandidate {
-    pub(super) fixed_version: String,
-    pub(super) source_id: String,
-    pub(super) reference_url: String,
-    pub(super) note: String,
+pub(in crate::vuln) struct DistroFixCandidate {
+    pub(in crate::vuln) fixed_version: String,
+    pub(in crate::vuln) source_id: String,
+    pub(in crate::vuln) reference_url: String,
+    pub(in crate::vuln) note: String,
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -169,15 +32,15 @@ fn env_i64(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
-pub(super) fn is_cve_id(id: &str) -> bool {
+pub(in crate::vuln) fn is_cve_id(id: &str) -> bool {
     id.starts_with("CVE-")
 }
 
-pub(super) fn pkg_cve_key(pkg: &str, cve: &str) -> String {
+pub(in crate::vuln) fn pkg_cve_key(pkg: &str, cve: &str) -> String {
     format!("{}|{}", pkg.to_ascii_lowercase(), cve.to_ascii_uppercase())
 }
 
-pub(super) fn select_best_candidate(
+pub(in crate::vuln) fn select_best_candidate(
     installed_version: &str,
     candidates: &[DistroFixCandidate],
 ) -> Option<DistroFixCandidate> {
@@ -262,7 +125,6 @@ fn debian_source_name_candidates(name: &str) -> Vec<String> {
     }
     out.push(base.clone());
 
-    // Common binary-package suffixes where source package often maps to the prefix.
     let suffixes = [
         "-dev", "-dbg", "-doc", "-data", "-bin", "-common", "-utils", "-tools", "-libs",
     ];
@@ -359,7 +221,7 @@ fn load_ubuntu_notices_data() -> Option<Value> {
     )
 }
 
-pub(super) fn build_ubuntu_candidate_index(
+pub(in crate::vuln) fn build_ubuntu_candidate_index(
     ubuntu_data: &Value,
     needed_keys: &HashSet<String>,
 ) -> HashMap<String, Vec<DistroFixCandidate>> {
@@ -429,7 +291,6 @@ pub(super) fn build_ubuntu_candidate_index(
     out
 }
 
-/// Query debian_tracker_cache in PG for needed packages/CVEs instead of downloading bulk JSON.
 fn build_debian_candidate_index_pg(
     pg: &mut Option<PgClient>,
     needed: &HashMap<String, HashSet<String>>,
@@ -479,13 +340,11 @@ fn build_debian_candidate_index_pg(
     Some(out)
 }
 
-/// Query ubuntu_usn_cache in PG for needed package/CVE pairs instead of downloading bulk JSON.
-pub(super) fn build_ubuntu_candidate_index_pg(
+pub(in crate::vuln) fn build_ubuntu_candidate_index_pg(
     pg: &mut Option<PgClient>,
     needed_keys: &HashSet<String>,
 ) -> Option<HashMap<String, Vec<DistroFixCandidate>>> {
     let client_pg = pg.as_mut()?;
-    // Extract unique package names from needed keys (format: "pkg|CVE-...")
     let mut pkgs: HashSet<String> = HashSet::new();
     for key in needed_keys {
         if let Some(pkg) = key.split('|').next() {
@@ -509,7 +368,6 @@ pub(super) fn build_ubuntu_candidate_index_pg(
             if !needed_keys.contains(&key) {
                 continue;
             }
-            // Use the fixed_version column (populated by bulk import). Skip if absent.
             let fv = fixed_version.unwrap_or_default();
             if fv.is_empty() {
                 continue;
@@ -560,7 +418,6 @@ fn load_alpine_secdb(branch: &str, repo: &str) -> Option<Value> {
     )
 }
 
-/// Query alpine_secdb_cache in PG for needed package/CVE pairs instead of downloading bulk JSON.
 fn build_alpine_candidate_index_pg(
     pg: &mut Option<PgClient>,
     needed_keys: &HashSet<String>,
@@ -669,7 +526,7 @@ fn build_alpine_candidate_index(
     out
 }
 
-pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
+pub(in crate::vuln) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut Option<PgClient>) {
     if findings.is_empty() {
         return;
     }
@@ -823,7 +680,7 @@ pub(super) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, pg: &mut 
     }
 }
 
-/// Pre-warm all distro advisory feeds (Ubuntu USN, Alpine SecDB) into the local cache.
+/// Pre-warm all distro advisory feeds into the local cache.
 pub fn seed_distro_feeds() {
     progress("seed.distro.ubuntu.start", "");
     let _ubuntu = load_ubuntu_notices_data();
