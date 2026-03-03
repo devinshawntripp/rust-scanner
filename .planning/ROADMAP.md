@@ -41,7 +41,7 @@ Plans:
   5. All HTTP API calls have a timeout; NVD 403 rate limit responses trigger a retry with backoff rather than an infinite hang
 **Plans**: 4 plans
 Plans:
-- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
+- [x] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
 - [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
 - [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
 - [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
@@ -115,7 +115,7 @@ Plans:
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
-| 2. DB-First Enrichment Pipeline | 0/4 | Not started | - |
+| 2. DB-First Enrichment Pipeline | 1/4 | In progress | - |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
 | 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
