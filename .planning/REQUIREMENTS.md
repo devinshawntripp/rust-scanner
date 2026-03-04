@@ -9,7 +9,7 @@ Requirements for this milestone. Each maps to roadmap phases.
 
 ### Scanning Reliability
 
-- [ ] **SCAN-01**: Scanner handles all supported image types (ISO, DMG, tar.gz, tar, OCI, docker-save) without crashing or hanging
+- [x] **SCAN-01**: Scanner handles all supported image types (ISO, DMG, tar.gz, tar, OCI, docker-save) without crashing or hanging
 - [x] **SCAN-02**: All HTTP API requests have timeouts and circuit breakers — no infinite hangs on API failures or rate limits
 
 ### Enrichment Pipeline
@@ -82,7 +82,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SCAN-01 | Phase 4 | Pending |
+| SCAN-01 | Phase 4 | Complete |
 | SCAN-02 | Phase 2 | Complete |
 | ENRICH-01 | Phase 2 | Complete |
 | ENRICH-02 | Phase 2 | Complete |

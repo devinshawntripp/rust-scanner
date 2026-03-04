@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.8
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-03T17:46:23.789Z"
+last_updated: "2026-03-04T01:50:27.069Z"
 progress:
-  total_phases: 8
+  total_phases: 9
   completed_phases: 2
-  total_plans: 7
-  completed_plans: 7
+  total_plans: 9
+  completed_plans: 8
 ---
 
 # Project State
@@ -52,6 +52,7 @@ Progress: [██████████] 67%
 | Phase 02 P02 | 10min | 2 tasks | 2 files |
 | Phase 02 P04 | 13min | 2 tasks | 14 files |
 | Phase 02 P05 | 3 | 2 tasks | 6 files |
+| Phase 04 P05 | 2 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -96,6 +97,8 @@ Recent decisions affecting current work:
 - [Phase 02-05]: breaker as last parameter on all 4 NVD query functions: consistent with enrichment function convention from Plan 04
 - [Phase 02-05]: binary.rs breakers moved before if !bytes.is_empty() block: ensures nvd_breaker in scope for both NVD loop and post-block enrichment calls
 - [Phase 02-05]: Separate named breakers in source.rs: nvd_breaker_build (initial query loop) and nvd_breaker_src (enrich step) to avoid shared state between function phases
+- [Phase 04]: try_extract_dmg_native made pub(crate) for testability — tests can call stub directly without exposing to external crates
+- [Phase 04]: DMG tests use garbage content (not real DMG files) — no external tool dependency in test suite; hdiutil output in logs is expected on macOS
 
 ### Pending Todos
 
@@ -110,6 +113,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-03
-Stopped at: Phase 2 plan 05 complete — NVD query circuit breaker gap closure. All 4 lower-level NVD query functions now accept CircuitBreaker. All NVD API call paths are circuit-breaker-protected. 52/52 tests pass. Zero warnings in release build.
-Resume file: .planning/phases/03-rhel-rocky-consolidation/03-01-PLAN.md
+Last session: 2026-03-04
+Stopped at: Phase 4 plan 05 complete — DMG module hardening gap closure. Module-level documentation added for p7zip-full/hdiutil requirements. try_extract_dmg_native made pub(crate). 4 fallback-chain unit tests added. 96/96 tests pass. SCAN-01 satisfied for DMG format.
+Resume file: .planning/phases/04-scanner-hardening/04-05-PLAN.md

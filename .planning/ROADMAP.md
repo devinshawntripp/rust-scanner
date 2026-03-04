@@ -120,6 +120,6 @@ Plans:
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
 | 2. DB-First Enrichment Pipeline | 4/5 | Gap closure | 2026-03-03 |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
-| 4. Multi-Format Scanning Reliability | 4/6 | Gap closure | - |
+| 4. Multi-Format Scanning Reliability | 1/2 | In Progress|  |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
 | 6. UI and Benchmark Validation | 0/TBD | Not started | - |
