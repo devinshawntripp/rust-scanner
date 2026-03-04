@@ -74,6 +74,30 @@ pub fn kev_enrich_findings(
         }
     }
 
+    // Standalone mode: check local vulndb for KEV entries
+    if !crate::vuln::cluster_mode() {
+        if let Some(conn) = crate::vulndb::open_vulndb() {
+            let mut kev_hits = 0usize;
+            let mut enriched = 0usize;
+            for finding in findings.iter_mut() {
+                if finding.id.starts_with("CVE-") && crate::vulndb::query_kev(&conn, &finding.id) {
+                    finding.in_kev = Some(true);
+                    enriched += 1;
+                    kev_hits += 1;
+                }
+            }
+            if kev_hits > 0 {
+                progress("kev.enrich.vulndb_hit", &format!("matched={}", kev_hits));
+                progress_timing("kev.enrich", started);
+                progress(
+                    "kev.enrich.done",
+                    &format!("kev_vulndb matched={}/{}", enriched, findings.len()),
+                );
+                return; // all KEV data came from local DB
+            }
+        }
+    }
+
     // Standalone mode (or PG miss): use file cache / live API
     let kev_set = kev_from_cache_or_api(cache_dir, breaker);
 
