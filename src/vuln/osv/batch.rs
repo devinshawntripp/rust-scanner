@@ -39,11 +39,15 @@ pub fn osv_batch_query(
     // Build per-package queries and remember original indices
     let mut ecosystem_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let indexed: Vec<(usize, Value)> = packages.iter().enumerate().map(|(i, p)| {
+    let indexed: Vec<(usize, Value)> = packages.iter().enumerate().filter_map(|(i, p)| {
         let (ecosystem, name, version) = map_ecosystem_name_version(p);
+        if ecosystem.is_empty() {
+            // Skip packages with no OSV ecosystem (e.g. mac-app, mac-pkg, mac-framework)
+            return None;
+        }
         *ecosystem_counts.entry(ecosystem.clone()).or_insert(0) += 1;
         let q = serde_json::json!({ "package": {"ecosystem": ecosystem, "name": name}, "version": version });
-        (i, q)
+        Some((i, q))
     }).collect();
     let mut eco_summary: Vec<String> = ecosystem_counts
         .iter()
@@ -425,6 +429,11 @@ fn map_ecosystem_name_version(p: &PackageCoordinate) -> (String, String, String)
         "fedora" => ("Fedora".into(), p.name.clone(), p.version.clone()),
         "centos" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
         "rpm" => ("Red Hat".into(), p.name.clone(), p.version.clone()),
+        // macOS ecosystems have no OSV database — skip by returning empty ecosystem
+        // so the filter below excludes them. They are enriched via NVD/CPE instead.
+        "mac-app" | "mac-pkg" | "mac-framework" => {
+            ("".into(), p.name.clone(), p.version.clone())
+        }
         other => (other.to_string(), p.name.clone(), p.version.clone()),
     }
 }
