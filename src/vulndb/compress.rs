@@ -84,3 +84,17 @@ pub(super) fn compress_json(data: &[u8]) -> Vec<u8> {
     // Use zstd level 3 -- 30-40% smaller than gzip with faster compression
     zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
 }
+
+/// Decompress a plain zstd-compressed payload blob.
+/// Returns None on decompression failure (corrupt data, wrong format, etc).
+pub(super) fn decompress_payload(data: &[u8]) -> Option<Vec<u8>> {
+    zstd::decode_all(data).ok()
+}
+
+/// Decompress a zstd payload that was compressed with a shared dictionary.
+/// Caps output at 10 MB to prevent memory exhaustion on corrupt data.
+/// Returns None on decompression failure.
+pub(super) fn decompress_payload_with_dict(data: &[u8], dict: &[u8]) -> Option<Vec<u8>> {
+    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict).ok()?;
+    decompressor.decompress(data, 10 * 1024 * 1024).ok()
+}
