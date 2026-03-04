@@ -5,6 +5,18 @@ All notable changes to ScanRook are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.2] - 2026-03-04
+
+### Added
+- SQLite vulndb query integration for OSV batch queries (local cache lookup before remote API)
+- SQLite vulndb query integration for EPSS enrichment (risk scoring from local cache)
+- SQLite vulndb query integration for KEV enrichment (CISA Known Exploited Vulnerabilities from local cache)
+- Magic-byte detection for gzip vs raw SQLite in vulndb fetch
+- Dict-aware decompression for zstd-compressed vulndb payloads
+
+### Changed
+- OSV batch queries now check local SQLite vulndb cache first, falling back to remote OSV API
+
 ## [1.10.0] - 2026-03-04
 
 ### Added

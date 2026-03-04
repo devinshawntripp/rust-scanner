@@ -94,14 +94,10 @@ jobs:
             ## ScanRook v${{ env.VERSION }}
 
             ### New Features
-            - **DMG scanning** — Detect macOS .app bundles and embedded frameworks via Info.plist parsing
-            - **RHEL/Rocky consolidation** — Unified enrichment pipeline with post-enrichment dedup eliminates duplicate CVE findings
-            - **RHEL version gating** — Strict CPE filtering prevents RHEL 7/8 false positives in RHEL 9 scans
-
-            ### Improvements
-            - DMG extraction gracefully falls through to binary-only scanning on failure (no hard errors)
-            - Rust-native DMG extraction via dmgwiz attempted before external tool fallback
-            - 25+ new unit tests for version comparison, CPE matching, EVR comparison, and package parsing
+            - **Local vulndb SQLite cache** — OSV batch queries now check a local SQLite database before calling the remote API, dramatically reducing API calls
+            - **EPSS risk scoring** — Findings enriched with Exploit Prediction Scoring System data from local cache
+            - **KEV enrichment** — CISA Known Exploited Vulnerabilities flagged from local cache
+            - **Smart decompression** — Magic-byte detection for gzip vs raw SQLite; dict-aware zstd decompression
 
             ### Install
             ```bash
