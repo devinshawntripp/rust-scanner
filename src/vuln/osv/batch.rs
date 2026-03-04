@@ -78,6 +78,13 @@ pub fn osv_batch_query(
         .unwrap_or(60);
     let client = build_http_client(osv_timeout_secs);
 
+    // Standalone mode: open vulndb once for SQLite lookups across all chunks
+    let vulndb_conn = if !crate::vuln::cluster_mode() {
+        crate::vulndb::open_vulndb()
+    } else {
+        None
+    };
+
     for chunk in indexed.chunks(chunk_size) {
         // Prepare body for this chunk
         let body =
@@ -97,6 +104,32 @@ pub fn osv_batch_query(
                 chunk.len()
             ),
         );
+
+        // Standalone mode: check SQLite vulndb before API
+        if let Some(ref conn) = vulndb_conn {
+            let mut all_found = true;
+            for &(orig_idx, ref query) in chunk {
+                let eco = query["package"]["ecosystem"].as_str().unwrap_or_default();
+                let name = query["package"]["name"].as_str().unwrap_or_default();
+                let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
+                if vulns.is_empty() {
+                    all_found = false;
+                    break;
+                }
+                results[orig_idx] = serde_json::json!({"vulns": vulns});
+            }
+            if all_found {
+                progress(
+                    "osv.query.chunk.vulndb",
+                    &format!(
+                        "offset={} size={}",
+                        chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                        chunk.len()
+                    ),
+                );
+                continue; // skip API call for this chunk
+            }
+        }
 
         // Cluster mode: check PG chunk cache BEFORE the retry loop (outside attempt counting)
         if crate::vuln::cluster_mode() {
