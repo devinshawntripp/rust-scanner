@@ -796,4 +796,56 @@ mod tests {
         assert_eq!(constraints[0].package, "openssl");
         assert_eq!(constraints[0].evr, "1:3.0.7-18.el9");
     }
+
+    #[test]
+    fn test_evaluate_oval_for_packages_vulnerable_vs_patched() {
+        // Synthetic OVAL definition for CVE-2024-0001 targeting openssl with linux-def: namespace
+        // Verifies the full evaluate_oval_for_packages pipeline with EVR comparison
+        let oval_xml = r#"
+<oval_definitions xmlns:linux-def="http://oval.mitre.org/XMLSchema/oval-definitions-5#linux">
+  <definitions>
+    <definition id="oval:com.redhat.rhsa:def:20240001" class="vulnerability">
+      <metadata>
+        <title>RHSA-2024:0001: openssl security update</title>
+        <reference source="CVE" ref_id="CVE-2024-0001"/>
+      </metadata>
+      <criteria operator="AND">
+        <criterion test_ref="oval:com.redhat.rhsa:tst:20240001001" comment="openssl is earlier than 1:3.0.7-25.el9"/>
+      </criteria>
+    </definition>
+  </definitions>
+  <tests>
+    <linux-def:rpminfo_test id="oval:com.redhat.rhsa:tst:20240001001" check="at least one">
+      <linux-def:object object_ref="oval:com.redhat.rhsa:obj:20240001001"/>
+      <linux-def:state state_ref="oval:com.redhat.rhsa:ste:20240001001"/>
+    </linux-def:rpminfo_test>
+  </tests>
+  <objects>
+    <linux-def:rpminfo_object id="oval:com.redhat.rhsa:obj:20240001001">
+      <linux-def:name>openssl</linux-def:name>
+    </linux-def:rpminfo_object>
+  </objects>
+  <states>
+    <linux-def:rpminfo_state id="oval:com.redhat.rhsa:ste:20240001001">
+      <linux-def:evr datatype="evr_string" operation="less than">1:3.0.7-25.el9</linux-def:evr>
+    </linux-def:rpminfo_state>
+  </states>
+</oval_definitions>"#;
+
+        let root = Element::parse(oval_xml.as_bytes()).expect("xml parse");
+        let tests = build_test_constraints(&root);
+
+        // Vulnerable: openssl 1:3.0.7-24.el9 is older than fixed 1:3.0.7-25.el9
+        let mut package_map = HashMap::new();
+        package_map.insert("openssl".to_string(), vec!["1:3.0.7-24.el9".to_string()]);
+        let eval = evaluate_oval_for_packages(&root, &tests, &package_map);
+        assert!(eval.covered_cves.contains("CVE-2024-0001"), "CVE should be covered");
+        assert!(eval.vulnerable_cves.contains("CVE-2024-0001"), "older version should be vulnerable");
+
+        // Patched: openssl 1:3.0.7-25.el9 is exactly at the fixed version (not less than)
+        package_map.insert("openssl".to_string(), vec!["1:3.0.7-25.el9".to_string()]);
+        let eval_patched = evaluate_oval_for_packages(&root, &tests, &package_map);
+        assert!(eval_patched.covered_cves.contains("CVE-2024-0001"), "CVE should still be covered");
+        assert!(!eval_patched.vulnerable_cves.contains("CVE-2024-0001"), "patched version should NOT be vulnerable");
+    }
 }

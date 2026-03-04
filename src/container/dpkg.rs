@@ -108,4 +108,41 @@ mod tests {
         assert_eq!(out[0].name, "libc6");
         assert_eq!(out[0].version, "2.36-9");
     }
+
+    #[test]
+    fn test_parse_dpkg_source_name_extracted() {
+        let status = "Package: libssl3\nStatus: install ok installed\nVersion: 3.0.2-0ubuntu1.10\nSource: openssl\n\n";
+        let mut out = Vec::new();
+        parse_dpkg_status(status, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "libssl3");
+        assert_eq!(out[0].source_name, Some("openssl".into()));
+    }
+
+    #[test]
+    fn test_parse_dpkg_source_name_with_version() {
+        // Source field sometimes has version: "openssl (3.0.2-0ubuntu1.10)"
+        let status = "Package: libssl3\nStatus: install ok installed\nVersion: 3.0.2-0ubuntu1.10\nSource: openssl (3.0.2-0ubuntu1.10)\n\n";
+        let mut out = Vec::new();
+        parse_dpkg_status(status, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source_name, Some("openssl".into()));
+    }
+
+    #[test]
+    fn test_parse_dpkg_no_source_when_same_as_name() {
+        let status = "Package: openssl\nStatus: install ok installed\nVersion: 3.0.2\nSource: openssl\n\n";
+        let mut out = Vec::new();
+        parse_dpkg_status(status, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source_name, None); // same as name, should be None
+    }
+
+    #[test]
+    fn test_parse_dpkg_multiple_packages() {
+        let status = "Package: bash\nStatus: install ok installed\nVersion: 5.1-2\n\nPackage: coreutils\nStatus: install ok installed\nVersion: 8.32-4\n\n";
+        let mut out = Vec::new();
+        parse_dpkg_status(status, &mut out);
+        assert_eq!(out.len(), 2);
+    }
 }

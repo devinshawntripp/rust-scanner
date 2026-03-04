@@ -535,4 +535,16 @@ mod tests {
         let result = parse_rpm_sqlite(Path::new("/nonexistent/rpmdb.sqlite"));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_detect_rpm_no_db_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = detect_rpm_packages_native(tmp.path());
+        // No RPM DB files → should fall through all paths
+        // Either returns Ok(empty) or Err (depending on CLI availability)
+        match result {
+            Ok(pkgs) => assert!(pkgs.is_empty()),
+            Err(_) => {} // Expected when no rpm CLI either
+        }
+    }
 }

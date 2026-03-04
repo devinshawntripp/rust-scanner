@@ -287,4 +287,54 @@ mod tests {
         assert_eq!(rpmvercmp("1.0~beta", "1.0"), Ordering::Less);
         assert_eq!(rpmvercmp("1.0", "1.0~beta"), Ordering::Greater);
     }
+
+    #[test]
+    fn test_compare_evr_no_epoch() {
+        // No epoch prefix — epoch defaults to 0
+        assert_eq!(compare_evr("1.2.3-1.el9", "1.2.3-1.el9"), Ordering::Equal);
+        assert_eq!(compare_evr("1.2.4-1.el9", "1.2.3-1.el9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_evr_epoch_beats_version() {
+        // Higher epoch always wins regardless of version
+        assert_eq!(compare_evr("2:1.0-1", "1:99.99-99"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_evr_release_tiebreaker() {
+        // Same version, different release
+        assert_eq!(compare_evr("1.0-10.el9", "1.0-2.el9"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_evr_tilde_pre_release() {
+        // Tilde sorts lower (pre-release)
+        assert_eq!(compare_evr("1.0~alpha", "1.0"), Ordering::Less);
+        assert_eq!(compare_evr("2.0.0", "2.0.0~rc1"), Ordering::Greater);
+        assert_eq!(compare_evr("1.0~beta2", "1.0~beta1"), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_detect_rhel_major_version_from_packages() {
+        let pkgs = vec![
+            PackageCoordinate { ecosystem: "rocky".into(), name: "bash".into(), version: "5.1.8-6.el9".into(), source_name: None },
+        ];
+        assert_eq!(detect_rhel_major_version(&pkgs), Some(9));
+
+        let pkgs8 = vec![
+            PackageCoordinate { ecosystem: "redhat".into(), name: "openssl".into(), version: "1:1.1.1k-9.el8_8".into(), source_name: None },
+        ];
+        assert_eq!(detect_rhel_major_version(&pkgs8), Some(8));
+    }
+
+    #[test]
+    fn test_is_rpm_ecosystem() {
+        assert!(is_rpm_ecosystem("rocky"));
+        assert!(is_rpm_ecosystem("redhat"));
+        assert!(is_rpm_ecosystem("centos"));
+        assert!(is_rpm_ecosystem("fedora"));
+        assert!(!is_rpm_ecosystem("deb"));
+        assert!(!is_rpm_ecosystem("apk"));
+    }
 }

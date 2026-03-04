@@ -48,3 +48,47 @@ pub(super) fn parse_apk_installed_with_ecosystem(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_apk_basic() {
+        let db = "P:busybox\nV:1.36.1-r2\n\n";
+        let mut out = Vec::new();
+        parse_apk_installed(db, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "busybox");
+        assert_eq!(out[0].version, "1.36.1-r2");
+        assert_eq!(out[0].source_name, None);
+    }
+
+    #[test]
+    fn test_parse_apk_origin_field() {
+        // When origin differs from package name, it should be set as source_name
+        let db = "P:busybox-binsh\nV:1.36.1-r2\no:busybox\n\n";
+        let mut out = Vec::new();
+        parse_apk_installed(db, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "busybox-binsh");
+        assert_eq!(out[0].source_name, Some("busybox".into()));
+    }
+
+    #[test]
+    fn test_parse_apk_origin_same_as_name() {
+        let db = "P:busybox\nV:1.36.1-r2\no:busybox\n\n";
+        let mut out = Vec::new();
+        parse_apk_installed(db, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].source_name, None); // same as name
+    }
+
+    #[test]
+    fn test_parse_apk_multiple_packages() {
+        let db = "P:alpine-baselayout\nV:3.4.0-r0\n\nP:busybox\nV:1.36.1-r2\n\n";
+        let mut out = Vec::new();
+        parse_apk_installed(db, &mut out);
+        assert_eq!(out.len(), 2);
+    }
+}
