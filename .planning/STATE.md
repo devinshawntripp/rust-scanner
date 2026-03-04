@@ -3,12 +3,12 @@ gsd_state_version: 1.0
 milestone: v1.8
 milestone_name: milestone
 status: unknown
-last_updated: "2026-03-04T01:50:27.069Z"
+last_updated: "2026-03-04T02:05:37.117Z"
 progress:
   total_phases: 9
-  completed_phases: 2
+  completed_phases: 3
   total_plans: 9
-  completed_plans: 8
+  completed_plans: 9
 ---
 
 # Project State
@@ -18,14 +18,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-02)
 
 **Core value:** Every scan returns accurate, complete vulnerability results — no false positives, no missed CVEs — by checking local data first and only hitting live APIs as a fallback.
-**Current focus:** Phase 2 - DB-First Enrichment Pipeline
+**Current focus:** Phase 4 - Multi-Format Scanning Reliability — COMPLETE. Next: Phase 3 (RHEL/Rocky Consolidation) or Phase 5 (Test Coverage)
 
 ## Current Position
 
-Phase: 2 of 6 (DB-First Enrichment Pipeline) — COMPLETE
-Plan: 5 of 5 in current phase (COMPLETE — all Phase 2 plans done including gap closure 02-05)
-Status: Phase 02 Complete — all 5 plans (01/02/03/04/05) done. Next: Phase 3 (RHEL/Rocky Consolidation)
-Last activity: 2026-03-03 — Completed 02-05 NVD Query Circuit Breaker Gap Closure: all 4 lower-level NVD query functions now accept CircuitBreaker; binary.rs, container/source.rs, container/scan.rs, container/cli.rs updated; 52/52 tests pass
+Phase: 4 of 6 (Multi-Format Scanning Reliability) — COMPLETE
+Plan: 6 of 6 in current phase (COMPLETE — all Phase 4 plans done including gap closures 04-05 and 04-06)
+Status: Phase 04 Complete — all 6 plans (01/02/03/04/05/06) done. SCAN-01 requirement satisfied. v1.10.0 released on GitHub.
+Last activity: 2026-03-04 — Completed 04-06 v1.10.0 Release: git tag v1.10.0 pushed to origin, GitHub Actions built 4-platform binaries, GitHub release published with 5 assets (linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, checksums)
 
 Progress: [██████████] 67%
 
@@ -53,6 +53,7 @@ Progress: [██████████] 67%
 | Phase 02 P04 | 13min | 2 tasks | 14 files |
 | Phase 02 P05 | 3 | 2 tasks | 6 files |
 | Phase 04 P05 | 2 | 2 tasks | 2 files |
+| Phase 04 P06 | 30min | 2 tasks | 0 files (release only) |
 
 ## Accumulated Context
 
@@ -99,6 +100,8 @@ Recent decisions affecting current work:
 - [Phase 02-05]: Separate named breakers in source.rs: nvd_breaker_build (initial query loop) and nvd_breaker_src (enrich step) to avoid shared state between function phases
 - [Phase 04]: try_extract_dmg_native made pub(crate) for testability — tests can call stub directly without exposing to external crates
 - [Phase 04]: DMG tests use garbage content (not real DMG files) — no external tool dependency in test suite; hdiutil output in logs is expected on macOS
+- [Phase 04-06]: Tag created locally by Claude (pre-push verification), pushed by user — human-action checkpoint is the appropriate gate before triggering CI
+- [Phase 04-06]: release.yml generates checksums.txt alongside 4 platform binary tarballs automatically via softprops/action-gh-release
 
 ### Pending Todos
 
@@ -114,5 +117,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-04
-Stopped at: Phase 4 plan 05 complete — DMG module hardening gap closure. Module-level documentation added for p7zip-full/hdiutil requirements. try_extract_dmg_native made pub(crate). 4 fallback-chain unit tests added. 96/96 tests pass. SCAN-01 satisfied for DMG format.
-Resume file: .planning/phases/04-scanner-hardening/04-05-PLAN.md
+Stopped at: Phase 4 plan 06 complete — v1.10.0 GitHub release. Tag v1.10.0 pushed to origin, GitHub Actions built linux-amd64/linux-arm64/darwin-amd64/darwin-arm64 binaries plus checksums.txt, GitHub release v1.10.0 published. Phase 4 fully complete.
+Resume file: .planning/phases/04-scanner-hardening/04-06-PLAN.md

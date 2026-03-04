@@ -77,8 +77,8 @@ Plans:
 - [x] 04-02-PLAN.md — DMG scanning: macOS package detection and dmgwiz extraction stub
 - [x] 04-03-PLAN.md — OVAL evaluation and package parsing unit tests (QUAL-02/03/04/05)
 - [x] 04-04-PLAN.md — Version bump to 1.10.0 and release artifacts
-- [ ] 04-05-PLAN.md — Gap closure: DMG extraction hardening (documentation, tests, error messages)
-- [ ] 04-06-PLAN.md — Gap closure: Tag and publish GitHub release v1.10.0
+- [x] 04-05-PLAN.md — Gap closure: DMG extraction hardening (documentation, tests, error messages)
+- [x] 04-06-PLAN.md — Gap closure: Tag and publish GitHub release v1.10.0
 
 ### Phase 5: Test Coverage and Cronjob Hardening
 **Goal**: Core scanning logic is covered by unit tests, and the daily CronJob imports complete payloads from all sources into PostgreSQL and exports a usable SQLite snapshot to MinIO
@@ -120,6 +120,6 @@ Plans:
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
 | 2. DB-First Enrichment Pipeline | 4/5 | Gap closure | 2026-03-03 |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
-| 4. Multi-Format Scanning Reliability | 1/2 | In Progress|  |
+| 4. Multi-Format Scanning Reliability | 6/6 | Complete | 2026-03-04 |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
 | 6. UI and Benchmark Validation | 0/TBD | Not started | - |
