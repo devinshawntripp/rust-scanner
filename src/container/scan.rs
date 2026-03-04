@@ -493,6 +493,21 @@ pub fn build_container_report(
         }
     }
 
+    // Post-enrichment deduplication pass: remove duplicate (CVE, package) pairs keeping
+    // the finding with the most complete metadata.
+    {
+        let before_count = findings_norm.len();
+        dedup_findings_by_cve_package(&mut findings_norm);
+        progress(
+            "container.dedup.done",
+            &format!("before={} after={}", before_count, findings_norm.len()),
+        );
+    }
+
+    // RHEL-version CPE gating: remove findings whose package version references a different
+    // RHEL major version than the one detected in the scanned image.
+    filter_findings_by_rhel_version(&mut findings_norm, &packages);
+
     // If this doesn't look like a container and we still found nothing, let caller
     // fall back to source/binary handlers.
     if !has_manifest && !has_oci_index && packages.is_empty() && findings_norm.is_empty() {
@@ -619,5 +634,233 @@ pub fn build_container_report(
 
     crate::progress::finish_pipeline();
     Some(report)
+}
+
+/// Returns a numeric score representing how complete a finding's metadata is.
+/// Higher score = preferred when deduplicating.
+fn metadata_score(f: &crate::report::Finding) -> u32 {
+    let mut score = 0u32;
+    if f.cvss.is_some() {
+        score += 3;
+    }
+    if f.fixed_in.is_some() {
+        score += 2;
+    }
+    // advisory_id represented via source_ids being non-empty
+    if !f.source_ids.is_empty() {
+        score += 1;
+    }
+    score
+}
+
+/// Deduplicates findings by (cve_id, package_name) composite key.
+/// When duplicates exist, keeps the finding with the highest metadata score.
+/// Findings with no package are deduplicated by cve_id alone.
+/// Findings from different packages are always preserved.
+pub(crate) fn dedup_findings_by_cve_package(findings: &mut Vec<crate::report::Finding>) {
+    use std::collections::HashMap;
+
+    // Map of (cve_id, package_name_or_empty) -> index of best candidate so far
+    let mut best: HashMap<(String, String), usize> = HashMap::new();
+    let mut keep = vec![true; findings.len()];
+
+    for (i, f) in findings.iter().enumerate() {
+        let pkg_name = f
+            .package
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let key = (f.id.clone(), pkg_name);
+        match best.get(&key).copied() {
+            None => {
+                best.insert(key, i);
+            }
+            Some(prev_idx) => {
+                if metadata_score(f) > metadata_score(&findings[prev_idx]) {
+                    keep[prev_idx] = false;
+                    best.insert(key, i);
+                } else {
+                    keep[i] = false;
+                }
+            }
+        }
+    }
+
+    let mut iter = keep.into_iter();
+    findings.retain(|_| iter.next().unwrap_or(false));
+}
+
+/// Detects the RHEL major version from the installed package list by inspecting
+/// `.elN` suffixes in package version strings. Returns the most common major version found,
+/// or None if no RPM packages are present or no el-tag is detected.
+fn detect_rhel_major_from_packages(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for pkg in packages {
+        let ver = &pkg.version;
+        // find ".elN" or ".elN." patterns
+        if let Some(pos) = ver.find(".el") {
+            let rest = &ver[pos + 3..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u32>() {
+                *counts.entry(n).or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().max_by_key(|&(_, count)| count).map(|(v, _)| v)
+}
+
+/// Removes findings whose package version string references a different RHEL major version
+/// than the one detected in the scanned container's packages.
+/// Only applies when a single dominant RHEL major version can be detected.
+pub(crate) fn filter_findings_by_rhel_version(
+    findings: &mut Vec<crate::report::Finding>,
+    packages: &[crate::container::PackageCoordinate],
+) {
+    let major = match detect_rhel_major_from_packages(packages) {
+        Some(v) => v,
+        None => return,
+    };
+
+    let before = findings.len();
+    findings.retain(|f| {
+        let pkg_ver = match f.package.as_ref() {
+            Some(p) => &p.version,
+            None => return true, // no package version info — keep
+        };
+        // Check if the finding's package version references a *wrong* RHEL major version
+        // by looking for .elN patterns that do NOT match the detected major.
+        let has_wrong_el = (1u32..=10u32)
+            .filter(|&n| n != major)
+            .any(|n| pkg_ver.contains(&format!(".el{}", n)));
+        let has_correct_el = pkg_ver.contains(&format!(".el{}", major));
+
+        if has_wrong_el && !has_correct_el {
+            false // remove: this finding is for a different RHEL version
+        } else {
+            true
+        }
+    });
+
+    let removed = before - findings.len();
+    if removed > 0 || before > 0 {
+        progress(
+            "container.rhel_version_gating",
+            &format!("rhel_major={} removed={}", major, removed),
+        );
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::report::{ConfidenceTier, CvssInfo, EvidenceSource, Finding, PackageInfo};
+
+    fn make_finding(id: &str, pkg_name: &str, pkg_ver: &str, cvss: Option<f32>, fixed_in: Option<&str>) -> Finding {
+        Finding {
+            id: id.to_string(),
+            source_ids: Vec::new(),
+            package: if pkg_name.is_empty() {
+                None
+            } else {
+                Some(PackageInfo {
+                    name: pkg_name.to_string(),
+                    ecosystem: "redhat".to_string(),
+                    version: pkg_ver.to_string(),
+                })
+            },
+            confidence_tier: ConfidenceTier::ConfirmedInstalled,
+            evidence_source: EvidenceSource::InstalledDb,
+            accuracy_note: None,
+            fixed: None,
+            fixed_in: fixed_in.map(|s| s.to_string()),
+            recommendation: None,
+            severity: None,
+            cvss: cvss.map(|s| CvssInfo { base: s, vector: "CVSS:3.1/AV:N".to_string() }),
+            description: None,
+            evidence: Vec::new(),
+            references: Vec::new(),
+            confidence: None,
+            epss_score: None,
+            epss_percentile: None,
+            in_kev: None,
+        }
+    }
+
+    fn make_pkg(name: &str, ver: &str) -> crate::container::PackageCoordinate {
+        crate::container::PackageCoordinate {
+            ecosystem: "redhat".to_string(),
+            name: name.to_string(),
+            version: ver.to_string(),
+            source_name: None,
+        }
+    }
+
+    /// RHEL-01: duplicate (CVE, package) pairs are collapsed, keeping highest-score finding
+    #[test]
+    fn test_dedup_findings_by_cve_package() {
+        let mut findings = vec![
+            make_finding("CVE-2024-1234", "openssl", "3.0.7-24.el9", None, None),
+            make_finding("CVE-2024-1234", "openssl", "3.0.7-24.el9", Some(7.5), None),
+            make_finding("CVE-2024-1234", "glibc", "2.34-60.el9", None, None),
+        ];
+        dedup_findings_by_cve_package(&mut findings);
+        assert_eq!(findings.len(), 2, "should collapse openssl dups but keep glibc");
+        let openssl_f = findings.iter().find(|f| {
+            f.package.as_ref().map(|p| p.name.as_str()) == Some("openssl")
+        }).expect("openssl finding must remain");
+        assert!(openssl_f.cvss.is_some(), "should keep the finding with CVSS score");
+    }
+
+    /// RHEL-03: different packages with the same CVE are both preserved
+    #[test]
+    fn test_dedup_preserves_different_packages() {
+        let mut findings = vec![
+            make_finding("CVE-2024-5678", "openssl-libs", "3.0.7-24.el9", None, None),
+            make_finding("CVE-2024-5678", "openssl-devel", "3.0.7-24.el9", None, None),
+        ];
+        dedup_findings_by_cve_package(&mut findings);
+        assert_eq!(findings.len(), 2, "different packages must both be preserved");
+    }
+
+    /// RHEL-03: unfixed CVE appearing from multiple sources deduplicates to one per package,
+    /// preferring the entry with fixed_in set.
+    #[test]
+    fn test_dedup_unfixed_cves_once_per_package() {
+        let mut findings = vec![
+            make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, None),
+            make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, Some("7.76.1-27.el9")),
+            make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, None),
+        ];
+        dedup_findings_by_cve_package(&mut findings);
+        assert_eq!(findings.len(), 1, "three dups for same CVE+package should become one");
+        assert!(
+            findings[0].fixed_in.is_some(),
+            "the surviving finding should be the one with fixed_in set"
+        );
+    }
+
+    /// RHEL-02: RHEL-version gating removes findings whose package version references a
+    /// different RHEL major version than the detected image version.
+    #[test]
+    fn test_rhel_version_cpe_gating() {
+        let mut findings = vec![
+            // RHEL 7 finding — should be removed in a RHEL 9 context
+            make_finding("CVE-2023-1111", "openssl", "1.0.2k-19.el7", None, None),
+            // RHEL 9 finding — should be kept
+            make_finding("CVE-2023-2222", "openssl", "3.0.7-24.el9", None, None),
+        ];
+        // Simulate a RHEL 9 container: packages have .el9 versions
+        let packages = vec![
+            make_pkg("glibc", "2.34-60.el9"),
+            make_pkg("bash", "5.1.8-6.el9"),
+        ];
+        filter_findings_by_rhel_version(&mut findings, &packages);
+        assert_eq!(findings.len(), 1, "RHEL 7 finding should be removed in RHEL 9 context");
+        assert_eq!(
+            findings[0].id, "CVE-2023-2222",
+            "only the RHEL 9 finding should remain"
+        );
+    }
 }
 
