@@ -1,4 +1,28 @@
 //! DMG (macOS disk image) extraction and scanning.
+//!
+//! # External Tool Requirements
+//!
+//! DMG extraction requires one of the following external tools:
+//!
+//! - **`hdiutil`** — macOS only, built-in. Used when the scanner runs on macOS.
+//! - **`7z`** — Cross-platform. Provided by the `p7zip-full` package on Linux/Debian.
+//!   The worker Docker image (Dockerfile) already installs `p7zip-full`, so `7z`
+//!   is available in production without any extra configuration.
+//!
+//! # Extraction Fallback Chain
+//!
+//! 1. `try_extract_dmg_native()` — Rust-native via dmgwiz. **Intentionally a no-op.**
+//!    dmgwiz extracts raw disk partition bytes, not a filesystem tree. We need a tree
+//!    to walk for packages and binaries, so this always bails and falls through to step 2.
+//! 2. `hdiutil attach` — macOS only (compile-time `cfg!(target_os = "macos")` guard).
+//! 3. `7z x` — Cross-platform fallback. The production path for Linux/worker deployments.
+//!
+//! # Graceful Degradation
+//!
+//! If all extraction methods fail (e.g., in a test environment without 7z), `build_dmg_report()`
+//! does **not** return `None`. Instead it falls through to binary-only scanning with an empty
+//! package list, emitting a warning in the progress output. This ensures a report is always
+//! returned for DMG inputs, even when extraction is impossible.
 
 use crate::report::{
     compute_summary, InventoryStatus, Report, ScanStatus, ScannerInfo, TargetInfo,
@@ -23,7 +47,7 @@ use super::detect::{detect_app_packages, detect_macos_packages};
 ///
 /// Keeping this as a stub satisfies the Cargo.toml dependency declaration and ensures
 /// the dmgwiz crate is compiled and available for future use.
-fn try_extract_dmg_native(_path: &str, _dest: &Path) -> anyhow::Result<()> {
+pub(crate) fn try_extract_dmg_native(_path: &str, _dest: &Path) -> anyhow::Result<()> {
     anyhow::bail!(
         "dmgwiz extracts raw disk partition data, not a filesystem tree — falling through to external tools"
     )
@@ -97,7 +121,7 @@ pub fn extract_dmg(path: &str, dest: &Path) -> anyhow::Result<()> {
             s.code().unwrap_or(-1)
         ),
         Err(_) => anyhow::bail!(
-            "DMG extraction requires hdiutil (macOS) or 7z. Neither was found."
+            "DMG extraction requires hdiutil (macOS) or 7z (apt: p7zip-full). Neither was found. Install p7zip-full on Linux or use macOS for DMG scanning."
         ),
     }
 }
