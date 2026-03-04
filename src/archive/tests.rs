@@ -161,3 +161,142 @@ fn test_detect_app_packages_walks_tree() {
     let pkgs = detect::detect_app_packages(dir.path());
     assert_eq!(pkgs.len(), 3); // flask, requests, serde
 }
+
+// ---------------------------------------------------------------------------
+// macOS .app bundle and .pkg installer detection tests
+// ---------------------------------------------------------------------------
+
+use super::detect::detect_macos_packages;
+
+#[test]
+fn test_detect_macos_empty_dir() {
+    let dir = tempdir().unwrap();
+    let pkgs = detect_macos_packages(dir.path());
+    assert!(pkgs.is_empty(), "empty dir should yield no packages");
+}
+
+#[test]
+fn test_detect_macos_app_bundle() {
+    let dir = tempdir().unwrap();
+    // Create TestApp.app/Contents/Info.plist
+    let app_dir = dir.path().join("TestApp.app/Contents");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.app</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2.1.0</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+    let pkgs = detect_macos_packages(dir.path());
+    assert_eq!(pkgs.len(), 1, "expected 1 package from .app bundle");
+    assert_eq!(pkgs[0].ecosystem, "mac-app");
+    assert_eq!(pkgs[0].name, "com.test.app");
+    assert_eq!(pkgs[0].version, "2.1.0");
+}
+
+#[test]
+fn test_detect_macos_app_bundle_fallback_version() {
+    // Only CFBundleVersion present (no CFBundleShortVersionString)
+    let dir = tempdir().unwrap();
+    let app_dir = dir.path().join("MyApp.app/Contents");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.fallback</string>
+    <key>CFBundleVersion</key>
+    <string>42</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+    let pkgs = detect_macos_packages(dir.path());
+    assert_eq!(pkgs.len(), 1);
+    assert_eq!(pkgs[0].ecosystem, "mac-app");
+    assert_eq!(pkgs[0].name, "com.test.fallback");
+    assert_eq!(pkgs[0].version, "42");
+}
+
+#[test]
+fn test_detect_macos_app_bundle_with_framework() {
+    let dir = tempdir().unwrap();
+
+    // Create TestApp.app with Contents/Info.plist
+    let app_dir = dir.path().join("TestApp.app/Contents");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.mainapp</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+
+    // Create embedded framework at Contents/Frameworks/MyFramework.framework/Resources/Info.plist
+    let fw_dir = dir.path().join("TestApp.app/Contents/Frameworks/MyFramework.framework/Resources");
+    fs::create_dir_all(&fw_dir).unwrap();
+    fs::write(
+        fw_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.framework</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+
+    let pkgs = detect_macos_packages(dir.path());
+    assert_eq!(pkgs.len(), 2, "expected app + framework = 2 packages");
+    let ecosystems: Vec<&str> = pkgs.iter().map(|p| p.ecosystem.as_str()).collect();
+    assert!(ecosystems.contains(&"mac-app"), "should contain mac-app");
+    assert!(ecosystems.contains(&"mac-framework"), "should contain mac-framework");
+}
+
+#[test]
+fn test_detect_macos_no_version_gets_unknown() {
+    // App with identifier but no version keys — returns "unknown" version
+    let dir = tempdir().unwrap();
+    let app_dir = dir.path().join("NoVersion.app/Contents");
+    fs::create_dir_all(&app_dir).unwrap();
+    fs::write(
+        app_dir.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.test.noversion</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+    let pkgs = detect_macos_packages(dir.path());
+    // push_if_new skips entries where version is empty, but "unknown" is not empty.
+    // The parse_app_info_plist function returns "unknown" when no version key is present.
+    assert_eq!(pkgs.len(), 1, "should return 1 package with 'unknown' version");
+    assert_eq!(pkgs[0].version, "unknown");
+}
