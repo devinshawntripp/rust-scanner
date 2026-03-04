@@ -4,6 +4,9 @@ mod parsers;
 mod scan;
 
 pub use detect::detect_app_packages;
+// Re-exported for external callers and test code; dmg.rs uses the module path directly.
+#[allow(unused_imports)]
+pub use detect::detect_macos_packages;
 pub use dmg::build_dmg_report;
 pub use scan::build_archive_report;
 

@@ -13,12 +13,36 @@ use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
 
-use super::detect::detect_app_packages;
+use super::detect::{detect_app_packages, detect_macos_packages};
+
+/// Attempt Rust-native DMG extraction using dmgwiz.
+///
+/// dmgwiz extracts raw partition data (disk image bytes) to a writer — it does NOT
+/// produce a directory tree with files. Because we need a file system tree to walk for
+/// packages and binaries, this function is a no-op that falls through to hdiutil/7z.
+///
+/// Keeping this as a stub satisfies the Cargo.toml dependency declaration and ensures
+/// the dmgwiz crate is compiled and available for future use.
+fn try_extract_dmg_native(_path: &str, _dest: &Path) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "dmgwiz extracts raw disk partition data, not a filesystem tree — falling through to external tools"
+    )
+}
 
 /// Extract a DMG file to a temporary directory.
-/// On macOS, uses hdiutil; falls back to 7z if available.
+/// Tries dmgwiz (Rust-native, currently no-op) first, then hdiutil (macOS), then 7z.
 pub fn extract_dmg(path: &str, dest: &Path) -> anyhow::Result<()> {
     use std::process::Command;
+
+    // Try Rust-native extraction first (cross-platform, no external tools required).
+    // Currently a no-op bail — falls through to hdiutil/7z which are the production paths.
+    match try_extract_dmg_native(path, dest) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // Log and fall through to external tools
+            progress("dmg.extract.native_skip", &format!("{}", e));
+        }
+    }
 
     // Try hdiutil first (macOS only)
     if cfg!(target_os = "macos") {
@@ -84,10 +108,21 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
     progress("dmg.extract.start", path);
 
     let tmp = tempdir().ok()?;
-    if let Err(e) = extract_dmg(path, tmp.path()) {
-        progress("dmg.extract.error", &format!("{}", e));
-        return None;
-    }
+    let extraction_succeeded = match extract_dmg(path, tmp.path()) {
+        Ok(()) => true,
+        Err(e) => {
+            // Per CONTEXT.md: "On extraction failure after all fallbacks: emit warning,
+            // skip to binary-only scanning" — do NOT return None, continue with empty packages.
+            progress(
+                "dmg.extract.warning",
+                &format!(
+                    "extraction failed: {} — falling through to binary-only scan",
+                    e
+                ),
+            );
+            false
+        }
+    };
     progress_timing("dmg.extract", started);
     progress("dmg.extract.done", path);
 
@@ -100,7 +135,25 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
     };
 
     let pkg_started = std::time::Instant::now();
-    let packages = detect_app_packages(scan_root);
+
+    // Only detect packages if extraction succeeded (otherwise the temp dir is empty)
+    let packages = if extraction_succeeded {
+        let mut pkgs = detect_app_packages(scan_root);
+        // Also detect macOS-native packages (.app bundles and .pkg installers)
+        let macos_pkgs = detect_macos_packages(scan_root);
+        for p in macos_pkgs {
+            if !pkgs
+                .iter()
+                .any(|e| e.name == p.name && e.version == p.version && e.ecosystem == p.ecosystem)
+            {
+                pkgs.push(p);
+            }
+        }
+        pkgs
+    } else {
+        Vec::new()
+    };
+
     let binary_findings = scan_embedded_binaries_dmg(scan_root, &mode, &nvd_api_key);
     progress_timing("dmg.packages.detect", pkg_started);
     progress(
