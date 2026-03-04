@@ -300,3 +300,86 @@ fn test_detect_macos_no_version_gets_unknown() {
     assert_eq!(pkgs.len(), 1, "should return 1 package with 'unknown' version");
     assert_eq!(pkgs[0].version, "unknown");
 }
+
+// ---------------------------------------------------------------------------
+// DMG extraction fallback chain tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dmg_native_extraction_always_bails() {
+    // try_extract_dmg_native is intentionally a no-op: dmgwiz extracts raw disk
+    // partition data, not a filesystem tree. This test confirms the stub always
+    // returns an error so the fallback chain (hdiutil -> 7z) is always reached.
+    let dir = tempdir().unwrap();
+    let result = super::dmg::try_extract_dmg_native("fake.dmg", dir.path());
+    assert!(result.is_err(), "native extraction must always bail");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("raw disk partition data"),
+        "error message should mention raw disk partition data, got: {err_msg}"
+    );
+}
+
+#[test]
+fn test_dmg_extract_nonexistent_file_returns_error() {
+    // extract_dmg() on a non-existent file should always return a structured
+    // Err — never panic. On CI (with 7z) this will be a 7z error; on dev machines
+    // without 7z it will be the "Neither was found" error. Both are acceptable.
+    let dir = tempdir().unwrap();
+    let result = super::dmg::extract_dmg("/nonexistent/path/file.dmg", dir.path());
+    assert!(result.is_err(), "extract_dmg on missing file must return Err");
+}
+
+#[test]
+fn test_dmg_build_report_extraction_failure_returns_some() {
+    // build_dmg_report MUST return Some even when extraction fails.
+    // Per the graceful degradation design: extraction failure falls through to
+    // binary-only scanning with empty packages. The result is a valid (but empty)
+    // report, not None.
+    let dir = tempdir().unwrap();
+    let garbage_file = dir.path().join("garbage.dmg");
+    fs::write(&garbage_file, b"not a real dmg file - just garbage bytes for testing").unwrap();
+
+    let result = super::dmg::build_dmg_report(
+        &garbage_file.to_string_lossy(),
+        crate::ScanMode::Light,
+        None,
+    );
+
+    assert!(
+        result.is_some(),
+        "build_dmg_report must return Some even on extraction failure"
+    );
+    let report = result.unwrap();
+    assert_eq!(
+        report.scan_status,
+        crate::report::ScanStatus::Complete,
+        "scan_status must be Complete (extraction failure is graceful, not a scan error)"
+    );
+    assert_eq!(
+        report.inventory_status,
+        crate::report::InventoryStatus::Missing,
+        "inventory_status must be Missing (no packages in garbage input)"
+    );
+}
+
+#[test]
+fn test_dmg_build_report_target_type() {
+    // Verify the DMG pipeline sets target.target_type = "dmg" so the report
+    // is correctly identified as a DMG scan in downstream consumers.
+    let dir = tempdir().unwrap();
+    let garbage_file = dir.path().join("test.dmg");
+    fs::write(&garbage_file, b"garbage dmg content").unwrap();
+
+    let result = super::dmg::build_dmg_report(
+        &garbage_file.to_string_lossy(),
+        crate::ScanMode::Light,
+        None,
+    );
+
+    let report = result.expect("build_dmg_report must return Some");
+    assert_eq!(
+        report.target.target_type, "dmg",
+        "target.target_type must be 'dmg' for DMG pipeline"
+    );
+}
