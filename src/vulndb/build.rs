@@ -557,52 +557,90 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
         eprintln!(); // newline after progress bar
     }
 
-    // Decompress to temp file, then atomic rename
-    let gz_len = gz_bytes.len() as u64;
-    if is_tty {
-        eprint!("  Decompressing...");
-    }
-    progress("vulndb.fetch.decompress", "decompressing vulndb");
-    let mut decoder = GzDecoder::new(std::io::Cursor::new(&gz_bytes));
+    // Detect format via magic bytes
+    let is_gzip = gz_bytes.len() >= 2 && gz_bytes[0] == 0x1f && gz_bytes[1] == 0x8b;
+    let is_sqlite = gz_bytes.len() >= 4 && &gz_bytes[0..4] == b"SQLi";
+
     let parent = db_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid db path"))?;
     std::fs::create_dir_all(parent)?;
     let tmp_path = parent.join(".scanrook.db.tmp");
-    {
-        let mut tmp_file = std::fs::File::create(&tmp_path)?;
-        let mut decompressed: u64 = 0;
-        let mut last_dpct: u8 = 0;
-        let mut dbuf = [0u8; 131072];
-        loop {
-            let n = decoder.read(&mut dbuf)?;
-            if n == 0 {
-                break;
-            }
-            tmp_file.write_all(&dbuf[..n])?;
-            decompressed += n as u64;
-            let consumed = decoder.get_ref().position();
-            let dpct = if gz_len > 0 {
-                ((consumed as f64 / gz_len as f64) * 100.0).min(100.0) as u8
-            } else {
-                0
-            };
-            if dpct > last_dpct {
-                last_dpct = dpct;
-                if is_tty {
-                    let filled = (dpct as usize) / 3;
-                    let empty = 33usize.saturating_sub(filled);
-                    eprint!(
-                        "\r  [\x1b[33m{}\x1b[0m{}] {}% \u{2014} {:.0} MB decompressed",
-                        "\u{2588}".repeat(filled),
-                        "\u{2591}".repeat(empty),
-                        dpct,
-                        decompressed as f64 / 1_048_576.0,
-                    );
+
+    if is_sqlite {
+        // Raw SQLite file -- write directly to disk, no decompression needed
+        progress("vulndb.fetch.format", "raw_sqlite");
+        if is_tty {
+            eprint!("  Writing raw SQLite...");
+        }
+        std::fs::write(&tmp_path, &gz_bytes)?;
+        if is_tty {
+            eprintln!(" done");
+        }
+    } else {
+        // Gzip compressed (or unknown -- try gzip, fall back to raw)
+        if is_gzip {
+            progress("vulndb.fetch.format", "gzip");
+        } else {
+            progress("vulndb.fetch.format", "unknown (trying gzip)");
+        }
+
+        let gz_len = gz_bytes.len() as u64;
+        if is_tty {
+            eprint!("  Decompressing...");
+        }
+        progress("vulndb.fetch.decompress", "decompressing vulndb");
+
+        let gzip_result: Result<(), std::io::Error> = (|| {
+            let mut decoder = GzDecoder::new(std::io::Cursor::new(&gz_bytes));
+            let mut tmp_file = std::fs::File::create(&tmp_path)?;
+            let mut decompressed: u64 = 0;
+            let mut last_dpct: u8 = 0;
+            let mut dbuf = [0u8; 131072];
+            loop {
+                let n = decoder.read(&mut dbuf)?;
+                if n == 0 {
+                    break;
+                }
+                tmp_file.write_all(&dbuf[..n])?;
+                decompressed += n as u64;
+                let consumed = decoder.get_ref().position();
+                let dpct = if gz_len > 0 {
+                    ((consumed as f64 / gz_len as f64) * 100.0).min(100.0) as u8
+                } else {
+                    0
+                };
+                if dpct > last_dpct {
+                    last_dpct = dpct;
+                    if is_tty {
+                        let filled = (dpct as usize) / 3;
+                        let empty = 33usize.saturating_sub(filled);
+                        eprint!(
+                            "\r  [\x1b[33m{}\x1b[0m{}] {}% \u{2014} {:.0} MB decompressed",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(empty),
+                            dpct,
+                            decompressed as f64 / 1_048_576.0,
+                        );
+                    }
                 }
             }
+            tmp_file.flush()?;
+            Ok(())
+        })();
+
+        if let Err(e) = gzip_result {
+            if !is_gzip {
+                // Unknown format and gzip failed -- try writing raw bytes as SQLite fallback
+                progress("vulndb.fetch.format", "gzip_failed_fallback_raw");
+                std::fs::write(&tmp_path, &gz_bytes)?;
+            } else {
+                // Was identified as gzip but decompression failed
+                let _ = std::fs::remove_file(&tmp_path);
+                anyhow::bail!("gzip decompression failed: {}", e);
+            }
         }
-        tmp_file.flush()?;
+
         if is_tty {
             eprintln!();
         }
@@ -612,21 +650,27 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
     std::fs::rename(&tmp_path, &db_path)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    // Verify by opening
-    if let Some(conn) = open_vulndb() {
-        let build_date = db_build_date(&conn).unwrap_or_default();
-        println!(
-            "vulndb installed: {} ({:.1} MB, build_date={})",
-            db_path.display(),
-            db_size as f64 / 1_048_576.0,
-            build_date,
-        );
-    } else {
-        println!(
-            "vulndb installed: {} ({:.1} MB)",
-            db_path.display(),
-            db_size as f64 / 1_048_576.0
-        );
+
+    // Validate the downloaded database
+    match open_vulndb() {
+        Some(conn) => {
+            if let Err(e) = validate_vulndb(&conn) {
+                // Validation failed -- remove corrupt DB and bail
+                let _ = std::fs::remove_file(&db_path);
+                anyhow::bail!("vulndb validation failed after download: {}", e);
+            }
+            let build_date = db_build_date(&conn).unwrap_or_default();
+            println!(
+                "vulndb installed: {} ({:.1} MB, build_date={})",
+                db_path.display(),
+                db_size as f64 / 1_048_576.0,
+                build_date,
+            );
+        }
+        None => {
+            let _ = std::fs::remove_file(&db_path);
+            anyhow::bail!("vulndb file could not be opened after download -- corrupt or invalid format");
+        }
     }
     Ok(())
 }

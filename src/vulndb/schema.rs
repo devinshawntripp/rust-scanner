@@ -131,3 +131,32 @@ pub fn optimize_db(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("PRAGMA optimize; PRAGMA journal_mode=WAL;")?;
     Ok(())
 }
+
+/// Validate the vulndb after download. Checks for required metadata and table existence.
+pub fn validate_vulndb(conn: &Connection) -> anyhow::Result<()> {
+    // Check schema_version exists
+    let schema_version: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if schema_version.is_none() {
+        anyhow::bail!("vulndb missing 'schema_version' in metadata table");
+    }
+
+    // Check build_date exists
+    let build_date: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'build_date'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if build_date.is_none() {
+        anyhow::bail!("vulndb missing 'build_date' in metadata table");
+    }
+
+    Ok(())
+}
