@@ -84,12 +84,227 @@ CREATE INDEX IF NOT EXISTS idx_alpine_pkg_branch ON alpine_secdb (package, branc
 
 /// Get the build date from metadata.
 pub fn db_build_date(conn: &Connection) -> Option<String> {
+    get_metadata(conn, "build_date")
+}
+
+/// Generic metadata lookup by key.
+pub fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
     conn.query_row(
-        "SELECT value FROM metadata WHERE key = 'build_date'",
-        [],
+        "SELECT value FROM metadata WHERE key = ?1",
+        params![key],
         |row| row.get(0),
     )
     .ok()
+}
+
+/// Load a zstd dictionary blob from the metadata table.
+/// Dict values are stored as hex-encoded strings in the TEXT value column.
+/// Used for keys like `nvd_zstd_dict` and `osv_zstd_dict`.
+pub fn get_dict(conn: &Connection, key: &str) -> Option<Vec<u8>> {
+    let hex_str: String = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .ok()?;
+    decode_hex(&hex_str)
+}
+
+/// Decode a hex-encoded string into bytes. Returns None on invalid hex.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Check if the database uses dictionary compression for payloads.
+pub fn has_dict_compression(conn: &Connection) -> bool {
+    get_metadata(conn, "dict_compression")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Look up a single NVD CVE by ID. Decompresses the payload blob and returns parsed JSON.
+/// Uses dictionary decompression if `dict_compression=1` in metadata.
+pub fn query_nvd_cve(conn: &Connection, cve_id: &str) -> Option<serde_json::Value> {
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM nvd_cves WHERE cve_id = ?1",
+            params![cve_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+
+    let json_bytes = decompress_nvd_payload(conn, &payload)?;
+    serde_json::from_slice(&json_bytes).ok()
+}
+
+/// Query OSV vulnerabilities by package ecosystem and name.
+/// Joins osv_vulns with osv_payloads, decompresses each payload, returns parsed JSON array.
+pub fn query_osv_by_package(conn: &Connection, ecosystem: &str, name: &str) -> Vec<serde_json::Value> {
+    let mut stmt = match conn.prepare(
+        "SELECT p.payload FROM osv_vulns v
+         JOIN osv_payloads p ON v.id = p.id
+         WHERE v.ecosystem = ?1 AND v.name = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let use_dict = has_dict_compression(conn);
+    let dict = if use_dict {
+        get_dict(conn, "osv_zstd_dict")
+    } else {
+        None
+    };
+
+    let rows = stmt
+        .query_map(params![ecosystem, name], |row| {
+            let payload: Vec<u8> = row.get(0)?;
+            Ok(payload)
+        })
+        .ok();
+
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+
+    rows.filter_map(|r| r.ok())
+        .filter_map(|payload| {
+            let json_bytes = if use_dict {
+                if let Some(ref d) = dict {
+                    super::compress::decompress_payload_with_dict(&payload, d)
+                } else {
+                    super::compress::decompress_payload(&payload)
+                }
+            } else {
+                super::compress::decompress_payload(&payload)
+            };
+            json_bytes.and_then(|b| serde_json::from_slice(&b).ok())
+        })
+        .collect()
+}
+
+/// Look up EPSS score and percentile for a CVE. Returns (score, percentile).
+pub fn query_epss(conn: &Connection, cve_id: &str) -> Option<(f32, f32)> {
+    conn.query_row(
+        "SELECT score, percentile FROM epss_scores WHERE cve_id = ?1",
+        params![cve_id],
+        |row| {
+            let score: f64 = row.get(0)?;
+            let percentile: f64 = row.get(1)?;
+            Ok((score as f32, percentile as f32))
+        },
+    )
+    .ok()
+}
+
+/// Check if a CVE exists in the Known Exploited Vulnerabilities catalog.
+pub fn query_kev(conn: &Connection, cve_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM kev_entries WHERE cve_id = ?1",
+        params![cve_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Query Debian security tracker for a package in a specific release.
+/// Returns Vec of (cve_id, status, fixed_version).
+pub fn query_debian(conn: &Connection, package: &str, release: &str) -> Vec<(String, String, String)> {
+    let mut stmt = match conn.prepare(
+        "SELECT cve_id, status, COALESCE(fixed_version, '') FROM debian_tracker
+         WHERE package = ?1 AND release = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    stmt.query_map(params![package, release], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Query Ubuntu USN data for a package in a specific release.
+/// Returns Vec of (cve_id, priority).
+pub fn query_ubuntu(conn: &Connection, package: &str, release: &str) -> Vec<(String, String)> {
+    let mut stmt = match conn.prepare(
+        "SELECT cve_id, COALESCE(priority, '') FROM ubuntu_usn
+         WHERE package = ?1 AND release = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    stmt.query_map(params![package, release], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+        ))
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Query Alpine SecDB for a package in a specific branch.
+/// Returns Vec of (cve_id, fixed_version).
+pub fn query_alpine(conn: &Connection, package: &str, branch: &str) -> Vec<(String, String)> {
+    let mut stmt = match conn.prepare(
+        "SELECT cve_id, COALESCE(fixed_version, '') FROM alpine_secdb
+         WHERE package = ?1 AND branch = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    stmt.query_map(params![package, branch], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+        ))
+    })
+    .ok()
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Helper: decompress an NVD payload blob, using dict if available.
+fn decompress_nvd_payload(conn: &Connection, payload: &[u8]) -> Option<Vec<u8>> {
+    if has_dict_compression(conn) {
+        if let Some(dict) = get_dict(conn, "nvd_zstd_dict") {
+            return super::compress::decompress_payload_with_dict(payload, &dict);
+        }
+    }
+    super::compress::decompress_payload(payload)
 }
 
 // --- DB creation & metadata ---
@@ -132,30 +347,65 @@ pub fn optimize_db(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validate the vulndb after download. Checks for required metadata and table existence.
+/// Validate the vulndb after download. Checks for required metadata, table existence,
+/// dictionary availability (if dict_compression enabled), and sample payload decompression.
 pub fn validate_vulndb(conn: &Connection) -> anyhow::Result<()> {
     // Check schema_version exists
-    let schema_version: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    if schema_version.is_none() {
+    if get_metadata(conn, "schema_version").is_none() {
         anyhow::bail!("vulndb missing 'schema_version' in metadata table");
     }
 
     // Check build_date exists
-    let build_date: Option<String> = conn
+    if get_metadata(conn, "build_date").is_none() {
+        anyhow::bail!("vulndb missing 'build_date' in metadata table");
+    }
+
+    // If dict_compression is enabled, verify dictionaries are present
+    if has_dict_compression(conn) {
+        if get_dict(conn, "nvd_zstd_dict").is_none() {
+            anyhow::bail!("vulndb has dict_compression=1 but missing 'nvd_zstd_dict' dictionary");
+        }
+        if get_dict(conn, "osv_zstd_dict").is_none() {
+            anyhow::bail!("vulndb has dict_compression=1 but missing 'osv_zstd_dict' dictionary");
+        }
+    }
+
+    // Try decompressing a sample NVD payload if any exist
+    let nvd_sample: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT value FROM metadata WHERE key = 'build_date'",
+            "SELECT payload FROM nvd_cves LIMIT 1",
             [],
             |row| row.get(0),
         )
         .ok();
-    if build_date.is_none() {
-        anyhow::bail!("vulndb missing 'build_date' in metadata table");
+    if let Some(payload) = nvd_sample {
+        if decompress_nvd_payload(conn, &payload).is_none() {
+            anyhow::bail!("vulndb validation: failed to decompress sample NVD payload");
+        }
+    }
+
+    // Try decompressing a sample OSV payload if any exist
+    let osv_sample: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT payload FROM osv_payloads LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(payload) = osv_sample {
+        let use_dict = has_dict_compression(conn);
+        let decompressed = if use_dict {
+            if let Some(dict) = get_dict(conn, "osv_zstd_dict") {
+                super::compress::decompress_payload_with_dict(&payload, &dict)
+            } else {
+                super::compress::decompress_payload(&payload)
+            }
+        } else {
+            super::compress::decompress_payload(&payload)
+        };
+        if decompressed.is_none() {
+            anyhow::bail!("vulndb validation: failed to decompress sample OSV payload");
+        }
     }
 
     Ok(())
