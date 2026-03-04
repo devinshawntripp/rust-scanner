@@ -94,21 +94,14 @@ jobs:
             ## ScanRook v${{ env.VERSION }}
 
             ### New Features
-            - **EPSS enrichment** — Every finding now includes EPSS exploit probability scores from FIRST.org
-            - **CISA KEV tagging** — Findings matching the Known Exploited Vulnerabilities catalog are automatically flagged
-            - **SBOM policy gates** — New `sbom policy check` subcommand for CI/CD enforcement of vulnerability thresholds
-            - **License detection** — Detect 15 license types (MIT, Apache-2.0, GPL, BSD, ISC, MPL, etc.) in source trees
-            - **5 new distro ecosystems** — Amazon Linux, Oracle Linux, AlmaLinux, Chainguard, Wolfi
-
-            ### Security
-            - Fixed path traversal (Zip Slip) vulnerability in tar extraction
-            - Hardened ISO extraction against symlink escape
-            - Cache directories now created with 0o700 permissions
-            - Decompression bomb protection (2GB per-entry limit)
+            - **DMG scanning** — Detect macOS .app bundles and embedded frameworks via Info.plist parsing
+            - **RHEL/Rocky consolidation** — Unified enrichment pipeline with post-enrichment dedup eliminates duplicate CVE findings
+            - **RHEL version gating** — Strict CPE filtering prevents RHEL 7/8 false positives in RHEL 9 scans
 
             ### Improvements
-            - Expanded benchmark matrix: ubuntu:22.04, debian:12, alpine:3.20, rockylinux:9, node:22-slim
-            - Updated README with full benchmark comparison table (ScanRook vs Trivy vs Grype)
+            - DMG extraction gracefully falls through to binary-only scanning on failure (no hard errors)
+            - Rust-native DMG extraction via dmgwiz attempted before external tool fallback
+            - 25+ new unit tests for version comparison, CPE matching, EVR comparison, and package parsing
 
             ### Install
             ```bash
