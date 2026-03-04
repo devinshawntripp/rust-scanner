@@ -71,12 +71,14 @@ Plans:
   1. Scanning an ISO image, an OCI image tar, a docker-save tar, a DMG, and a source tar.gz all complete without a panic or process hang
   2. Malformed or partially corrupted archives return a structured error (not a panic), emit an error progress event, and exit with non-zero status
   3. A test suite of at least three real image tarballs (different formats) passes through the full scan pipeline end-to-end
-**Plans**: 4 plans
+**Plans**: 6 plans
 Plans:
-- [ ] 02-01-PLAN.md — Foundation: CircuitBreaker struct, PG schema extensions, jittered TTL, report warnings
-- [ ] 02-02-PLAN.md — osv_batch_query PG cache support + all 10 caller updates
-- [ ] 02-03-PLAN.md — EPSS/KEV PG cache support + all caller updates
-- [ ] 02-04-PLAN.md — Circuit breaker wiring, mode separation enforcement, report warnings collection
+- [x] 04-01-PLAN.md — Post-enrichment dedup and RHEL-version CPE gating
+- [x] 04-02-PLAN.md — DMG scanning: macOS package detection and dmgwiz extraction stub
+- [x] 04-03-PLAN.md — OVAL evaluation and package parsing unit tests (QUAL-02/03/04/05)
+- [x] 04-04-PLAN.md — Version bump to 1.10.0 and release artifacts
+- [ ] 04-05-PLAN.md — Gap closure: DMG extraction hardening (documentation, tests, error messages)
+- [ ] 04-06-PLAN.md — Gap closure: Tag and publish GitHub release v1.10.0
 
 ### Phase 5: Test Coverage and Cronjob Hardening
 **Goal**: Core scanning logic is covered by unit tests, and the daily CronJob imports complete payloads from all sources into PostgreSQL and exports a usable SQLite snapshot to MinIO
@@ -118,6 +120,6 @@ Plans:
 | 1. Code Audit and Module Refactor | 2/2 | Complete | 2026-03-03 |
 | 2. DB-First Enrichment Pipeline | 4/5 | Gap closure | 2026-03-03 |
 | 3. RHEL/Rocky Consolidation | 0/TBD | Not started | - |
-| 4. Multi-Format Scanning Reliability | 0/TBD | Not started | - |
+| 4. Multi-Format Scanning Reliability | 4/6 | Gap closure | - |
 | 5. Test Coverage and Cronjob Hardening | 0/TBD | Not started | - |
 | 6. UI and Benchmark Validation | 0/TBD | Not started | - |
