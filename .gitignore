@@ -30,3 +30,7 @@ dist/
 # Claude Code
 CLAUDE.md
 .claude/
+
+# Build artifacts
+scanrook-linux-amd64
+blobs/
