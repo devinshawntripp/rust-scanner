@@ -80,6 +80,29 @@ pub fn epss_enrich_findings(
         }
     }
 
+    // Standalone mode: check local vulndb for EPSS scores
+    if !crate::vuln::cluster_mode() {
+        if let Some(conn) = crate::vulndb::open_vulndb() {
+            let mut db_hits = 0usize;
+            let mut still_needed: Vec<String> = Vec::new();
+            for id in &api_ids {
+                if let Some((score, percentile)) = crate::vulndb::query_epss(&conn, id) {
+                    scores.insert(id.clone(), (score, percentile));
+                    db_hits += 1;
+                } else {
+                    still_needed.push(id.clone());
+                }
+            }
+            if db_hits > 0 {
+                progress(
+                    "epss.enrich.vulndb_hit",
+                    &format!("hit={} miss={}", db_hits, still_needed.len()),
+                );
+            }
+            api_ids = still_needed;
+        }
+    }
+
     // Fetch remaining IDs from FIRST.org API (or all IDs in standalone mode)
     let mut api_fetched: Vec<(String, f32, f32)> = Vec::new();
     for chunk in api_ids.chunks(100) {
