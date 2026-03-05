@@ -11,11 +11,20 @@ pub fn build_scan_report_value(
     nvd_api_key: Option<String>,
     oval_redhat: Option<String>,
 ) -> Option<Value> {
+    let dmg_like = looks_like_dmg_input(file);
     let tar_like = looks_like_tar_input(file);
     let iso_like = looks_like_iso_input(file);
     let sbom_like = looks_like_sbom_input(file);
     let zip_like = looks_like_zip_input(file);
-    let dmg_like = looks_like_dmg_input(file);
+    // DMG before tar: UDIF DMGs use bzip2 compression internally, which triggers
+    // looks_like_tar_input(). Checking DMG first prevents bzip2-compressed DMGs
+    // from being misrouted to the tar pipeline.
+    if dmg_like {
+        if let Some(r) = archive::build_dmg_report(file, mode.clone(), nvd_api_key.clone()) {
+            return serde_json::to_value(r).ok();
+        }
+        return None;
+    }
     if tar_like {
         if let Some(r) = container::build_container_report(
             file,
@@ -49,12 +58,6 @@ pub fn build_scan_report_value(
             return serde_json::to_value(r).ok();
         }
         // Fall through to binary if archive scanning fails
-    }
-    if dmg_like {
-        if let Some(r) = archive::build_dmg_report(file, mode.clone(), nvd_api_key.clone()) {
-            return serde_json::to_value(r).ok();
-        }
-        return None;
     }
     binary::build_binary_report(file, mode, yara, nvd_api_key)
         .and_then(|r| serde_json::to_value(r).ok())
