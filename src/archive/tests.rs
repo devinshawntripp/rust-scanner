@@ -307,16 +307,19 @@ fn test_detect_macos_no_version_gets_unknown() {
 
 #[test]
 fn test_dmg_native_extraction_always_bails() {
-    // try_extract_dmg_native is intentionally a no-op: dmgwiz extracts raw disk
-    // partition data, not a filesystem tree. This test confirms the stub always
-    // returns an error so the fallback chain (hdiutil -> 7z) is always reached.
+    // try_extract_dmg_native() requires dmgwiz (UDIF parsing) + hpcopy (HFS+ extraction).
+    // In test/CI environments without hpcopy installed, it bails at the hpcopy check.
+    // In environments with hpcopy but a non-existent file, it bails at dmgwiz parsing.
+    // Either way, it MUST return Err so the fallback chain (hdiutil -> 7z) is reached.
     let dir = tempdir().unwrap();
     let result = super::dmg::try_extract_dmg_native("fake.dmg", dir.path());
-    assert!(result.is_err(), "native extraction must always bail");
+    assert!(result.is_err(), "native extraction must always bail on missing/invalid input");
     let err_msg = format!("{}", result.unwrap_err());
+    // Error message should describe the failure (hpcopy not installed, or dmgwiz parse error)
     assert!(
-        err_msg.contains("raw disk partition data"),
-        "error message should mention raw disk partition data, got: {err_msg}"
+        err_msg.contains("hpcopy") || err_msg.contains("dmgwiz") || err_msg.contains("hfsutils")
+            || err_msg.contains("failed to open") || err_msg.contains("partition"),
+        "error message should describe the native extraction failure, got: {err_msg}"
     );
 }
 
@@ -382,4 +385,54 @@ fn test_dmg_build_report_target_type() {
         report.target.target_type, "dmg",
         "target.target_type must be 'dmg' for DMG pipeline"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic DMG test: .app bundle with embedded npm packages
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_detect_macos_app_with_embedded_packages() {
+    let dir = tempdir().unwrap();
+
+    // Create Firefox.app/Contents/Info.plist
+    let app_contents = dir.path().join("Firefox.app/Contents");
+    fs::create_dir_all(&app_contents).unwrap();
+    fs::write(
+        app_contents.join("Info.plist"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>org.mozilla.firefox</string>
+    <key>CFBundleShortVersionString</key>
+    <string>123.0</string>
+</dict>
+</plist>"#,
+    )
+    .unwrap();
+
+    // Create embedded npm package inside the app bundle
+    let node_modules = app_contents.join("Resources/node_modules/express");
+    fs::create_dir_all(&node_modules).unwrap();
+    fs::write(
+        node_modules.join("package.json"),
+        r#"{"name":"express","version":"4.18.0"}"#,
+    )
+    .unwrap();
+
+    // detect_macos_packages finds the .app bundle
+    let macos_pkgs = detect_macos_packages(dir.path());
+    assert_eq!(macos_pkgs.len(), 1, "detect_macos_packages should find 1 mac-app package");
+    assert_eq!(macos_pkgs[0].ecosystem, "mac-app");
+    assert_eq!(macos_pkgs[0].name, "org.mozilla.firefox");
+    assert_eq!(macos_pkgs[0].version, "123.0");
+
+    // detect_app_packages finds the embedded npm package
+    let app_pkgs = detect::detect_app_packages(dir.path());
+    let express_pkg = app_pkgs.iter().find(|p| p.name == "express");
+    assert!(express_pkg.is_some(), "detect_app_packages should find the embedded express npm package");
+    assert_eq!(express_pkg.unwrap().ecosystem, "npm");
+    assert_eq!(express_pkg.unwrap().version, "4.18.0");
 }

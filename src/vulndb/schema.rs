@@ -98,44 +98,15 @@ pub fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
 }
 
 /// Load a zstd dictionary blob from the metadata table.
-/// Dict values are stored as hex-encoded strings in the TEXT value column.
+/// Dict values are stored as BLOBs by Python's sqlite3.Binary() — read directly as Vec<u8>.
 /// Used for keys like `nvd_zstd_dict` and `osv_zstd_dict`.
 pub fn get_dict(conn: &Connection, key: &str) -> Option<Vec<u8>> {
-    let hex_str: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .ok()?;
-    decode_hex(&hex_str)
-}
-
-/// Decode a hex-encoded string into bytes. Returns None on invalid hex.
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .ok()
 }
 
 /// Check if the database uses dictionary compression for payloads.
@@ -409,4 +380,62 @@ pub fn validate_vulndb(conn: &Connection) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test that get_dict reads a BLOB value stored in metadata table directly as Vec<u8>.
+    /// Python's sqlite3.Binary() stores the dict as raw binary, not as a hex-encoded string.
+    #[test]
+    fn test_get_dict_reads_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+
+        let raw_bytes: Vec<u8> = vec![0x01, 0x02, 0xAB, 0xCD, 0xFF, 0x00, 0x7F];
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["test_dict", rusqlite::types::Value::Blob(raw_bytes.clone())],
+        )
+        .unwrap();
+
+        let result = get_dict(&conn, "test_dict");
+        assert!(result.is_some(), "get_dict should return Some for a BLOB value");
+        assert_eq!(result.unwrap(), raw_bytes, "get_dict should return exact bytes stored as BLOB");
+    }
+
+    /// Test that validate_vulndb passes on a DB with dict_compression=0
+    /// and that the pipeline works end-to-end with zstd-compressed payloads.
+    #[test]
+    fn test_validate_vulndb_with_dict_compression_0() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+
+        // Set required metadata
+        set_metadata(&conn, "schema_version", "2").unwrap();
+        set_metadata(&conn, "build_date", "2026-03-05").unwrap();
+        set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        // Insert a sample NVD payload (plain zstd-compressed JSON)
+        let sample_json = br#"{"id": "CVE-2024-0001", "cvssMetricV31": []}"#;
+        let compressed = super::super::compress::compress_json(sample_json);
+        conn.execute(
+            "INSERT OR REPLACE INTO nvd_cves (cve_id, payload, last_modified) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["CVE-2024-0001", compressed, "2026-03-05"],
+        )
+        .unwrap();
+
+        // Insert a sample OSV payload (plain zstd-compressed JSON)
+        let osv_json = br#"{"id": "GHSA-xxxx-yyyy-zzzz"}"#;
+        let osv_compressed = super::super::compress::compress_json(osv_json);
+        conn.execute(
+            "INSERT OR REPLACE INTO osv_payloads (id, payload) VALUES (?1, ?2)",
+            rusqlite::params!["GHSA-xxxx-yyyy-zzzz", osv_compressed],
+        )
+        .unwrap();
+
+        let result = validate_vulndb(&conn);
+        assert!(result.is_ok(), "validate_vulndb should pass on dict_compression=0 DB: {:?}", result.err());
+    }
 }

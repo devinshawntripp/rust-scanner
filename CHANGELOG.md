@@ -5,6 +5,21 @@ All notable changes to ScanRook are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.3] - 2026-03-05
+
+### Fixed
+- vulndb fetch: read zstd dictionary from metadata table as BLOB (not hex string) — fixes
+  "missing nvd_zstd_dict dictionary" error on databases built by vulndb-pg-import.py
+- DMG scanning: implement dmgwiz+hpcopy extraction pipeline for Linux workers —
+  DMGs now return actual packages on Linux (previously only worked on macOS via hdiutil)
+
+### Added
+- DMG extraction via dmgwiz (UDIF decompression) + hpcopy (HFS+ filesystem extraction)
+- Fallback chain: dmgwiz+hpcopy -> hdiutil (macOS) -> 7z -> graceful degradation
+- node_modules/package.json scanning for bundled apps (Electron apps, macOS .app bundles)
+- Unit tests for vulndb dictionary BLOB reading and validation pipeline
+- Synthetic DMG test exercising .app bundle + embedded npm package detection
+
 ## [1.10.2] - 2026-03-04
 
 ### Added

@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
+use serde_json;
 
 /// Walk an extracted filesystem tree and detect application-level packages
 /// from lock files and manifests. Usable from both archive and container scans.
@@ -35,6 +36,12 @@ pub fn detect_app_packages(root: &Path) -> Vec<PackageCoordinate> {
             "package-lock.json" => parse_npm_lockfile(path, &mut packages, &mut seen),
             "yarn.lock" => parse_yarn_lock(path, &mut packages, &mut seen),
             "pnpm-lock.yaml" => parse_pnpm_lock(path, &mut packages, &mut seen),
+            // Individual package.json inside node_modules directories (bundled apps, Electron, etc.)
+            "package.json" => {
+                if is_inside_node_modules(path) {
+                    parse_node_package_json(path, &mut packages, &mut seen);
+                }
+            }
 
             // Python
             "requirements.txt" => parse_requirements_txt(path, &mut packages, &mut seen),
@@ -88,6 +95,47 @@ pub fn detect_app_packages(root: &Path) -> Vec<PackageCoordinate> {
     }
 
     packages
+}
+
+// ---------------------------------------------------------------------------
+// node_modules package.json scanner (for bundled apps, Electron apps, etc.)
+// ---------------------------------------------------------------------------
+
+/// Returns true if the given path is inside a node_modules directory.
+fn is_inside_node_modules(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str() == "node_modules"
+    })
+}
+
+/// Parse a package.json file inside node_modules and extract name + version.
+/// Only parses direct package entries (not nested node_modules), skipping workspace
+/// roots and packages without a version field.
+fn parse_node_package_json(
+    path: &Path,
+    pkgs: &mut Vec<PackageCoordinate>,
+    seen: &mut HashSet<String>,
+) {
+    // Avoid double-counting nested node_modules (node_modules/foo/node_modules/bar)
+    // by only processing the shallowest package.json for each package name.
+    // We skip paths where node_modules appears more than once in the ancestry.
+    let node_modules_count = path
+        .components()
+        .filter(|c| c.as_os_str() == "node_modules")
+        .count();
+    if node_modules_count > 1 {
+        return; // nested node_modules — skip to avoid duplicates
+    }
+
+    if let Ok(text) = fs::read_to_string(path) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
+            let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("").trim();
+            if !name.is_empty() && !version.is_empty() {
+                push_if_new(pkgs, seen, "npm", name, version);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
