@@ -2,27 +2,29 @@
 //!
 //! # External Tool Requirements
 //!
-//! DMG extraction requires one of the following external tools:
+//! DMG extraction uses the following tools in order:
 //!
-//! - **`hdiutil`** — macOS only, built-in. Used when the scanner runs on macOS.
-//! - **`7z`** — Cross-platform. Provided by the `p7zip-full` package on Linux/Debian.
-//!   The worker Docker image (Dockerfile) already installs `p7zip-full`, so `7z`
-//!   is available in production without any extra configuration.
+//! - **`dmgwiz + hpcopy`** — Cross-platform Rust-native UDIF decompression via the `dmgwiz`
+//!   crate, followed by HFS+ filesystem extraction via `hpcopy` from the `hfsutils` package.
+//!   On Linux: `apt-get install hfsutils` or `brew install hfsutils`.
+//!   This is the primary extraction path for Linux workers.
+//! - **`hdiutil`** — macOS only, built-in. Mounts the DMG and copies the filesystem tree.
+//! - **`7z`** — Cross-platform last-resort fallback. Provided by `p7zip-full` on Linux/Debian.
 //!
 //! # Extraction Fallback Chain
 //!
-//! 1. `try_extract_dmg_native()` — Rust-native via dmgwiz. **Intentionally a no-op.**
-//!    dmgwiz extracts raw disk partition bytes, not a filesystem tree. We need a tree
-//!    to walk for packages and binaries, so this always bails and falls through to step 2.
+//! 1. `try_extract_dmg_native()` — dmgwiz (UDIF decompression) + hpcopy (HFS+ tree extraction).
+//!    Writes raw partition bytes to a temp file, then shells out to `hpcopy -r / <dest>`.
+//!    Bails gracefully with a descriptive error if `hpcopy` is not installed.
 //! 2. `hdiutil attach` — macOS only (compile-time `cfg!(target_os = "macos")` guard).
-//! 3. `7z x` — Cross-platform fallback. The production path for Linux/worker deployments.
+//! 3. `7z x` — Cross-platform fallback.
 //!
 //! # Graceful Degradation
 //!
-//! If all extraction methods fail (e.g., in a test environment without 7z), `build_dmg_report()`
-//! does **not** return `None`. Instead it falls through to binary-only scanning with an empty
-//! package list, emitting a warning in the progress output. This ensures a report is always
-//! returned for DMG inputs, even when extraction is impossible.
+//! If all extraction methods fail (e.g., in a test environment without hpcopy/7z),
+//! `build_dmg_report()` does **not** return `None`. Instead it falls through to binary-only
+//! scanning with an empty package list, emitting a warning in the progress output. This ensures
+//! a report is always returned for DMG inputs, even when extraction is impossible.
 
 use crate::report::{
     compute_summary, InventoryStatus, Report, ScanStatus, ScannerInfo, TargetInfo,
@@ -39,18 +41,145 @@ use tempfile::tempdir;
 
 use super::detect::{detect_app_packages, detect_macos_packages};
 
-/// Attempt Rust-native DMG extraction using dmgwiz.
+/// Attempt Rust-native DMG extraction using dmgwiz + hpcopy.
 ///
-/// dmgwiz extracts raw partition data (disk image bytes) to a writer — it does NOT
-/// produce a directory tree with files. Because we need a file system tree to walk for
-/// packages and binaries, this function is a no-op that falls through to hdiutil/7z.
+/// Pipeline:
+/// 1. dmgwiz parses the UDIF footer/partition table and decompresses the HFS+ partition data
+///    to a raw partition image file (e.g., `dest/partition.hfs`).
+/// 2. `hpcopy -r / <dest>` extracts the HFS+ filesystem tree from the raw image into `dest`.
+/// 3. The temp partition file is removed after successful extraction.
 ///
-/// Keeping this as a stub satisfies the Cargo.toml dependency declaration and ensures
-/// the dmgwiz crate is compiled and available for future use.
-pub(crate) fn try_extract_dmg_native(_path: &str, _dest: &Path) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "dmgwiz extracts raw disk partition data, not a filesystem tree — falling through to external tools"
+/// Fails gracefully (returning Err) when:
+/// - dmgwiz cannot parse the DMG (invalid format, encrypted, LZMA gap, etc.)
+/// - No non-trivial data partition is found in the partition table
+/// - `hpcopy` is not installed on the system
+/// - `hpcopy` returns a non-zero exit code
+///
+/// Falls through to hdiutil (macOS) or 7z on error.
+pub(crate) fn try_extract_dmg_native(path: &str, dest: &Path) -> anyhow::Result<()> {
+    use std::io::BufWriter;
+    use std::process::Command;
+
+    // Check that hpcopy is available before doing expensive dmgwiz work.
+    // `hpcopy` is provided by `hfsutils` — install with:
+    //   Linux:  apt-get install hfsutils
+    //   macOS:  brew install hfsutils
+    let hpcopy_check = Command::new("hpcopy").arg("--version").output();
+    if hpcopy_check.is_err() {
+        // Also check if it's in PATH via which-style probe
+        let which_check = Command::new("which").arg("hpcopy").output();
+        let found = which_check
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            anyhow::bail!(
+                "hpcopy not found — install hfsutils (Linux: apt-get install hfsutils, macOS: brew install hfsutils) for dmgwiz+hpcopy DMG extraction"
+            );
+        }
+    }
+
+    // Open the DMG and parse the UDIF partition table using dmgwiz.
+    let dmg_file = fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("failed to open DMG '{}': {}", path, e))?;
+    let mut wiz = dmgwiz::DmgWiz::from_reader(
+        std::io::BufReader::new(dmg_file),
+        dmgwiz::Verbosity::None,
     )
+    .map_err(|e| anyhow::anyhow!("dmgwiz failed to parse '{}': {}", path, e))?;
+
+    // Find the data partition: prefer partitions whose names suggest HFS+ data.
+    // Common names in Apple DMGs: "Apple_HFS", "Apple_HFSX", "disk image", or the app name.
+    // Skip partition map entries, free space, drivers, and EFI partitions.
+    let skip_names = ["partition_map", "free_space", "driver", "efi", "apple_boot"];
+    let hfs_names = ["apple_hfs", "apple_hfsx", "hfs"];
+
+    // First try partitions with explicitly known HFS names, then fall back to any non-skip partition.
+    let partition_idx = {
+        let partitions = &wiz.partitions;
+        // Priority 1: known HFS+ partition name
+        let hfs_idx = partitions.iter().enumerate().find(|(_, p)| {
+            let name_lower = p.name.to_ascii_lowercase();
+            hfs_names.iter().any(|s| name_lower.contains(s))
+        });
+        // Priority 2: any non-skipped partition (typically the main data partition)
+        let fallback_idx = partitions.iter().enumerate().find(|(_, p)| {
+            let name_lower = p.name.to_ascii_lowercase();
+            !skip_names.iter().any(|s| name_lower.contains(s))
+        });
+
+        match hfs_idx.or(fallback_idx) {
+            Some((i, _)) => i,
+            None => anyhow::bail!("dmgwiz: no suitable data partition found in '{}'", path),
+        }
+    };
+
+    progress(
+        "dmg.extract.dmgwiz",
+        &format!(
+            "partition={} name='{}'",
+            partition_idx, wiz.partitions[partition_idx].name
+        ),
+    );
+
+    // Write raw HFS+ partition bytes to a temp file.
+    let partition_file = dest.join("partition.hfs");
+    {
+        let out_file = fs::File::create(&partition_file)
+            .map_err(|e| anyhow::anyhow!("failed to create partition file: {}", e))?;
+        let writer = BufWriter::new(out_file);
+        wiz.extract_partition(writer, partition_idx)
+            .map_err(|e| anyhow::anyhow!("dmgwiz extraction failed: {}", e))?;
+    }
+
+    // Shell out to hpcopy to extract the HFS+ filesystem tree.
+    // hpcopy syntax: hpcopy -r <src_hfs_path> <local_dest>
+    // The `:` prefix means the HFS+ root volume.
+    let hcopy_dest = dest.join("contents");
+    fs::create_dir_all(&hcopy_dest)
+        .map_err(|e| anyhow::anyhow!("failed to create hcopy dest dir: {}", e))?;
+
+    // hpcopy needs the HFS volume mounted. Use `hmount` first, then `hcopy`.
+    // hmount <image> — mounts the HFS partition image
+    // hcopy -r : <dest_dir> — copies all files from volume root recursively
+    let hmount_status = Command::new("hmount")
+        .arg(&partition_file)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to run hmount: {} — is hfsutils installed?", e))?;
+
+    if !hmount_status.success() {
+        // Clean up partition file before bailing
+        let _ = fs::remove_file(&partition_file);
+        anyhow::bail!(
+            "hmount failed on '{}' — partition may not be HFS+ format",
+            partition_file.display()
+        );
+    }
+
+    // Copy all files from the HFS+ volume to dest
+    let hcopy_status = Command::new("hcopy")
+        .args(["-r", ":", &hcopy_dest.to_string_lossy()])
+        .status();
+
+    // Always unmount before returning
+    let _ = Command::new("humount").status();
+
+    // Clean up partition file
+    let _ = fs::remove_file(&partition_file);
+
+    match hcopy_status {
+        Ok(s) if s.success() => {
+            progress("dmg.extract.hpcopy.done", &hcopy_dest.to_string_lossy());
+            Ok(())
+        }
+        Ok(s) => anyhow::bail!(
+            "hcopy failed with exit code {} — HFS+ filesystem tree extraction failed",
+            s.code().unwrap_or(-1)
+        ),
+        Err(e) => anyhow::bail!(
+            "hcopy not found: {} — install hfsutils (apt-get install hfsutils)",
+            e
+        ),
+    }
 }
 
 /// Extract a DMG file to a temporary directory.

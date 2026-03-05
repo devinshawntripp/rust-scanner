@@ -98,44 +98,15 @@ pub fn get_metadata(conn: &Connection, key: &str) -> Option<String> {
 }
 
 /// Load a zstd dictionary blob from the metadata table.
-/// Dict values are stored as hex-encoded strings in the TEXT value column.
+/// Dict values are stored as BLOBs by Python's sqlite3.Binary() — read directly as Vec<u8>.
 /// Used for keys like `nvd_zstd_dict` and `osv_zstd_dict`.
 pub fn get_dict(conn: &Connection, key: &str) -> Option<Vec<u8>> {
-    let hex_str: String = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .ok()?;
-    decode_hex(&hex_str)
-}
-
-/// Decode a hex-encoded string into bytes. Returns None on invalid hex.
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(s.len() / 2);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = hex_nibble(bytes[i])?;
-        let lo = hex_nibble(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
-    }
-    Some(out)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    conn.query_row(
+        "SELECT value FROM metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .ok()
 }
 
 /// Check if the database uses dictionary compression for payloads.

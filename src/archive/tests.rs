@@ -307,16 +307,19 @@ fn test_detect_macos_no_version_gets_unknown() {
 
 #[test]
 fn test_dmg_native_extraction_always_bails() {
-    // try_extract_dmg_native is intentionally a no-op: dmgwiz extracts raw disk
-    // partition data, not a filesystem tree. This test confirms the stub always
-    // returns an error so the fallback chain (hdiutil -> 7z) is always reached.
+    // try_extract_dmg_native() requires dmgwiz (UDIF parsing) + hpcopy (HFS+ extraction).
+    // In test/CI environments without hpcopy installed, it bails at the hpcopy check.
+    // In environments with hpcopy but a non-existent file, it bails at dmgwiz parsing.
+    // Either way, it MUST return Err so the fallback chain (hdiutil -> 7z) is reached.
     let dir = tempdir().unwrap();
     let result = super::dmg::try_extract_dmg_native("fake.dmg", dir.path());
-    assert!(result.is_err(), "native extraction must always bail");
+    assert!(result.is_err(), "native extraction must always bail on missing/invalid input");
     let err_msg = format!("{}", result.unwrap_err());
+    // Error message should describe the failure (hpcopy not installed, or dmgwiz parse error)
     assert!(
-        err_msg.contains("raw disk partition data"),
-        "error message should mention raw disk partition data, got: {err_msg}"
+        err_msg.contains("hpcopy") || err_msg.contains("dmgwiz") || err_msg.contains("hfsutils")
+            || err_msg.contains("failed to open") || err_msg.contains("partition"),
+        "error message should describe the native extraction failure, got: {err_msg}"
     );
 }
 
