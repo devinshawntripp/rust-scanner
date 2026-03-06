@@ -12,6 +12,42 @@ pub(in crate::vuln) fn map_debian_advisory_to_cves(
     advisory_id: &str,
     pg: &mut Option<PgClient>,
 ) -> Option<Vec<String>> {
+    // 0. Check local vulndb for advisory payload (standalone mode only)
+    if !crate::vuln::cluster_mode() {
+        if let Some(conn) = crate::vulndb::open_vulndb() {
+            if let Some(payload) = crate::vulndb::query_osv_payload_by_id(&conn, advisory_id) {
+                let mut cves: Vec<String> = Vec::new();
+                // Extract from aliases array
+                if let Some(aliases) = payload["aliases"].as_array() {
+                    for alias in aliases {
+                        if let Some(s) = alias.as_str() {
+                            if s.starts_with("CVE-") {
+                                cves.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                // Also scan summary/details for CVE patterns
+                if let Ok(re) = regex::Regex::new(r"CVE-\d{4}-\d+") {
+                    for field in ["summary", "details"] {
+                        if let Some(text) = payload[field].as_str() {
+                            for m in re.find_iter(text) {
+                                let cve = m.as_str().to_string();
+                                if !cves.contains(&cve) {
+                                    cves.push(cve);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !cves.is_empty() {
+                    progress("osv.debian.map.vulndb", &format!("{} -> {} CVEs", advisory_id, cves.len()));
+                    return Some(cves);
+                }
+            }
+        }
+    }
+
     // 1. Check PG osv_vuln_cache for aliases (populated by bulk import)
     if let Some(client_pg) = pg.as_mut() {
         if let Some((payload, _last_checked, _last_mod)) = pg_get_osv(client_pg, advisory_id) {
@@ -136,4 +172,42 @@ pub(in crate::vuln) fn map_debian_advisory_to_cves(
     }
 
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verify that a Debian advisory in vulndb's osv_payloads has extractable CVE aliases.
+    #[test]
+    fn test_extract_cves_from_vulndb_advisory_aliases() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::vulndb::schema::CREATE_SCHEMA).unwrap();
+        crate::vulndb::schema::set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        let dla_json = br#"{"id": "DLA-3879-1", "aliases": ["CVE-2024-1234", "CVE-2024-5678"], "summary": "Debian LTS advisory"}"#;
+        let compressed = crate::vulndb::compress::compress_json(dla_json);
+        conn.execute(
+            "INSERT INTO osv_payloads (id, payload) VALUES (?1, ?2)",
+            rusqlite::params!["DLA-3879-1", compressed],
+        ).unwrap();
+
+        let payload = crate::vulndb::query_osv_payload_by_id(&conn, "DLA-3879-1").unwrap();
+        let aliases = payload["aliases"].as_array().unwrap();
+        let cves: Vec<&str> = aliases
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| s.starts_with("CVE-"))
+            .collect();
+        assert_eq!(cves, vec!["CVE-2024-1234", "CVE-2024-5678"]);
+    }
+
+    /// Verify that missing advisory returns None from vulndb.
+    #[test]
+    fn test_missing_advisory_returns_none_from_vulndb() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::vulndb::schema::CREATE_SCHEMA).unwrap();
+        crate::vulndb::schema::set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        let result = crate::vulndb::query_osv_payload_by_id(&conn, "DLA-9999-1");
+        assert!(result.is_none());
+    }
 }
