@@ -424,8 +424,15 @@ pub fn check_redhat_cve(cve: &str, oval_path: &str) {
 fn parse_oval_file(oval_path: &str) -> anyhow::Result<ParsedOval> {
     let file = File::open(oval_path)
         .with_context(|| format!("could not open OVAL file at {}", oval_path))?;
-    let reader = BufReader::new(file);
-    let root = Element::parse(reader)
+
+    let reader: Box<dyn std::io::Read> = if oval_path.ends_with(".bz2") {
+        Box::new(bzip2::read::BzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+
+    let buf = BufReader::new(reader);
+    let root = Element::parse(buf)
         .with_context(|| format!("failed to parse OVAL XML at {}", oval_path))?;
     let test_constraints = build_test_constraints(&root);
     Ok(ParsedOval {
@@ -847,5 +854,33 @@ mod tests {
         let eval_patched = evaluate_oval_for_packages(&root, &tests, &package_map);
         assert!(eval_patched.covered_cves.contains("CVE-2024-0001"), "CVE should still be covered");
         assert!(!eval_patched.vulnerable_cves.contains("CVE-2024-0001"), "patched version should NOT be vulnerable");
+    }
+
+    #[test]
+    fn parse_oval_file_handles_bz2() {
+        use bzip2::write::BzEncoder;
+        use bzip2::Compression;
+        use std::io::Write;
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<oval_definitions xmlns="http://oval.mitre.org/XMLSchema/oval-definitions-5">
+  <definitions/>
+  <tests/>
+  <objects/>
+  <states/>
+</oval_definitions>"#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bz2_path = dir.path().join("test.oval.xml.bz2");
+
+        {
+            let f = std::fs::File::create(&bz2_path).unwrap();
+            let mut encoder = BzEncoder::new(f, Compression::default());
+            encoder.write_all(xml.as_bytes()).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let result = parse_oval_file(bz2_path.to_str().unwrap());
+        assert!(result.is_ok(), "parse_oval_file should handle .bz2: {:?}", result.err());
     }
 }
