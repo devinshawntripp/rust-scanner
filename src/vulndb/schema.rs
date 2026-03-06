@@ -201,6 +201,43 @@ pub fn query_kev(conn: &Connection, cve_id: &str) -> bool {
     .is_ok()
 }
 
+/// Check if a package (ecosystem, name) is indexed in the vulndb.
+/// Returns true if the package exists in osv_packages, even if it has zero vulnerabilities.
+/// This distinguishes "package not in DB" from "package has no known vulns."
+pub fn has_osv_package(conn: &Connection, ecosystem: &str, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM osv_packages WHERE ecosystem = ?1 AND name = ?2",
+        params![ecosystem, name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Look up a single OSV advisory/vulnerability by ID from osv_payloads.
+/// Decompresses the payload blob (using dict if available) and returns parsed JSON.
+/// Used by the enrichment pipeline to avoid HTTP fetches for advisories already in the vulndb.
+pub fn query_osv_payload_by_id(conn: &Connection, id: &str) -> Option<serde_json::Value> {
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM osv_payloads WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .ok()?;
+
+    let use_dict = has_dict_compression(conn);
+    let json_bytes = if use_dict {
+        if let Some(dict) = get_dict(conn, "osv_zstd_dict") {
+            super::compress::decompress_payload_with_dict(&payload, &dict)
+        } else {
+            super::compress::decompress_payload(&payload)
+        }
+    } else {
+        super::compress::decompress_payload(&payload)
+    };
+    json_bytes.and_then(|b| serde_json::from_slice(&b).ok())
+}
+
 /// Query Debian security tracker for a package in a specific release.
 /// Returns Vec of (cve_id, status, fixed_version).
 pub fn query_debian(conn: &Connection, package: &str, release: &str) -> Vec<(String, String, String)> {
@@ -437,5 +474,109 @@ mod tests {
 
         let result = validate_vulndb(&conn);
         assert!(result.is_ok(), "validate_vulndb should pass on dict_compression=0 DB: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_has_osv_package_returns_true_for_indexed_package() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO osv_packages (ecosystem, name) VALUES (?1, ?2)",
+            params!["PyPI", "requests"],
+        ).unwrap();
+        assert!(has_osv_package(&conn, "PyPI", "requests"));
+    }
+
+    #[test]
+    fn test_has_osv_package_returns_false_for_unknown_package() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        assert!(!has_osv_package(&conn, "PyPI", "nonexistent-pkg"));
+    }
+
+    #[test]
+    fn test_has_osv_package_distinguishes_ecosystem() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO osv_packages (ecosystem, name) VALUES (?1, ?2)",
+            params!["npm", "lodash"],
+        ).unwrap();
+        assert!(has_osv_package(&conn, "npm", "lodash"));
+        assert!(!has_osv_package(&conn, "PyPI", "lodash"));
+    }
+
+    #[test]
+    fn test_query_osv_payload_by_id_returns_decompressed_json() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        set_metadata(&conn, "schema_version", "2").unwrap();
+        set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        let osv_json = br#"{"id": "GHSA-1234-5678-abcd", "summary": "Test vuln"}"#;
+        let compressed = super::super::compress::compress_json(osv_json);
+        conn.execute(
+            "INSERT INTO osv_payloads (id, payload) VALUES (?1, ?2)",
+            params!["GHSA-1234-5678-abcd", compressed],
+        ).unwrap();
+
+        let result = query_osv_payload_by_id(&conn, "GHSA-1234-5678-abcd");
+        assert!(result.is_some());
+        let json = result.unwrap();
+        assert_eq!(json["id"].as_str().unwrap(), "GHSA-1234-5678-abcd");
+        assert_eq!(json["summary"].as_str().unwrap(), "Test vuln");
+    }
+
+    #[test]
+    fn test_query_osv_payload_by_id_returns_none_for_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        set_metadata(&conn, "dict_compression", "0").unwrap();
+        assert!(query_osv_payload_by_id(&conn, "GHSA-nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_query_osv_payload_by_id_with_debian_advisory() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+        set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        let dla_json = br#"{"id": "DLA-3879-1", "aliases": ["CVE-2024-1234", "CVE-2024-5678"], "summary": "Debian advisory"}"#;
+        let compressed = super::super::compress::compress_json(dla_json);
+        conn.execute(
+            "INSERT INTO osv_payloads (id, payload) VALUES (?1, ?2)",
+            params!["DLA-3879-1", compressed],
+        ).unwrap();
+
+        let result = query_osv_payload_by_id(&conn, "DLA-3879-1");
+        assert!(result.is_some());
+        let json = result.unwrap();
+        let aliases = json["aliases"].as_array().unwrap();
+        assert_eq!(aliases.len(), 2);
+    }
+
+    /// Simulates the batch.rs scenario: package IS indexed in osv_packages
+    /// but has zero vulnerabilities. query_osv_by_package returns empty vec,
+    /// but has_osv_package returns true — this is a valid "clean" result.
+    #[test]
+    fn test_indexed_package_with_no_vulns_is_distinguishable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(CREATE_SCHEMA).unwrap();
+
+        // Package is indexed (exists in osv_packages)...
+        conn.execute(
+            "INSERT INTO osv_packages (ecosystem, name) VALUES (?1, ?2)",
+            params!["Debian:11", "zlib"],
+        ).unwrap();
+        // ...but has no vulnerability entries in osv_vulns
+
+        // has_osv_package should return true (it's indexed)
+        assert!(has_osv_package(&conn, "Debian:11", "zlib"),
+            "indexed package should be found even with zero vulns");
+
+        // query_osv_by_package should return empty vec (no vulns)
+        let vulns = query_osv_by_package(&conn, "Debian:11", "zlib");
+        assert!(vulns.is_empty(),
+            "package with no vulns should return empty vec");
     }
 }
