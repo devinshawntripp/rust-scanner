@@ -4,6 +4,7 @@ pub mod detect;
 pub mod diff;
 pub mod helpers;
 pub mod sbom_cmd;
+pub mod text_report;
 pub mod upgrade;
 
 // Re-export commonly used items so callers can use crate::cli::*
