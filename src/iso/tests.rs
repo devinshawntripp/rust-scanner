@@ -1,6 +1,6 @@
 use super::extract::normalize_path_like;
 use super::inventory::{dedupe_packages, parse_rpm_filename};
-use super::repodata::{parse_primary_packages, parse_repodata_primary_href};
+use super::repodata::{parse_primary_packages, parse_repodata_comps_href, parse_repodata_primary_href};
 use super::extract::find_entry;
 use crate::container::PackageCoordinate;
 
@@ -107,7 +107,7 @@ fn repodata_findings_get_softer_accuracy_note() {
         &mut findings,
         ConfidenceTier::HeuristicUnverified,
         EvidenceSource::RepoMetadata,
-        Some(super::report::ISO_REPODATA_NOTE),
+        Some("Package list from repository metadata (primary.xml). Use --mode deep for more accurate results."),
     );
 
     let note = findings[0].accuracy_note.as_ref().unwrap();
@@ -156,13 +156,41 @@ fn heuristic_findings_keep_harsh_accuracy_note() {
         &mut findings,
         ConfidenceTier::HeuristicUnverified,
         EvidenceSource::FilenameHeuristic,
-        Some(super::report::ISO_HEURISTIC_NOTE),
+        Some("Package list inferred from RPM filenames. Names and versions may be approximate."),
     );
 
     let note = findings[0].accuracy_note.as_ref().unwrap();
     assert!(
-        note.contains("false positive"),
-        "heuristic findings should warn about false positives, got: {}",
+        note.contains("false positive") || note.contains("approximate"),
+        "heuristic findings should warn about accuracy, got: {}",
         note
     );
+}
+
+#[test]
+fn test_parse_repodata_comps_href() {
+    let xml = r#"
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/abc-primary.xml.gz"/>
+  </data>
+  <data type="group">
+    <location href="repodata/xyz-comps.xml.gz"/>
+  </data>
+</repomd>
+"#;
+    assert_eq!(
+        parse_repodata_comps_href(xml.as_bytes()),
+        Some("repodata/xyz-comps.xml.gz".to_string())
+    );
+
+    // No group data
+    let xml_no_group = r#"
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/abc-primary.xml.gz"/>
+  </data>
+</repomd>
+"#;
+    assert_eq!(parse_repodata_comps_href(xml_no_group.as_bytes()), None);
 }

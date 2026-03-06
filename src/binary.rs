@@ -466,6 +466,7 @@ pub fn build_binary_report(
             sha256: hash_file_stream(path).ok(),
             parent_path: None,
         }],
+        iso_profile: None,
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);

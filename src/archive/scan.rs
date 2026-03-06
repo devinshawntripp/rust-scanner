@@ -201,6 +201,7 @@ pub fn build_archive_report(
         sbom: None,
         findings,
         files: Vec::new(),
+        iso_profile: None,
         summary,
     })
 }

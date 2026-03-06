@@ -12,36 +12,13 @@ use crate::vuln::{
 use crate::ScanMode;
 use std::collections::HashSet;
 
+use super::comps::CompsData;
 use super::extract::{list_iso_entries, normalize_path_like};
 use super::inventory::{
     dedupe_packages, packages_from_rpm_entries, packages_from_runtime_inventory,
 };
-use super::repodata::packages_from_repodata;
+use super::repodata::{comps_package_names_from_repodata, packages_from_repodata};
 
-pub(super) const ISO_HEURISTIC_NOTE: &str =
-    "Installed package inventory could not be fully determined for this ISO. Finding may be false positive.";
-
-pub(super) const ISO_REPODATA_NOTE: &str =
-    "Package inventory derived from repository metadata. Versions reflect available packages, not confirmed installed state.";
-
-fn light_allow_heuristic_fallback() -> bool {
-    std::env::var("SCANNER_LIGHT_ALLOW_HEURISTIC_FALLBACK")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true)
-}
-
-fn deep_require_installed_inventory() -> bool {
-    std::env::var("SCANNER_DEEP_REQUIRE_INSTALLED_INVENTORY")
-        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(true)
-}
-
-fn heuristic_fallback_allowed(mode: &ScanMode) -> bool {
-    match mode {
-        ScanMode::Light => light_allow_heuristic_fallback(),
-        ScanMode::Deep => !deep_require_installed_inventory(),
-    }
-}
 
 pub fn build_iso_report(
     path: &str,
@@ -89,18 +66,12 @@ pub fn build_iso_report(
         );
     }
 
-    let allow_heuristic_fallback = heuristic_fallback_allowed(&mode);
-    let mut fallback_source = EvidenceSource::RepoMetadata;
     let mut used_repodata = false;
+    let mut comps_info: Option<(String, usize, usize, CompsData)> = None;
     let mut packages = if inventory_complete {
         runtime_packages
-    } else if !allow_heuristic_fallback {
-        progress(
-            "iso.packages.fallback.skip",
-            "heuristic fallback disabled by strict inventory policy",
-        );
-        Vec::new()
     } else {
+        // Always try repodata + filename heuristic (even in deep mode)
         let fallback_started = std::time::Instant::now();
         let mut p = packages_from_rpm_entries(&entries);
         progress("iso.packages.filenames", &format!("packages={}", p.len()));
@@ -119,12 +90,32 @@ pub fn build_iso_report(
             }
             Err(e) => progress("iso.repodata.error", &format!("{}", e)),
         }
+
+        // Deep mode: filter through comps.xml
+        if matches!(mode, ScanMode::Deep) && used_repodata {
+            match comps_package_names_from_repodata(path, &entries) {
+                Ok(Some((env_name, comps_names, comps_data))) => {
+                    let before = p.len();
+                    p.retain(|pkg| comps_names.contains(&pkg.name));
+                    let after = p.len();
+                    progress(
+                        "iso.comps.filter",
+                        &format!("environment={} before={} after={}", env_name, before, after),
+                    );
+                    comps_info = Some((env_name, before, after, comps_data));
+                }
+                Ok(None) => {
+                    progress("iso.comps.missing", "no comps.xml in repodata");
+                }
+                Err(e) => {
+                    progress("iso.comps.error", &format!("{}", e));
+                }
+            }
+        }
+
         progress_timing("iso.packages.fallback", fallback_started);
         p
     };
-    if !used_repodata {
-        fallback_source = EvidenceSource::FilenameHeuristic;
-    }
     packages = dedupe_packages(packages);
     progress(
         "iso.packages.detect.done",
@@ -189,18 +180,44 @@ pub fn build_iso_report(
             progress("iso.enrich.nvd.skip", "disabled by SCANNER_NVD_ENRICH");
         }
 
-        if !inventory_complete && allow_heuristic_fallback {
-            let note = if used_repodata {
-                ISO_REPODATA_NOTE
+        if !inventory_complete {
+            let (tier, source, note) = if let Some((ref env_name, total, filtered, _)) = comps_info {
+                // Deep mode with comps.xml — high confidence
+                (
+                    ConfidenceTier::ConfirmedInstalled,
+                    EvidenceSource::RepoMetadata,
+                    format!(
+                        "Package list from repository metadata filtered through default installation \
+                         profile '{}' (comps.xml). {} of {} available packages matched the default \
+                         install set. Findings reflect packages installed by a standard '{}' installation.",
+                        env_name, filtered, total, env_name
+                    ),
+                )
+            } else if used_repodata {
+                // Light mode with repodata — medium confidence
+                (
+                    ConfidenceTier::HeuristicUnverified,
+                    EvidenceSource::RepoMetadata,
+                    format!(
+                        "Package list from repository metadata (primary.xml). This ISO contains {} \
+                         available packages — not all are installed by default. Use --mode deep to \
+                         filter to the default installation profile for more accurate results.",
+                        packages.len()
+                    ),
+                )
             } else {
-                ISO_HEURISTIC_NOTE
+                // Filename heuristic only — low confidence
+                (
+                    ConfidenceTier::HeuristicUnverified,
+                    EvidenceSource::FilenameHeuristic,
+                    format!(
+                        "Package list inferred from RPM filenames. Names and versions may be \
+                         approximate (epoch unavailable). {} packages detected.",
+                        packages.len()
+                    ),
+                )
             };
-            retag_findings(
-                &mut findings_norm,
-                ConfidenceTier::HeuristicUnverified,
-                fallback_source,
-                Some(note),
-            );
+            retag_findings(&mut findings_norm, tier, source, Some(&note));
         }
 
         let oval_redhat = oval_redhat
@@ -248,12 +265,6 @@ pub fn build_iso_report(
 
     let (scan_status, inventory_status, inventory_reason) = if inventory_complete {
         (ScanStatus::Complete, InventoryStatus::Complete, None)
-    } else if !allow_heuristic_fallback {
-        (
-            ScanStatus::PartialFailed,
-            InventoryStatus::Missing,
-            Some("deep_mode_requires_installed_inventory".into()),
-        )
     } else if !packages.is_empty() {
         (
             ScanStatus::PartialFailed,
@@ -292,6 +303,22 @@ pub fn build_iso_report(
     crate::progress::enter_stage("kev");
     crate::vuln::kev_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref(), &kev_breaker);
 
+    let iso_profile = if let Some((ref env_name, total, filtered, ref comps_data)) = comps_info {
+        let env = comps_data.environments.iter().find(|e| e.name == *env_name);
+        let groups: Vec<String> = env
+            .map(|e| e.mandatory_groups.clone())
+            .unwrap_or_default();
+        Some(crate::report::IsoProfile {
+            environment: env.map(|e| e.id.clone()).unwrap_or_default(),
+            environment_name: env_name.clone(),
+            total_available_packages: total,
+            default_install_packages: filtered,
+            mandatory_groups: groups,
+        })
+    } else {
+        None
+    };
+
     let mut report = Report {
         scanner,
         target,
@@ -302,6 +329,7 @@ pub fn build_iso_report(
         findings: findings_norm,
         files,
         summary: Default::default(),
+        iso_profile,
     };
     report.summary = compute_summary(&report.findings);
 

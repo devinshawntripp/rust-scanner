@@ -174,6 +174,17 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
     pub summary: Summary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iso_profile: Option<IsoProfile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct IsoProfile {
+    pub environment: String,
+    pub environment_name: String,
+    pub total_available_packages: usize,
+    pub default_install_packages: usize,
+    pub mandatory_groups: Vec<String>,
 }
 
 pub fn compute_summary(findings: &[Finding]) -> Summary {

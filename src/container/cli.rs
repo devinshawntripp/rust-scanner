@@ -485,6 +485,7 @@ pub fn scan_container(
                 sbom: sbom_info,
                 findings: findings_norm,
                 files: collect_file_tree_if_enabled(&rootfs),
+            iso_profile: None,
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);

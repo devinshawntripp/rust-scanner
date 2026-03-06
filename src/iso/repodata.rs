@@ -2,8 +2,10 @@
 
 use crate::container::PackageCoordinate;
 use crate::utils::progress;
+use super::comps::{parse_comps_xml, CompsData};
 use super::extract::*;
 use anyhow::anyhow;
+use std::collections::HashSet;
 use xmltree::{Element, XMLNode};
 
 pub(super) fn packages_from_repodata(
@@ -52,6 +54,60 @@ pub(super) fn parse_repodata_primary_href(repomd_xml: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+pub(super) fn parse_repodata_comps_href(repomd_xml: &[u8]) -> Option<String> {
+    let root = Element::parse(repomd_xml).ok()?;
+    let mut data_nodes = Vec::new();
+    collect_descendants_by_local(&root, "data", &mut data_nodes);
+    for data in data_nodes {
+        let Some(data_type) = attr_value(data, "type") else {
+            continue;
+        };
+        if data_type != "group" {
+            continue;
+        }
+        let mut location_nodes = Vec::new();
+        collect_descendants_by_local(data, "location", &mut location_nodes);
+        for loc in location_nodes {
+            if let Some(href) = attr_value(loc, "href") {
+                let v = href.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Load comps.xml from repodata and return the default-install package names.
+/// Returns (environment_name, package_names, full_comps_data).
+pub(super) fn comps_package_names_from_repodata(
+    path: &str,
+    entries: &[String],
+) -> anyhow::Result<Option<(String, HashSet<String>, CompsData)>> {
+    let Some(repomd_path) = find_entry(entries, "repodata/repomd.xml") else {
+        return Ok(None);
+    };
+    let repomd_raw = read_iso_entry(path, repomd_path)?;
+    let Some(comps_href) = parse_repodata_comps_href(&repomd_raw) else {
+        return Ok(None);
+    };
+    let Some(comps_entry) = find_entry(entries, &comps_href) else {
+        return Err(anyhow!(
+            "repodata comps metadata not found in ISO entries: {}",
+            comps_href
+        ));
+    };
+    let comps_raw = read_iso_entry(path, comps_entry)?;
+    let comps_xml = decompress_if_needed(comps_entry, comps_raw)?;
+    let comps_data = parse_comps_xml(&comps_xml)?;
+    let (env_name, package_names) = comps_data.default_install_packages();
+    match env_name {
+        Some(name) => Ok(Some((name, package_names, comps_data))),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn parse_primary_packages(primary_xml: &[u8]) -> Vec<PackageCoordinate> {
