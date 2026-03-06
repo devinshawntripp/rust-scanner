@@ -23,40 +23,49 @@ pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) {
                 std::env::set_var("SCANNER_NVD_ENRICH", nvd_on);
             }
             progress("sbom.scan.start", &file);
-            if let Some(mut report) = sbom::build_sbom_report(&file, mode, nvd_api_key.clone())
-                .and_then(|r| serde_json::to_value(r).ok())
-            {
-                if !refs {
-                    strip_references_in_findings(&mut report);
+            let report = match sbom::build_sbom_report(&file, mode, nvd_api_key.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    progress("sbom.scan.error", &file);
+                    utils::progress_panel_finish("sbom import failed");
+                    eprintln!("failed to import SBOM: {} — {}", file, e);
+                    std::process::exit(1);
                 }
-                let summary = report
-                    .get("summary")
-                    .and_then(|s| s.as_object())
-                    .and_then(|o| o.get("total_findings"))
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0);
-                progress(
-                    "sbom.scan.done",
-                    &format!("file={} findings={}", file, summary),
-                );
-                utils::progress_panel_finish(&format!(
-                    "sbom import complete findings={}",
-                    summary
-                ));
-
-                let text = if matches!(format, OutputFormat::Json) {
-                    serde_json::to_string_pretty(&report).unwrap()
-                } else {
-                    crate::cli::text_report::render_text_report(&report)
-                };
-                println!("{}", text);
-                utils::write_output_if_needed(&out, &text);
-            } else {
-                progress("sbom.scan.error", &file);
-                utils::progress_panel_finish("sbom import failed");
-                eprintln!("failed to import SBOM: {}", file);
-                std::process::exit(1);
+            };
+            let mut report_value = match serde_json::to_value(report) {
+                Ok(v) => v,
+                Err(e) => {
+                    progress("sbom.scan.error", &file);
+                    utils::progress_panel_finish("sbom import failed");
+                    eprintln!("failed to serialize SBOM report: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            if !refs {
+                strip_references_in_findings(&mut report_value);
             }
+            let summary = report_value
+                .get("summary")
+                .and_then(|s| s.as_object())
+                .and_then(|o| o.get("total_findings"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            progress(
+                "sbom.scan.done",
+                &format!("file={} findings={}", file, summary),
+            );
+            utils::progress_panel_finish(&format!(
+                "sbom import complete findings={}",
+                summary
+            ));
+
+            let text = if matches!(format, OutputFormat::Json) {
+                serde_json::to_string_pretty(&report_value).unwrap()
+            } else {
+                crate::cli::text_report::render_text_report(&report_value)
+            };
+            println!("{}", text);
+            utils::write_output_if_needed(&out, &text);
         }
         SbomCommands::Diff {
             baseline,

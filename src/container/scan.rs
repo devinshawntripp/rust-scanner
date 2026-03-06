@@ -599,10 +599,13 @@ pub fn build_container_report(
     }
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
-    crate::progress::enter_stage("epss");
-    crate::vuln::epss_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref(), &epss_breaker);
-    crate::progress::enter_stage("kev");
-    crate::vuln::kev_enrich_findings(&mut findings_norm, &mut pg, cache_dir.as_deref(), &kev_breaker);
+    crate::progress::enter_stage("epss_kev");
+    crate::vuln::parallel_enrich_epss_kev(
+        &mut findings_norm,
+        cache_dir.as_deref(),
+        &epss_breaker,
+        &kev_breaker,
+    );
 
     crate::progress::enter_stage("report");
     let (scan_status, inventory_status, inventory_reason) =

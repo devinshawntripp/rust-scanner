@@ -31,8 +31,10 @@ pub fn resolve_yara_rules(user_yara: &Option<String>, mode: &ScanMode) -> Option
     #[cfg(not(feature = "yara"))]
     {
         if matches!(mode, ScanMode::Deep) {
-            eprintln!("Warning: deep mode requires YARA support. This binary was built without it. Running in light mode.");
-            crate::utils::progress("scan.warn", "deep_mode_requires_yara");
+            // Only emit a progress event — don't warn to stderr.
+            // Deep mode without YARA still enables comps.xml filtering for ISO
+            // scans and installed-inventory requirements for container scans.
+            crate::utils::progress("scan.info", "yara_unavailable_deep_mode_continues_without_rules");
         }
         let _ = mode;
     }

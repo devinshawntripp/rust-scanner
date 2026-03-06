@@ -18,9 +18,9 @@ pub fn build_sbom_report(
     path: &str,
     _mode: ScanMode,
     nvd_api_key: Option<String>,
-) -> Option<Report> {
+) -> anyhow::Result<Report> {
     crate::utils::progress("sbom.import.start", path);
-    let parsed = parse_sbom_packages(path).ok()?;
+    let parsed = parse_sbom_packages(path)?;
     crate::utils::progress(
         "sbom.import.detect.done",
         &format!(
@@ -133,7 +133,7 @@ pub fn build_sbom_report(
         ),
     );
 
-    Some(Report {
+    Ok(Report {
         scanner: ScannerInfo {
             name: "scanrook",
             version: env!("CARGO_PKG_VERSION"),
@@ -730,5 +730,33 @@ mod tests {
         assert_eq!(p.0, "deb");
         assert_eq!(p.1, "coreutils");
         assert_eq!(p.2, "8.32-4");
+    }
+
+    #[test]
+    fn parse_sbom_returns_error_for_invalid_json() {
+        let tmp = std::env::temp_dir().join("bad_sbom.json");
+        std::fs::write(&tmp, "not valid json").unwrap();
+        let result = parse_sbom_packages(tmp.to_str().unwrap());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("failed to parse SBOM JSON"), "got: {}", msg);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn parse_sbom_returns_error_for_unsupported_format() {
+        let tmp = std::env::temp_dir().join("unknown_sbom.json");
+        std::fs::write(&tmp, r#"{"foo": "bar"}"#).unwrap();
+        let result = parse_sbom_packages(tmp.to_str().unwrap());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("unsupported SBOM format"), "got: {}", msg);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn parse_sbom_returns_error_for_missing_file() {
+        let result = parse_sbom_packages("/nonexistent/path/sbom.json");
+        assert!(result.is_err());
     }
 }

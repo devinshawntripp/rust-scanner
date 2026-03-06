@@ -15,58 +15,48 @@ fn epss_enrich_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Enrich findings with EPSS (Exploit Prediction Scoring System) scores.
-/// Batch queries the FIRST.org EPSS API in groups of 100 CVE IDs.
-///
-/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `epss_scores_cache`
-/// table before calling the FIRST.org API. API responses are written back to PG.
-/// In standalone mode, uses the file cache only — PG is never touched.
-pub fn epss_enrich_findings(
-    findings: &mut [Finding],
+/// Fetch EPSS scores for a set of CVE IDs using the provided PG connection.
+/// Returns a map of CVE ID -> (score, percentile).
+fn fetch_epss_scores_with_pg(
+    cve_ids: &[String],
     pg: &mut Option<PgClient>,
     cache_dir: Option<&std::path::Path>,
     breaker: &crate::vuln::CircuitBreaker,
-) {
+) -> HashMap<String, (f32, f32)> {
     if !epss_enrich_enabled() {
         progress("epss.enrich.skip", "disabled by SCANNER_EPSS_ENRICH");
-        return;
+        return HashMap::new();
     }
     if breaker.is_open() {
         progress(
             "epss.enrich.skip",
             &format!("circuit_open source={}", breaker.source_name()),
         );
-        return;
+        return HashMap::new();
     }
-    let mut cve_ids: Vec<String> = findings
-        .iter()
-        .filter(|f| f.id.starts_with("CVE-"))
-        .map(|f| f.id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    // Sort for stable chunking — without this the HashSet iteration order is random each run,
-    // producing different chunk boundaries and non-matching cache keys on every scan.
-    cve_ids.sort_unstable();
     if cve_ids.is_empty() {
-        return;
+        return HashMap::new();
     }
-    progress("epss.enrich.start", &format!("cves={}", cve_ids.len()));
+
+    let mut sorted_ids: Vec<String> = cve_ids.iter().cloned().collect::<HashSet<_>>().into_iter().collect();
+    sorted_ids.sort_unstable();
+
+    progress("epss.enrich.start", &format!("cves={}", sorted_ids.len()));
     let started = std::time::Instant::now();
 
     let mut scores: HashMap<String, (f32, f32)> = HashMap::new();
-    let mut api_ids: Vec<String> = cve_ids.clone();
+    let mut api_ids: Vec<String> = sorted_ids.clone();
 
     // Cluster mode: check PG cache before calling live API
     if crate::vuln::cluster_mode() {
         if let Some(client) = pg.as_mut() {
             let ttl = compute_jittered_ttl_days(30, 7);
-            let id_refs: Vec<&str> = cve_ids.iter().map(|s| s.as_str()).collect();
+            let id_refs: Vec<&str> = sorted_ids.iter().map(|s| s.as_str()).collect();
             let pg_scores = pg_get_epss_scores(client, &id_refs, ttl);
             let hit_count = pg_scores.len();
             scores.extend(pg_scores);
             // Only request IDs that were not in PG
-            api_ids = cve_ids
+            api_ids = sorted_ids
                 .iter()
                 .filter(|id| !scores.contains_key(id.as_str()))
                 .cloned()
@@ -198,6 +188,27 @@ pub fn epss_enrich_findings(
         }
     }
 
+    progress_timing("epss.enrich.fetch", started);
+    scores
+}
+
+/// Fetch EPSS scores for a set of CVE IDs, opening its own PG connection.
+/// Intended for use in parallel enrichment where the caller's PG connection
+/// cannot be shared across threads.
+pub fn fetch_epss_scores(
+    cve_ids: &[String],
+    cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
+) -> HashMap<String, (f32, f32)> {
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+    fetch_epss_scores_with_pg(cve_ids, &mut pg, cache_dir, breaker)
+}
+
+/// Apply pre-fetched EPSS scores to findings. Returns the number of findings enriched.
+pub fn apply_epss_scores(findings: &mut [Finding], scores: &HashMap<String, (f32, f32)>) -> usize {
     let mut enriched = 0usize;
     for finding in findings.iter_mut() {
         if let Some(&(score, percentile)) = scores.get(&finding.id) {
@@ -206,7 +217,30 @@ pub fn epss_enrich_findings(
             enriched += 1;
         }
     }
-    progress_timing("epss.enrich", started);
+    enriched
+}
+
+/// Enrich findings with EPSS (Exploit Prediction Scoring System) scores.
+/// Batch queries the FIRST.org EPSS API in groups of 100 CVE IDs.
+///
+/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `epss_scores_cache`
+/// table before calling the FIRST.org API. API responses are written back to PG.
+/// In standalone mode, uses the file cache only — PG is never touched.
+pub fn epss_enrich_findings(
+    findings: &mut [Finding],
+    pg: &mut Option<PgClient>,
+    cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
+) {
+    let cve_ids: Vec<String> = findings
+        .iter()
+        .filter(|f| f.id.starts_with("CVE-"))
+        .map(|f| f.id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let scores = fetch_epss_scores_with_pg(&cve_ids, pg, cache_dir, breaker);
+    let enriched = apply_epss_scores(findings, &scores);
     progress(
         "epss.enrich.done",
         &format!("enriched={}/{}", enriched, findings.len()),

@@ -8,6 +8,7 @@ mod http;
 mod kev;
 mod nvd;
 mod osv;
+mod parallel;
 pub mod pg;
 mod redhat_enrich;
 mod version;
@@ -17,8 +18,9 @@ mod version;
 pub use circuit::CircuitBreaker;
 pub use debian_legacy::debian_tracker_enrich_seed;
 pub use distro::seed_distro_feeds;
-pub use epss::epss_enrich_findings;
-pub use kev::kev_enrich_findings;
+pub use epss::{apply_epss_scores, epss_enrich_findings, fetch_epss_scores};
+pub use kev::{apply_kev_set, fetch_kev_set, kev_enrich_findings};
+pub use parallel::parallel_enrich_epss_kev;
 pub use nvd::{
     enrich_findings_with_nvd, match_vuln, nvd_cpe_findings, nvd_findings_by_product_version,
     nvd_keyword_findings, nvd_keyword_findings_name,

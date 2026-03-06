@@ -16,13 +16,13 @@ ENV SCANNER_NVD_CONC=5
 # Build dependencies
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
     apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates build-essential curl && \
+    pkg-config libssl-dev ca-certificates build-essential curl libyara-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Build + install the scanner binary into /usr/local.
 # Keep this as a single deterministic build step to avoid stale placeholder binaries.
 COPY . .
-RUN cargo install --path . --root /usr/local --locked
+RUN cargo install --path . --root /usr/local --locked --features yara
 
 # ---- runtime stage with Node.js ----
 FROM node:20-bookworm-slim
@@ -31,7 +31,7 @@ WORKDIR /app
 # Minimal runtime deps for scanner
 # Keep default apt sources here so ca-certificates can be installed before any HTTPS switch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 rpm libarchive-tools && \
+    ca-certificates libssl3 rpm libarchive-tools libyara9 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy scanrook binary installed in builder
