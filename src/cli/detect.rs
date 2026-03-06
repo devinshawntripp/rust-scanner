@@ -55,10 +55,13 @@ pub fn build_scan_report_value(
         return None;
     }
     if sbom_like {
-        if let Some(r) = sbom::build_sbom_report(file, mode, nvd_api_key) {
-            return serde_json::to_value(r).ok();
+        match sbom::build_sbom_report(file, mode, nvd_api_key) {
+            Ok(r) => return serde_json::to_value(r).ok(),
+            Err(e) => {
+                eprintln!("sbom import error: {}", e);
+                return None;
+            }
         }
-        return None;
     }
     if zip_like {
         if let Some(r) = archive::build_archive_report(file, mode.clone(), nvd_api_key.clone()) {
