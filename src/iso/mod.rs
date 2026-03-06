@@ -2,6 +2,7 @@
 
 mod extract;
 mod inventory;
+mod comps;
 mod repodata;
 mod report;
 
