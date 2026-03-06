@@ -62,6 +62,31 @@ fn nvd_vendor_product(extracted_name: &str) -> Option<(&'static str, &'static st
         "event" | "event_core" => Some(("libevent_project", "libevent")),
         "uv" => Some(("libuv_project", "libuv")),
         "cap" => Some(("kernel", "linux_kernel")),
+        // Additional common libraries
+        "cares" | "c-ares" => Some(("c-ares_project", "c-ares")),
+        "jansson" => Some(("digip", "jansson")),
+        "lz4" => Some(("lz4_project", "lz4")),
+        "snappy" => Some(("google", "snappy")),
+        "hiredis" => Some(("redis", "hiredis")),
+        "sodium" | "nacl" => Some(("jedisct1", "libsodium")),
+        "gpg" | "gpgme" | "gcrypt" => Some(("gnupg", "libgcrypt")),
+        "glib" | "gobject" | "gio" => Some(("gnome", "glib")),
+        "avcodec" | "avformat" | "avutil" | "swresample" | "swscale" => Some(("ffmpeg", "ffmpeg")),
+        "boost" => Some(("boost", "boost")),
+        "icu" | "icuuc" | "icui18n" | "icudata" => Some(("icu-project", "international_components_for_unicode")),
+        "ncurses" | "ncursesw" => Some(("gnu", "ncurses")),
+        "readline" => Some(("gnu", "readline")),
+        "archive" => Some(("libarchive", "libarchive")),
+        "microhttpd" => Some(("gnu", "libmicrohttpd")),
+        "maxminddb" => Some(("maxmind", "libmaxminddb")),
+        "p11-kit" | "p11kit" => Some(("p11-glue", "p11-kit")),
+        "tasn1" => Some(("gnu", "libtasn1")),
+        "onig" => Some(("kkos", "oniguruma")),
+        "cjson" | "cJSON" => Some(("cjson_project", "cjson")),
+        "leveldb" => Some(("google", "leveldb")),
+        "rocksdb" => Some(("facebook", "rocksdb")),
+        "mbedtls" | "mbedcrypto" | "mbedx509" => Some(("arm", "mbed_tls")),
+        "wolfssl" | "wolfcrypt" => Some(("wolfssl", "wolfssl")),
         _ => None,
     }
 }
@@ -382,7 +407,8 @@ pub fn build_binary_report(
             if extra.is_empty() {
                 extra = nvd_cpe_findings(&vendor, &nvd_product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
-            if extra.is_empty() {
+            if extra.is_empty() && nvd_vendor_product(product).is_some() {
+                // Only use keyword fallback for known-vendor components to reduce false positives
                 extra = nvd_keyword_findings(&nvd_product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
 
