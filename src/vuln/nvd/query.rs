@@ -172,6 +172,85 @@ pub fn nvd_keyword_findings(
         for item in items {
             let cve = &item["cve"];
             let id = cve["id"].as_str().unwrap_or("unknown").to_string();
+
+            // Check if this CVE actually affects our version via CPE configurations
+            let mut version_confirmed = false;
+            if let Some(configs) = cve.get("configurations").and_then(|c| c.as_array()) {
+                for config in configs {
+                    if let Some(nodes) = config.get("nodes").and_then(|n| n.as_array()) {
+                        for node in nodes {
+                            if let Some(cpes) = node.get("cpeMatch").and_then(|m| m.as_array()) {
+                                for c in cpes {
+                                    let vulnerable = c.get("vulnerable")
+                                        .and_then(|b| b.as_bool()).unwrap_or(false);
+                                    if !vulnerable { continue; }
+
+                                    let criteria = c.get("criteria")
+                                        .and_then(|s| s.as_str()).unwrap_or("");
+                                    if let Some((_ven, prod, _ver)) = cpe_parts(criteria) {
+                                        if prod.eq_ignore_ascii_case(component) {
+                                            let si = c.get("versionStartIncluding").and_then(|v| v.as_str());
+                                            let se = c.get("versionStartExcluding").and_then(|v| v.as_str());
+                                            let ei = c.get("versionEndIncluding").and_then(|v| v.as_str());
+                                            let ee = c.get("versionEndExcluding").and_then(|v| v.as_str());
+
+                                            if si.is_none() && se.is_none() && ei.is_none() && ee.is_none() {
+                                                // No range constraints -- check exact version in CPE
+                                                if let Some(cv) = _ver.as_deref() {
+                                                    if cv == "*" || cmp_versions(version, cv) == std::cmp::Ordering::Equal {
+                                                        version_confirmed = true;
+                                                    }
+                                                }
+                                            } else if is_version_in_range(version, si, se, ei, ee) {
+                                                version_confirmed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Also check top-level configurations.nodes (NVD v2 sometimes uses this shape)
+            if !version_confirmed {
+                if let Some(nodes) = cve["configurations"].get("nodes").and_then(|n| n.as_array()) {
+                    for node in nodes {
+                        if let Some(cpes) = node.get("cpeMatch").and_then(|m| m.as_array()) {
+                            for c in cpes {
+                                let vulnerable = c.get("vulnerable")
+                                    .and_then(|b| b.as_bool()).unwrap_or(false);
+                                if !vulnerable { continue; }
+
+                                let criteria = c.get("criteria")
+                                    .and_then(|s| s.as_str()).unwrap_or("");
+                                if let Some((_ven, prod, _ver)) = cpe_parts(criteria) {
+                                    if prod.eq_ignore_ascii_case(component) {
+                                        let si = c.get("versionStartIncluding").and_then(|v| v.as_str());
+                                        let se = c.get("versionStartExcluding").and_then(|v| v.as_str());
+                                        let ei = c.get("versionEndIncluding").and_then(|v| v.as_str());
+                                        let ee = c.get("versionEndExcluding").and_then(|v| v.as_str());
+
+                                        if si.is_none() && se.is_none() && ei.is_none() && ee.is_none() {
+                                            if let Some(cv) = _ver.as_deref() {
+                                                if cv == "*" || cmp_versions(version, cv) == std::cmp::Ordering::Equal {
+                                                    version_confirmed = true;
+                                                }
+                                            }
+                                        } else if is_version_in_range(version, si, se, ei, ee) {
+                                            version_confirmed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Skip CVEs where version doesn't match any affected range
+            if !version_confirmed { continue; }
+
             let description = extract_nvd_description(cve);
             let (cvss, severity) = extract_nvd_cvss(cve);
             let references = extract_nvd_references(cve);
@@ -212,9 +291,10 @@ pub fn nvd_keyword_findings(
     out
 }
 
-/// Query NVD by CPE name constructed from component/version
+/// Query NVD by CPE name constructed from vendor/product/version
 pub fn nvd_cpe_findings(
-    component: &str,
+    vendor: &str,
+    product: &str,
     version: &str,
     api_key: Option<&str>,
     evidence_path: Option<&str>,
@@ -223,8 +303,8 @@ pub fn nvd_cpe_findings(
     if breaker.is_open() {
         return Vec::new();
     }
-    let vendor = component.to_lowercase();
-    let product = component.to_lowercase();
+    let vendor = vendor.to_lowercase();
+    let product = product.to_lowercase();
     let cpe = format!("cpe:2.3:a:{}:{}:{}:*:*:*:*:*:*:*", vendor, product, version);
     let url = format!(
         "https://services.nvd.nist.gov/rest/json/cves/2.0?cpeName={}",
@@ -251,9 +331,9 @@ pub fn nvd_cpe_findings(
             }];
             out.push(Finding {
                 id,
-                source_ids: vec![format!("heuristic:cpe:{} {}", component, version)],
+                source_ids: vec![format!("heuristic:cpe:{} {}", product, version)],
                 package: Some(PackageInfo {
-                    name: component.to_string(),
+                    name: product.to_string(),
                     ecosystem: "nvd".into(),
                     version: version.to_string(),
                 }),
@@ -469,4 +549,19 @@ pub fn nvd_findings_by_product_version(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vuln::CircuitBreaker;
+
+    #[test]
+    fn keyword_findings_filters_by_version() {
+        // With breaker open, should return empty
+        let breaker = CircuitBreaker::new("test", 3);
+        for _ in 0..4 { breaker.record_failure(); }
+        let result = nvd_keyword_findings("test", "1.0", None, None, &breaker);
+        assert!(result.is_empty());
+    }
 }
