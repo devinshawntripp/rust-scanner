@@ -15,32 +15,23 @@ fn kev_enrich_enabled() -> bool {
         .unwrap_or(true)
 }
 
-/// Enrich findings with CISA KEV (Known Exploited Vulnerabilities) data.
-/// Downloads the full KEV catalog JSON and marks matching findings.
-///
-/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `kev_entries_cache`
-/// table before calling the CISA API. API responses are written back to PG.
-/// In standalone mode, uses the file cache only — PG is never touched.
-pub fn kev_enrich_findings(
-    findings: &mut [Finding],
+/// Fetch KEV entries using the provided PG connection.
+/// Returns a set of CVE IDs that are in the CISA KEV catalog.
+fn fetch_kev_set_with_pg(
     pg: &mut Option<PgClient>,
     cache_dir: Option<&std::path::Path>,
     breaker: &crate::vuln::CircuitBreaker,
-) {
+) -> Option<HashSet<String>> {
     if !kev_enrich_enabled() {
         progress("kev.enrich.skip", "disabled by SCANNER_KEV_ENRICH");
-        return;
+        return None;
     }
     if breaker.is_open() {
         progress(
             "kev.enrich.skip",
             &format!("circuit_open source={}", breaker.source_name()),
         );
-        return;
-    }
-    let has_cves = findings.iter().any(|f| f.id.starts_with("CVE-"));
-    if !has_cves {
-        return;
+        return None;
     }
     progress("kev.enrich.start", "checking KEV catalog");
     let started = std::time::Instant::now();
@@ -52,51 +43,14 @@ pub fn kev_enrich_findings(
             let kev_set = pg_get_kev_entries(client, ttl);
             if !kev_set.is_empty() {
                 progress("kev.enrich.pg_hit", &format!("entries={}", kev_set.len()));
-                let mut enriched = 0usize;
-                for finding in findings.iter_mut() {
-                    if finding.id.starts_with("CVE-") && kev_set.contains(&finding.id) {
-                        finding.in_kev = Some(true);
-                        enriched += 1;
-                    }
-                }
-                progress_timing("kev.enrich", started);
-                progress(
-                    "kev.enrich.done",
-                    &format!(
-                        "kev_total={} matched={}/{}",
-                        kev_set.len(),
-                        enriched,
-                        findings.len()
-                    ),
-                );
-                return;
+                progress_timing("kev.enrich.fetch", started);
+                return Some(kev_set);
             }
         }
     }
 
-    // Standalone mode: check local vulndb for KEV entries
-    if !crate::vuln::cluster_mode() {
-        if let Some(conn) = crate::vulndb::open_vulndb() {
-            let mut kev_hits = 0usize;
-            let mut enriched = 0usize;
-            for finding in findings.iter_mut() {
-                if finding.id.starts_with("CVE-") && crate::vulndb::query_kev(&conn, &finding.id) {
-                    finding.in_kev = Some(true);
-                    enriched += 1;
-                    kev_hits += 1;
-                }
-            }
-            if kev_hits > 0 {
-                progress("kev.enrich.vulndb_hit", &format!("matched={}", kev_hits));
-                progress_timing("kev.enrich", started);
-                progress(
-                    "kev.enrich.done",
-                    &format!("kev_vulndb matched={}/{}", enriched, findings.len()),
-                );
-                return; // all KEV data came from local DB
-            }
-        }
-    }
+    // Standalone vulndb KEV check happens in apply_kev_set() since it
+    // needs per-finding CVE IDs. Fall through to file cache / live API.
 
     // Standalone mode (or PG miss): use file cache / live API
     let kev_set = kev_from_cache_or_api(cache_dir, breaker);
@@ -111,14 +65,70 @@ pub fn kev_enrich_findings(
         }
     }
 
+    progress_timing("kev.enrich.fetch", started);
+    Some(kev_set)
+}
+
+/// Fetch KEV set, opening its own PG connection.
+/// Intended for use in parallel enrichment.
+pub fn fetch_kev_set(
+    cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
+) -> HashSet<String> {
+    let mut pg = crate::vuln::pg_connect();
+    if let Some(c) = pg.as_mut() {
+        crate::vuln::pg_init_schema(c);
+    }
+    fetch_kev_set_with_pg(&mut pg, cache_dir, breaker).unwrap_or_default()
+}
+
+/// Apply pre-fetched KEV set to findings. Returns the number of findings enriched.
+pub fn apply_kev_set(findings: &mut [Finding], kev_set: &HashSet<String>) -> usize {
+    // Also check vulndb in standalone mode for any entries not in the API set
+    let vulndb_conn = if !crate::vuln::cluster_mode() {
+        crate::vulndb::open_vulndb()
+    } else {
+        None
+    };
+
     let mut enriched = 0usize;
     for finding in findings.iter_mut() {
-        if finding.id.starts_with("CVE-") && kev_set.contains(&finding.id) {
-            finding.in_kev = Some(true);
-            enriched += 1;
+        if finding.id.starts_with("CVE-") {
+            if kev_set.contains(&finding.id) {
+                finding.in_kev = Some(true);
+                enriched += 1;
+            } else if let Some(ref conn) = vulndb_conn {
+                if crate::vulndb::query_kev(conn, &finding.id) {
+                    finding.in_kev = Some(true);
+                    enriched += 1;
+                }
+            }
         }
     }
-    progress_timing("kev.enrich", started);
+    enriched
+}
+
+/// Enrich findings with CISA KEV (Known Exploited Vulnerabilities) data.
+/// Downloads the full KEV catalog JSON and marks matching findings.
+///
+/// In cluster mode (`SCANROOK_CLUSTER_MODE=1`), checks the PostgreSQL `kev_entries_cache`
+/// table before calling the CISA API. API responses are written back to PG.
+/// In standalone mode, uses the file cache only — PG is never touched.
+pub fn kev_enrich_findings(
+    findings: &mut [Finding],
+    pg: &mut Option<PgClient>,
+    cache_dir: Option<&std::path::Path>,
+    breaker: &crate::vuln::CircuitBreaker,
+) {
+    let has_cves = findings.iter().any(|f| f.id.starts_with("CVE-"));
+    if !has_cves {
+        return;
+    }
+    let kev_set = match fetch_kev_set_with_pg(pg, cache_dir, breaker) {
+        Some(set) => set,
+        None => return,
+    };
+    let enriched = apply_kev_set(findings, &kev_set);
     progress(
         "kev.enrich.done",
         &format!(
