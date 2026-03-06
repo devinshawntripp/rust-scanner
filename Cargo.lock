@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "scanrook"
-version = "1.10.5"
+version = "1.10.6"
 dependencies = [
  "anyhow",
  "apple-flat-package",
