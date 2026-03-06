@@ -72,6 +72,12 @@ pub fn build_scan_report_value(
 
 pub fn looks_like_tar_input(path: &str) -> bool {
     let lower = path.to_lowercase();
+
+    // OVAL XML files use bzip2 compression but are not tarballs
+    if lower.ends_with(".oval.xml.bz2") || lower.ends_with(".oval.xml") {
+        return false;
+    }
+
     if lower.ends_with(".tar")
         || lower.ends_with(".tar.gz")
         || lower.ends_with(".tgz")
@@ -249,5 +255,15 @@ mod tests {
             None,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn oval_bz2_not_detected_as_tar() {
+        assert!(!looks_like_tar_input("rhel-8.oval.xml.bz2"));
+        assert!(!looks_like_tar_input("RHEL9/rhel-9.oval.xml.bz2"));
+        assert!(!looks_like_tar_input("test.oval.xml"));
+        // Real tar files should still be detected
+        assert!(looks_like_tar_input("image.tar.bz2"));
+        assert!(looks_like_tar_input("archive.tar.gz"));
     }
 }
