@@ -111,11 +111,11 @@ pub fn osv_batch_query(
             for &(orig_idx, ref query) in chunk {
                 let eco = query["package"]["ecosystem"].as_str().unwrap_or_default();
                 let name = query["package"]["name"].as_str().unwrap_or_default();
-                let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
-                if vulns.is_empty() {
+                if !crate::vulndb::has_osv_package(conn, eco, name) {
                     all_found = false;
                     break;
                 }
+                let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
                 results[orig_idx] = serde_json::json!({"vulns": vulns});
             }
             if all_found {
