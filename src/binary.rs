@@ -22,6 +22,50 @@ use std::path::Path;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
+/// Map extracted library short names to their NVD vendor:product pair.
+/// Covers the most common C/C++ libraries found in binaries.
+fn nvd_vendor_product(extracted_name: &str) -> Option<(&'static str, &'static str)> {
+    let lower = extracted_name.to_lowercase();
+    match lower.as_str() {
+        "ssl" | "crypto" | "openssl" => Some(("openssl", "openssl")),
+        "z" | "zlib" => Some(("zlib", "zlib")),
+        "curl" => Some(("haxx", "curl")),
+        "xml2" | "libxml2" => Some(("xmlsoft", "libxml2")),
+        "xslt" | "libxslt" => Some(("xmlsoft", "libxslt")),
+        "png" | "png16" => Some(("libpng", "libpng")),
+        "jpeg" | "turbojpeg" => Some(("libjpeg-turbo", "libjpeg-turbo")),
+        "tiff" => Some(("libtiff", "libtiff")),
+        "freetype" => Some(("freetype", "freetype")),
+        "pcre" | "pcre2" => Some(("pcre", "pcre")),
+        "expat" => Some(("libexpat_project", "libexpat")),
+        "sqlite3" | "sqlite" => Some(("sqlite", "sqlite")),
+        "nghttp2" => Some(("nghttp2", "nghttp2")),
+        "ssh2" | "libssh2" => Some(("libssh2", "libssh2")),
+        "ssh" | "libssh" => Some(("libssh", "libssh")),
+        "gnutls" => Some(("gnu", "gnutls")),
+        "bz2" | "bzip2" => Some(("bzip", "bzip2")),
+        "lzma" | "xz" => Some(("tukaani", "xz")),
+        "zstd" => Some(("facebook", "zstandard")),
+        "protobuf" | "protobuf-c" => Some(("google", "protobuf")),
+        "yaml" => Some(("pyyaml", "libyaml")),
+        "ffi" => Some(("sourceware", "libffi")),
+        "gmp" => Some(("gmplib", "gmp")),
+        "idn2" => Some(("gnu", "libidn2")),
+        "nettle" => Some(("nettle_project", "nettle")),
+        "hogweed" => Some(("nettle_project", "nettle")),
+        "systemd" => Some(("systemd_project", "systemd")),
+        "krb5" | "gssapi_krb5" | "k5crypto" => Some(("mit", "kerberos_5")),
+        "ldap" => Some(("openldap", "openldap")),
+        "sasl2" => Some(("cyrusimap", "cyrus-sasl")),
+        "pq" => Some(("postgresql", "postgresql")),
+        "mysqlclient" => Some(("oracle", "mysql")),
+        "event" | "event_core" => Some(("libevent_project", "libevent")),
+        "uv" => Some(("libuv_project", "libuv")),
+        "cap" => Some(("kernel", "linux_kernel")),
+        _ => None,
+    }
+}
+
 const DEFAULT_BINARY_FULL_SCAN_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_BINARY_SAMPLE_BYTES: usize = 12 * 1024 * 1024;
 const DEFAULT_BINARY_HEAD_BYTES: usize = 8 * 1024 * 1024;
@@ -319,22 +363,27 @@ pub fn build_binary_report(
                 progress("binary.nvd.lookup.skip", "circuit breaker open");
                 break;
             }
-            let step = format!("{}/{} {} {}", idx + 1, total, product, version);
+            // Look up correct NVD vendor/product, fall back to product=product
+            let (vendor, nvd_product) = nvd_vendor_product(product)
+                .map(|(v, p)| (v.to_string(), p.to_string()))
+                .unwrap_or_else(|| (product.clone(), product.clone()));
+
+            let step = format!("{}/{} {} {}", idx + 1, total, nvd_product, version);
             progress("binary.nvd.lookup.start", &step);
 
             let mut extra = nvd_findings_by_product_version(
-                product,
-                product,
+                &vendor,
+                &nvd_product,
                 version,
                 nvd_api_key.as_deref(),
                 Some(path),
                 &nvd_breaker,
             );
             if extra.is_empty() {
-                extra = nvd_cpe_findings(product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
+                extra = nvd_cpe_findings(&vendor, &nvd_product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
             if extra.is_empty() {
-                extra = nvd_keyword_findings(product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
+                extra = nvd_keyword_findings(&nvd_product, version, nvd_api_key.as_deref(), Some(path), &nvd_breaker);
             }
 
             let found = extra.len();
@@ -440,6 +489,21 @@ pub fn build_binary_report(
     crate::vuln::epss_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &epss_breaker);
     crate::progress::enter_stage("kev");
     crate::vuln::kev_enrich_findings(&mut findings, &mut pg, cache_dir.as_deref(), &kev_breaker);
+
+    // Downgrade findings from components with no known NVD vendor mapping
+    for f in findings.iter_mut() {
+        if let Some(ref pkg) = f.package {
+            if nvd_vendor_product(&pkg.name).is_none() {
+                f.confidence = Some("LOW".into());
+                if f.accuracy_note.is_none() {
+                    f.accuracy_note = Some(
+                        "Component detected via binary string heuristic with no known NVD vendor mapping. \
+                         Finding may be a false positive.".into(),
+                    );
+                }
+            }
+        }
+    }
 
     crate::progress::enter_stage("report");
     let mut report = Report {
@@ -644,5 +708,15 @@ mod tests {
             None,
         );
         assert!(report.is_none(), "plain text file should not produce a binary report");
+    }
+
+    #[test]
+    fn vendor_lookup_maps_common_libraries() {
+        assert_eq!(nvd_vendor_product("ssl"), Some(("openssl", "openssl")));
+        assert_eq!(nvd_vendor_product("SSL"), Some(("openssl", "openssl")));
+        assert_eq!(nvd_vendor_product("z"), Some(("zlib", "zlib")));
+        assert_eq!(nvd_vendor_product("curl"), Some(("haxx", "curl")));
+        assert_eq!(nvd_vendor_product("pq"), Some(("postgresql", "postgresql")));
+        assert_eq!(nvd_vendor_product("unknownlib"), None);
     }
 }
