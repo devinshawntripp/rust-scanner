@@ -31,7 +31,7 @@ pub fn open_vulndb() -> Option<Connection> {
 
 // --- Schema ---
 
-pub(super) const CREATE_SCHEMA: &str = r#"
+pub(crate) const CREATE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS osv_packages (ecosystem TEXT, name TEXT, PRIMARY KEY (ecosystem, name));

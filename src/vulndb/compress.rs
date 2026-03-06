@@ -80,7 +80,7 @@ pub(super) fn strip_osv_unused_fields(val: &Value) -> Value {
     Value::Object(out)
 }
 
-pub(super) fn compress_json(data: &[u8]) -> Vec<u8> {
+pub(crate) fn compress_json(data: &[u8]) -> Vec<u8> {
     // Use zstd level 3 -- 30-40% smaller than gzip with faster compression
     zstd::encode_all(data, 3).unwrap_or_else(|_| data.to_vec())
 }

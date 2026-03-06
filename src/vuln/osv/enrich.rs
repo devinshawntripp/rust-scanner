@@ -371,6 +371,31 @@ pub fn osv_enrich_findings(
         pg_init_schema(c);
     }
 
+    // Phase 0: vulndb payload lookup (standalone mode only)
+    let vulndb_conn = if !crate::vuln::cluster_mode() {
+        crate::vulndb::open_vulndb()
+    } else {
+        None
+    };
+    let mut vulndb_hits: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    if let Some(ref conn) = vulndb_conn {
+        for id in &unique_ids {
+            if id.starts_with("CVE-") && !fetch_cve_details {
+                continue;
+            }
+            if let Some(json) = crate::vulndb::query_osv_payload_by_id(conn, id) {
+                vulndb_hits.insert(id.clone(), json);
+            }
+        }
+        if !vulndb_hits.is_empty() {
+            progress(
+                "osv.enrich.vulndb",
+                &format!("hits={}/{}", vulndb_hits.len(), unique_ids.len()),
+            );
+        }
+    }
+
     // Phase 1: PG cache lookup (sequential — PgClient is not Send)
     let phase_pg_started = std::time::Instant::now();
     let mut pg_cache_hits: std::collections::HashMap<String, Value> =
@@ -378,6 +403,10 @@ pub fn osv_enrich_findings(
     let mut needs_fetch: Vec<String> = Vec::new();
     let mut skipped_cve_fetch = 0usize;
     for id in &unique_ids {
+        // Skip IDs already resolved from vulndb
+        if vulndb_hits.contains_key(id) {
+            continue;
+        }
         if id.starts_with("CVE-") && !fetch_cve_details {
             skipped_cve_fetch += 1;
             continue;
@@ -430,9 +459,9 @@ pub fn osv_enrich_findings(
     }
     progress_timing("osv.enrich.pg_cache_store", phase_pg_store_started);
 
-    // Phase 4: Build combined payloads map (PG hits + freshly fetched)
+    // Phase 4: Build combined payloads map (vulndb + PG hits + freshly fetched)
     let all_payloads: std::collections::HashMap<String, Value> =
-        pg_cache_hits.into_iter().chain(fetched).collect();
+        vulndb_hits.into_iter().chain(pg_cache_hits).chain(fetched).collect();
 
     // Phase 5: Apply payloads to findings sequentially
     // (advisory->CVE upgrades require sequential mutation of the shared findings vec)
@@ -475,5 +504,53 @@ pub fn osv_enrich_findings(
     let dropped = before_len_final.saturating_sub(findings.len());
     if dropped > 0 {
         progress("osv.advisory.drop.final", &format!("count={}", dropped));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// In standalone mode (no SCANROOK_CLUSTER_MODE), vulndb should be checked
+    /// for advisory payloads before falling through to PG/API.
+    #[test]
+    fn test_vulndb_payload_lookup_in_standalone_mode() {
+        // Ensure standalone mode
+        std::env::remove_var("SCANROOK_CLUSTER_MODE");
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::vulndb::schema::CREATE_SCHEMA).unwrap();
+        crate::vulndb::schema::set_metadata(&conn, "schema_version", "2").unwrap();
+        crate::vulndb::schema::set_metadata(&conn, "dict_compression", "0").unwrap();
+
+        // Insert a DLA advisory payload
+        let dla_json = br#"{"id": "DLA-3879-1", "aliases": ["CVE-2024-1234"], "summary": "test"}"#;
+        let compressed = crate::vulndb::compress::compress_json(dla_json);
+        conn.execute(
+            "INSERT INTO osv_payloads (id, payload) VALUES (?1, ?2)",
+            rusqlite::params!["DLA-3879-1", compressed],
+        ).unwrap();
+
+        // query_osv_payload_by_id should find it
+        let result = crate::vulndb::query_osv_payload_by_id(&conn, "DLA-3879-1");
+        assert!(result.is_some(), "vulndb should return payload for DLA-3879-1");
+        assert_eq!(result.unwrap()["id"].as_str().unwrap(), "DLA-3879-1");
+    }
+
+    /// In cluster mode (SCANROOK_CLUSTER_MODE=1), vulndb should NOT be opened.
+    /// The enrichment pipeline should skip vulndb and use PG cache instead.
+    #[test]
+    fn test_cluster_mode_skips_vulndb() {
+        std::env::set_var("SCANROOK_CLUSTER_MODE", "1");
+        assert!(crate::vuln::cluster_mode(), "cluster_mode should be true");
+
+        // In cluster mode, open_vulndb is not called (vulndb_conn = None)
+        let vulndb_conn: Option<rusqlite::Connection> = if !crate::vuln::cluster_mode() {
+            Some(rusqlite::Connection::open_in_memory().unwrap())
+        } else {
+            None
+        };
+        assert!(vulndb_conn.is_none(), "cluster mode should skip vulndb");
+
+        // Clean up env
+        std::env::remove_var("SCANROOK_CLUSTER_MODE");
     }
 }
