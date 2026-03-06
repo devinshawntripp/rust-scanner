@@ -297,6 +297,13 @@ pub fn build_binary_report(
             }
         }
 
+        // If not a recognized binary format and no components extracted, bail
+        if file_type == "Unknown" && seen_pairs.is_empty() {
+            eprintln!("Unrecognized file type: {}. Not an ELF, PE, or Mach-O binary.", path);
+            crate::utils::progress("scan.skip", &format!("unknown_type={}", path));
+            return None;
+        }
+
         let mut pairs: Vec<(String, String)> = seen_pairs.into_iter().collect();
         pairs.sort_unstable();
         let total = pairs.len();
@@ -615,4 +622,27 @@ pub fn parse_go_buildinfo(bytes: &[u8]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn unknown_file_type_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readme.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "This is a plain text file with no version-like strings anywhere inside it.").unwrap();
+        }
+        let report = build_binary_report(
+            path.to_str().unwrap(),
+            ScanMode::Light,
+            None,
+            None,
+        );
+        assert!(report.is_none(), "plain text file should not produce a binary report");
+    }
 }
