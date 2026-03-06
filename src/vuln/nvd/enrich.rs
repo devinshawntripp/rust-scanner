@@ -90,6 +90,11 @@ pub fn enrich_findings_with_nvd(
     // Determine which IDs to fetch from network after consulting PG cache
     let cache_lookup_started = std::time::Instant::now();
     let mut to_fetch: Vec<(usize, String)> = Vec::new();
+    progress(
+        "nvd.enrich.cache_lookup.start",
+        &format!("{} CVEs to check", total),
+    );
+    let mut cached_count: usize = 0;
     for (idx, id) in unique_ids.into_iter().enumerate() {
         let mut served_from_cache = false;
         if let Some(client) = pg.as_mut() {
@@ -99,13 +104,25 @@ pub fn enrich_findings_with_nvd(
                     id_to_json.insert(id.clone(), payload);
                     progress("nvd.cache.pg.hit", &id);
                     served_from_cache = true;
+                    cached_count += 1;
                 }
             }
         }
         if !served_from_cache {
             to_fetch.push((idx, id));
         }
+        if (idx + 1) % 50 == 0 || idx + 1 == total {
+            progress(
+                "nvd.enrich.cache_lookup.progress",
+                &format!("{}/{}", idx + 1, total),
+            );
+        }
     }
+    let to_fetch_count = to_fetch.len();
+    progress(
+        "nvd.enrich.cache_lookup.done",
+        &format!("{} cached, {} to fetch", cached_count, to_fetch_count),
+    );
     progress_timing("nvd.enrich.cache_lookup", cache_lookup_started);
 
     // Concurrency with politeness via a small threadpool
