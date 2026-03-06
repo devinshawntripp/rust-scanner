@@ -601,7 +601,6 @@ fn main() {
                 println!("{}", text);
                 utils::write_output_if_needed(&out, &text);
             } else {
-                eprintln!("Failed to detect or scan file: {}", file);
                 progress("scan.error", &format!("file={}", file));
                 utils::progress_panel_finish("scan failed");
                 std::process::exit(1);

@@ -11,6 +11,13 @@ pub fn build_scan_report_value(
     nvd_api_key: Option<String>,
     oval_redhat: Option<String>,
 ) -> Option<Value> {
+    // Early exit for non-existent files
+    if !std::path::Path::new(file).exists() {
+        eprintln!("File not found: {}", file);
+        crate::utils::progress("scan.error", &format!("file_not_found={}", file));
+        return None;
+    }
+
     let dmg_like = looks_like_dmg_input(file);
     let tar_like = looks_like_tar_input(file);
     let iso_like = looks_like_iso_input(file);
@@ -226,4 +233,21 @@ pub fn looks_like_dmg_input(path: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonexistent_file_returns_none_early() {
+        let result = build_scan_report_value(
+            "/tmp/scanrook_test_nonexistent_file_xyz.tar",
+            ScanMode::Light,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_none());
+    }
 }
