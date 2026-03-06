@@ -21,6 +21,9 @@ use super::repodata::packages_from_repodata;
 pub(super) const ISO_HEURISTIC_NOTE: &str =
     "Installed package inventory could not be fully determined for this ISO. Finding may be false positive.";
 
+pub(super) const ISO_REPODATA_NOTE: &str =
+    "Package inventory derived from repository metadata. Versions reflect available packages, not confirmed installed state.";
+
 fn light_allow_heuristic_fallback() -> bool {
     std::env::var("SCANNER_LIGHT_ALLOW_HEURISTIC_FALLBACK")
         .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -187,11 +190,16 @@ pub fn build_iso_report(
         }
 
         if !inventory_complete && allow_heuristic_fallback {
+            let note = if used_repodata {
+                ISO_REPODATA_NOTE
+            } else {
+                ISO_HEURISTIC_NOTE
+            };
             retag_findings(
                 &mut findings_norm,
                 ConfidenceTier::HeuristicUnverified,
                 fallback_source,
-                Some(ISO_HEURISTIC_NOTE),
+                Some(note),
             );
         }
 

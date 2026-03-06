@@ -73,3 +73,96 @@ fn test_find_entry_normalized() {
         Some("./repodata/repomd.xml")
     );
 }
+
+#[test]
+fn repodata_findings_get_softer_accuracy_note() {
+    use crate::report::{retag_findings, ConfidenceTier, EvidenceSource, Finding, PackageInfo};
+
+    let mut findings = vec![Finding {
+        id: "CVE-2024-0001".to_string(),
+        source_ids: Vec::new(),
+        package: Some(PackageInfo {
+            name: "bash".into(),
+            ecosystem: "redhat".into(),
+            version: "5.1.8-6.el9".into(),
+        }),
+        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+        evidence_source: EvidenceSource::InstalledDb,
+        accuracy_note: None,
+        fixed: None,
+        fixed_in: None,
+        recommendation: None,
+        severity: None,
+        cvss: None,
+        description: None,
+        evidence: Vec::new(),
+        references: Vec::new(),
+        confidence: None,
+        epss_score: None,
+        epss_percentile: None,
+        in_kev: None,
+    }];
+
+    retag_findings(
+        &mut findings,
+        ConfidenceTier::HeuristicUnverified,
+        EvidenceSource::RepoMetadata,
+        Some(super::report::ISO_REPODATA_NOTE),
+    );
+
+    let note = findings[0].accuracy_note.as_ref().unwrap();
+    assert!(
+        !note.contains("false positive"),
+        "repodata findings should not warn about false positives, got: {}",
+        note
+    );
+    assert!(
+        note.contains("repository metadata"),
+        "repodata note should mention repository metadata, got: {}",
+        note
+    );
+}
+
+#[test]
+fn heuristic_findings_keep_harsh_accuracy_note() {
+    use crate::report::{retag_findings, ConfidenceTier, EvidenceSource, Finding, PackageInfo};
+
+    let mut findings = vec![Finding {
+        id: "CVE-2024-0002".to_string(),
+        source_ids: Vec::new(),
+        package: Some(PackageInfo {
+            name: "bash".into(),
+            ecosystem: "redhat".into(),
+            version: "5.1.8".into(),
+        }),
+        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+        evidence_source: EvidenceSource::InstalledDb,
+        accuracy_note: None,
+        fixed: None,
+        fixed_in: None,
+        recommendation: None,
+        severity: None,
+        cvss: None,
+        description: None,
+        evidence: Vec::new(),
+        references: Vec::new(),
+        confidence: None,
+        epss_score: None,
+        epss_percentile: None,
+        in_kev: None,
+    }];
+
+    retag_findings(
+        &mut findings,
+        ConfidenceTier::HeuristicUnverified,
+        EvidenceSource::FilenameHeuristic,
+        Some(super::report::ISO_HEURISTIC_NOTE),
+    );
+
+    let note = findings[0].accuracy_note.as_ref().unwrap();
+    assert!(
+        note.contains("false positive"),
+        "heuristic findings should warn about false positives, got: {}",
+        note
+    );
+}
