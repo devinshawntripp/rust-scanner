@@ -227,8 +227,8 @@ enum Commands {
     },
     /// Detect license in a file
     License {
-        #[arg(short, long)]
-        path: String,
+        #[arg(short = 'f', long = "file", alias = "path")]
+        file: String,
     },
     /// Match CVE from component/version
     Vuln {
@@ -647,8 +647,8 @@ fn main() {
         Commands::Source { tar, format, out } => {
             container::scan_source_tarball(&tar, format, nvd_api_key.clone(), out);
         }
-        Commands::License { path } => {
-            license::detect_license(&path);
+        Commands::License { file } => {
+            license::detect_license(&file);
         }
         Commands::Vuln { component, version } => {
             vuln::match_vuln(&component, &version);
