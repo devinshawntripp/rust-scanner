@@ -263,7 +263,11 @@ pub fn build_iso_report(
         }
     }
 
+    let comps_filtered = comps_info.is_some();
     let (scan_status, inventory_status, inventory_reason) = if inventory_complete {
+        (ScanStatus::Complete, InventoryStatus::Complete, None)
+    } else if comps_filtered && !packages.is_empty() {
+        // Deep mode comps.xml filtering succeeded — treat as complete
         (ScanStatus::Complete, InventoryStatus::Complete, None)
     } else if !packages.is_empty() {
         (
