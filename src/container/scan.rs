@@ -377,7 +377,7 @@ pub fn build_container_report(
     let allow_heuristic_fallback = heuristic_fallback_allowed(&mode);
     if packages.is_empty() && (has_manifest || has_oci_index) && allow_heuristic_fallback {
         if let Some((name, ver)) = parse_name_version_from_filename(tar_path) {
-            let mut extra = nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
+            let mut extra = nvd_cpe_findings(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
             if extra.is_empty() {
                 extra = crate::vuln::nvd_findings_by_product_version(
                     &name,
@@ -410,7 +410,7 @@ pub fn build_container_report(
             if let Some((name, ver)) = detect_busybox_version_in_tree(&rootfs) {
                 progress("container.filename.heuristic", &format!("{} {}", name, ver));
                 let mut extra =
-                    nvd_cpe_findings(&name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
+                    nvd_cpe_findings(&name, &name, &ver, nvd_api_key.as_deref(), Some(tar_path), &nvd_breaker);
                 if extra.is_empty() {
                     extra = crate::vuln::nvd_findings_by_product_version(
                         &name,
