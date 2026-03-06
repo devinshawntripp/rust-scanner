@@ -84,6 +84,9 @@ pub fn osv_batch_query(
     } else {
         None
     };
+    if vulndb_conn.is_some() {
+        progress("osv.vulndb.open", &format!("path={}", crate::vulndb::vulndb_path().display()));
+    }
 
     for chunk in indexed.chunks(chunk_size) {
         // Prepare body for this chunk
