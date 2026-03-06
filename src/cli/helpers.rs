@@ -29,7 +29,13 @@ pub fn resolve_yara_rules(user_yara: &Option<String>, mode: &ScanMode) -> Option
         }
     }
     #[cfg(not(feature = "yara"))]
-    let _ = mode;
+    {
+        if matches!(mode, ScanMode::Deep) {
+            eprintln!("Warning: deep mode requires YARA support. This binary was built without it. Running in light mode.");
+            crate::utils::progress("scan.warn", "deep_mode_requires_yara");
+        }
+        let _ = mode;
+    }
     None
 }
 
@@ -308,5 +314,16 @@ pub fn nudge_seed_if_empty() {
             "cache.empty",
             "run `scanrook db seed --all` to pre-warm the vulnerability cache for faster scans",
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_mode_without_yara_returns_none() {
+        let result = resolve_yara_rules(&None, &ScanMode::Deep);
+        assert!(result.is_none());
     }
 }
