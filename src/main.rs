@@ -596,7 +596,7 @@ fn main() {
                 let text = if matches!(format, OutputFormat::Json) {
                     serde_json::to_string_pretty(&v).unwrap()
                 } else {
-                    format!("{}", v)
+                    crate::cli::text_report::render_text_report(&v)
                 };
                 println!("{}", text);
                 utils::write_output_if_needed(&out, &text);

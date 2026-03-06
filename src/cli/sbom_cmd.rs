@@ -47,7 +47,7 @@ pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) {
                 let text = if matches!(format, OutputFormat::Json) {
                     serde_json::to_string_pretty(&report).unwrap()
                 } else {
-                    format!("{}", report)
+                    crate::cli::text_report::render_text_report(&report)
                 };
                 println!("{}", text);
                 utils::write_output_if_needed(&out, &text);
