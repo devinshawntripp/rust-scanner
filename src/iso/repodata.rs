@@ -13,22 +13,61 @@ pub(super) fn packages_from_repodata(
     entries: &[String],
 ) -> anyhow::Result<Vec<PackageCoordinate>> {
     progress("iso.repodata.start", "repomd.xml");
-    let Some(repomd_path) = find_entry(entries, "repodata/repomd.xml") else {
+    let repos = find_repomd_entries(entries);
+    if repos.is_empty() {
         return Ok(Vec::new());
-    };
-    let repomd_raw = read_iso_entry(path, repomd_path)?;
-    let Some(primary_href) = parse_repodata_primary_href(&repomd_raw) else {
-        return Ok(Vec::new());
-    };
-    let Some(primary_entry) = find_entry(entries, &primary_href) else {
-        return Err(anyhow!(
-            "repodata primary metadata not found in ISO entries: {}",
-            primary_href
-        ));
-    };
-    let primary_raw = read_iso_entry(path, primary_entry)?;
-    let primary_xml = decompress_if_needed(primary_entry, primary_raw)?;
-    Ok(parse_primary_packages(&primary_xml))
+    }
+    let mut all_packages = Vec::new();
+    for (prefix, repomd_entry) in &repos {
+        let repomd_raw = read_iso_entry(path, repomd_entry)?;
+        let Some(primary_href) = parse_repodata_primary_href(&repomd_raw) else {
+            continue;
+        };
+        let resolved = resolve_href(prefix, &primary_href);
+        let Some(primary_entry) = find_entry(entries, &resolved) else {
+            progress(
+                "iso.repodata.primary.missing",
+                &format!("not found: {}", resolved),
+            );
+            continue;
+        };
+        let primary_raw = read_iso_entry(path, primary_entry)?;
+        let primary_xml = decompress_if_needed(primary_entry, primary_raw)?;
+        let pkgs = parse_primary_packages(&primary_xml);
+        progress(
+            "iso.repodata.repo",
+            &format!("prefix={} packages={}", if prefix.is_empty() { "(root)" } else { prefix }, pkgs.len()),
+        );
+        all_packages.extend(pkgs);
+    }
+    Ok(all_packages)
+}
+
+/// Find all repomd.xml entries in the ISO, returning (prefix, entry_path) pairs.
+/// Checks root `repodata/repomd.xml` and subdirectory patterns like `BaseOS/repodata/repomd.xml`.
+fn find_repomd_entries<'a>(entries: &'a [String]) -> Vec<(String, &'a str)> {
+    let suffix = "repodata/repomd.xml";
+    let mut results = Vec::new();
+    for entry in entries {
+        let norm = normalize_path_like(entry);
+        if norm == suffix {
+            results.push(("".to_string(), entry.as_str()));
+        } else if norm.ends_with(&format!("/{}", suffix)) {
+            let prefix = &norm[..norm.len() - suffix.len()];
+            results.push((prefix.to_string(), entry.as_str()));
+        }
+    }
+    results
+}
+
+/// Resolve a relative href from repomd.xml against the repo prefix directory.
+/// e.g., prefix="BaseOS/", href="repodata/hash-primary.xml.gz" → "BaseOS/repodata/hash-primary.xml.gz"
+fn resolve_href(prefix: &str, href: &str) -> String {
+    if prefix.is_empty() {
+        href.to_string()
+    } else {
+        format!("{}{}", prefix, href)
+    }
 }
 
 pub(super) fn parse_repodata_primary_href(repomd_xml: &[u8]) -> Option<String> {
@@ -83,31 +122,42 @@ pub(super) fn parse_repodata_comps_href(repomd_xml: &[u8]) -> Option<String> {
 
 /// Load comps.xml from repodata and return the default-install package names.
 /// Returns (environment_name, package_names, full_comps_data).
+/// Searches all repos (BaseOS/, AppStream/, root) and uses the first with a
+/// valid comps.xml containing installation environments.
 pub(super) fn comps_package_names_from_repodata(
     path: &str,
     entries: &[String],
 ) -> anyhow::Result<Option<(String, HashSet<String>, CompsData)>> {
-    let Some(repomd_path) = find_entry(entries, "repodata/repomd.xml") else {
+    let repos = find_repomd_entries(entries);
+    if repos.is_empty() {
         return Ok(None);
-    };
-    let repomd_raw = read_iso_entry(path, repomd_path)?;
-    let Some(comps_href) = parse_repodata_comps_href(&repomd_raw) else {
-        return Ok(None);
-    };
-    let Some(comps_entry) = find_entry(entries, &comps_href) else {
-        return Err(anyhow!(
-            "repodata comps metadata not found in ISO entries: {}",
-            comps_href
-        ));
-    };
-    let comps_raw = read_iso_entry(path, comps_entry)?;
-    let comps_xml = decompress_if_needed(comps_entry, comps_raw)?;
-    let comps_data = parse_comps_xml(&comps_xml)?;
-    let (env_name, package_names) = comps_data.default_install_packages();
-    match env_name {
-        Some(name) => Ok(Some((name, package_names, comps_data))),
-        None => Ok(None),
     }
+    for (prefix, repomd_entry) in &repos {
+        let repomd_raw = read_iso_entry(path, repomd_entry)?;
+        let Some(comps_href) = parse_repodata_comps_href(&repomd_raw) else {
+            continue;
+        };
+        let resolved = resolve_href(prefix, &comps_href);
+        let Some(comps_entry) = find_entry(entries, &resolved) else {
+            progress(
+                "iso.comps.entry.missing",
+                &format!("not found: {}", resolved),
+            );
+            continue;
+        };
+        let comps_raw = read_iso_entry(path, comps_entry)?;
+        let comps_xml = decompress_if_needed(comps_entry, comps_raw)?;
+        let comps_data = parse_comps_xml(&comps_xml)?;
+        let (env_name, package_names) = comps_data.default_install_packages();
+        if let Some(name) = env_name {
+            progress(
+                "iso.comps.found",
+                &format!("prefix={} environment={}", if prefix.is_empty() { "(root)" } else { prefix }, name),
+            );
+            return Ok(Some((name, package_names, comps_data)));
+        }
+    }
+    Ok(None)
 }
 
 pub(super) fn parse_primary_packages(primary_xml: &[u8]) -> Vec<PackageCoordinate> {
@@ -219,5 +269,94 @@ fn append_text(el: &Element, out: &mut String) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_repomd_entries_root() {
+        let entries = vec![
+            "repodata/repomd.xml".to_string(),
+            "repodata/abc-primary.xml.gz".to_string(),
+            "Packages/foo.rpm".to_string(),
+        ];
+        let found = find_repomd_entries(&entries);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "");
+        assert_eq!(found[0].1, "repodata/repomd.xml");
+    }
+
+    #[test]
+    fn test_find_repomd_entries_subdirs() {
+        let entries = vec![
+            "BaseOS/repodata/repomd.xml".to_string(),
+            "BaseOS/repodata/abc-primary.xml.gz".to_string(),
+            "AppStream/repodata/repomd.xml".to_string(),
+            "AppStream/repodata/def-primary.xml.gz".to_string(),
+            "Packages/foo.rpm".to_string(),
+        ];
+        let found = find_repomd_entries(&entries);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "BaseOS/");
+        assert_eq!(found[1].0, "AppStream/");
+    }
+
+    #[test]
+    fn test_find_repomd_entries_leading_dot_slash() {
+        let entries = vec![
+            "./BaseOS/repodata/repomd.xml".to_string(),
+        ];
+        let found = find_repomd_entries(&entries);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "BaseOS/");
+    }
+
+    #[test]
+    fn test_resolve_href_with_prefix() {
+        assert_eq!(
+            resolve_href("BaseOS/", "repodata/abc-primary.xml.gz"),
+            "BaseOS/repodata/abc-primary.xml.gz"
+        );
+    }
+
+    #[test]
+    fn test_resolve_href_root() {
+        assert_eq!(
+            resolve_href("", "repodata/abc-primary.xml.gz"),
+            "repodata/abc-primary.xml.gz"
+        );
+    }
+
+    #[test]
+    fn test_parse_repodata_primary_href_rhel10() {
+        let repomd = br#"<?xml version="1.0" encoding="UTF-8"?>
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/579c0ab-primary.xml.gz"/>
+  </data>
+  <data type="group">
+    <location href="repodata/efbe7f7-comps-BaseOS.x86_64.xml"/>
+  </data>
+</repomd>"#;
+        let href = parse_repodata_primary_href(repomd).unwrap();
+        assert_eq!(href, "repodata/579c0ab-primary.xml.gz");
+    }
+
+    #[test]
+    fn test_parse_repodata_comps_href_rhel10() {
+        let repomd = br#"<?xml version="1.0" encoding="UTF-8"?>
+<repomd xmlns="http://linux.duke.edu/metadata/repo">
+  <data type="primary">
+    <location href="repodata/579c0ab-primary.xml.gz"/>
+  </data>
+  <data type="group">
+    <location href="repodata/efbe7f7-comps-BaseOS.x86_64.xml"/>
+  </data>
+</repomd>"#;
+        let href = parse_repodata_comps_href(repomd).unwrap();
+        assert_eq!(href, "repodata/efbe7f7-comps-BaseOS.x86_64.xml");
     }
 }
