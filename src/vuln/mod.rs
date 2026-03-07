@@ -15,7 +15,7 @@ mod version;
 
 // --- Public re-exports (used by container.rs, binary.rs, sbom.rs, archive.rs, iso.rs, main.rs) ---
 #[allow(unused_imports)]
-pub use circuit::CircuitBreaker;
+pub use circuit::{global_breaker, CircuitBreaker};
 pub use debian_legacy::debian_tracker_enrich_seed;
 pub use distro::seed_distro_feeds;
 pub use epss::{apply_epss_scores, epss_enrich_findings, fetch_epss_scores};

@@ -32,7 +32,7 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     }
 
     let mut findings = Vec::new();
-    let nvd_breaker_build = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let nvd_breaker_build = crate::vuln::global_breaker("nvd");
     for (name, ver) in candidates {
         if nvd_breaker_build.is_open() {
             break;
@@ -65,9 +65,9 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
     if let Some(c) = pg.as_mut() {
         crate::vuln::pg_init_schema(c);
     }
-    let nvd_breaker_src = crate::vuln::CircuitBreaker::new("nvd", 5);
-    let epss_breaker_src = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker_src = crate::vuln::CircuitBreaker::new("kev", 5);
+    let nvd_breaker_src = crate::vuln::global_breaker("nvd");
+    let epss_breaker_src = crate::vuln::global_breaker("epss");
+    let kev_breaker_src = crate::vuln::global_breaker("kev");
     crate::vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg, &nvd_breaker_src);
 
     let cache_dir = crate::vuln::resolve_enrich_cache_dir();
@@ -120,7 +120,7 @@ pub fn scan_source_tarball(
     }
 
     let mut findings = Vec::new();
-    let nvd_breaker_scan = crate::vuln::CircuitBreaker::new("nvd", 5);
+    let nvd_breaker_scan = crate::vuln::global_breaker("nvd");
     for (name, ver) in candidates {
         if nvd_breaker_scan.is_open() {
             break;
@@ -145,8 +145,8 @@ pub fn scan_source_tarball(
     } else {
         None
     };
-    let epss_breaker_scan = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker_scan = crate::vuln::CircuitBreaker::new("kev", 5);
+    let epss_breaker_scan = crate::vuln::global_breaker("epss");
+    let kev_breaker_scan = crate::vuln::global_breaker("kev");
 
     match format {
         OutputFormat::Text => {

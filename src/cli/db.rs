@@ -512,8 +512,8 @@ pub fn run_db(
             if epss || all {
                 progress("db.seed.epss.start", "");
                 let mut dummy_findings = Vec::new();
-                let epss_seed_breaker = vuln::CircuitBreaker::new("epss", 5);
-                let kev_seed_breaker = vuln::CircuitBreaker::new("kev", 5);
+                let epss_seed_breaker = vuln::global_breaker("epss");
+                let kev_seed_breaker = vuln::global_breaker("kev");
                 vuln::epss_enrich_findings(&mut dummy_findings, &mut None, Some(&cache_dir), &epss_seed_breaker);
                 vuln::kev_enrich_findings(&mut dummy_findings, &mut None, Some(&cache_dir), &kev_seed_breaker);
                 progress("db.seed.epss.done", "ok");
@@ -546,7 +546,7 @@ pub fn run_db(
                         in_kev: None,
                     }];
                     let mut pg = vuln::pg_connect();
-                    let nvd_seed_breaker = vuln::CircuitBreaker::new("nvd", 5);
+                    let nvd_seed_breaker = vuln::global_breaker("nvd");
                     vuln::enrich_findings_with_nvd(&mut findings, nvd_api_key.as_deref(), &mut pg, &nvd_seed_breaker);
                 }
                 progress("db.seed.nvd.done", "ok");
@@ -576,7 +576,7 @@ pub fn run_db(
                         source_name: None,
                     },
                 ];
-                let osv_seed_breaker = vuln::CircuitBreaker::new("osv", 5);
+                let osv_seed_breaker = vuln::global_breaker("osv");
                 let _results = vuln::osv_batch_query(&sample_pkgs, &mut None, &osv_seed_breaker);
                 progress("db.seed.osv.done", "ok");
                 seeded += sample_pkgs.len();

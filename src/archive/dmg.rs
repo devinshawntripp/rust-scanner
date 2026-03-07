@@ -321,10 +321,10 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
     }
 
     // Create per-scan circuit breakers (one per API source, not static/shared)
-    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
-    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
-    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+    let osv_breaker = crate::vuln::global_breaker("osv");
+    let nvd_breaker = crate::vuln::global_breaker("nvd");
+    let epss_breaker = crate::vuln::global_breaker("epss");
+    let kev_breaker = crate::vuln::global_breaker("kev");
 
     let osv_started = std::time::Instant::now();
     let osv_results = osv_batch_query(&packages, &mut pg, &osv_breaker);

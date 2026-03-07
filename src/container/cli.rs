@@ -154,10 +154,10 @@ pub fn scan_container(
         crate::vuln::pg_init_schema(c);
     }
 
-    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
-    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
-    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+    let osv_breaker = crate::vuln::global_breaker("osv");
+    let nvd_breaker = crate::vuln::global_breaker("nvd");
+    let epss_breaker = crate::vuln::global_breaker("epss");
+    let kev_breaker = crate::vuln::global_breaker("kev");
 
     let (mut findings_norm, heuristic_used) = {
         let mut ectx = super::enrich::EnrichCtx {

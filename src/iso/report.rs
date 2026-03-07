@@ -129,10 +129,10 @@ pub fn build_iso_report(
     }
 
     // Create per-scan circuit breakers (one per API source, not static/shared)
-    let osv_breaker = crate::vuln::CircuitBreaker::new("osv", 5);
-    let nvd_breaker = crate::vuln::CircuitBreaker::new("nvd", 5);
-    let epss_breaker = crate::vuln::CircuitBreaker::new("epss", 5);
-    let kev_breaker = crate::vuln::CircuitBreaker::new("kev", 5);
+    let osv_breaker = crate::vuln::global_breaker("osv");
+    let nvd_breaker = crate::vuln::global_breaker("nvd");
+    let epss_breaker = crate::vuln::global_breaker("epss");
+    let kev_breaker = crate::vuln::global_breaker("kev");
 
     if !packages.is_empty() {
         crate::progress::enter_stage("osv_query");
