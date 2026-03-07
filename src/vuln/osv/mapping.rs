@@ -180,27 +180,34 @@ pub fn map_osv_results_to_findings(
                 }
 
                 if !cve_ids.is_empty() {
-                    for cid in cve_ids {
-                        out.push(Finding {
-                            id: cid.trim().to_string(),
-                            source_ids: source_ids.clone(),
-                            package: package.clone(),
-                            confidence_tier: ConfidenceTier::ConfirmedInstalled,
-                            evidence_source: EvidenceSource::InstalledDb,
-                            accuracy_note: None,
-                            fixed,
-                            fixed_in: None,
-                            recommendation: None,
-                            severity: severity_str.clone(),
-                            cvss: cvss.clone(),
-                            description: description.clone(),
-                            evidence: evidence.clone(),
-                            references: references.clone(),
-                            confidence: Some("HIGH".into()),
-                            epss_score: None,
-                            epss_percentile: None,
-                            in_kev: None,
-                        });
+                    let mut cve_iter = cve_ids.into_iter();
+                    let first_cve = cve_iter.next().unwrap();
+                    // Build base finding once, clone for remaining aliases
+                    let base = Finding {
+                        id: first_cve.trim().to_string(),
+                        source_ids: source_ids.clone(),
+                        package: package.clone(),
+                        confidence_tier: ConfidenceTier::ConfirmedInstalled,
+                        evidence_source: EvidenceSource::InstalledDb,
+                        accuracy_note: None,
+                        fixed,
+                        fixed_in: None,
+                        recommendation: None,
+                        severity: severity_str.clone(),
+                        cvss: cvss.clone(),
+                        description: description.clone(),
+                        evidence: evidence.clone(),
+                        references: references.clone(),
+                        confidence: Some("HIGH".into()),
+                        epss_score: None,
+                        epss_percentile: None,
+                        in_kev: None,
+                    };
+                    out.push(base);
+                    for cid in cve_iter {
+                        let mut cloned = out.last().unwrap().clone();
+                        cloned.id = cid.trim().to_string();
+                        out.push(cloned);
                     }
                 } else {
                     // Advisory-only if no CVE mapping found yet
