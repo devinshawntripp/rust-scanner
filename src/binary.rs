@@ -22,6 +22,27 @@ use std::path::Path;
 #[cfg(feature = "yara")]
 use yara::Compiler;
 
+/// Component names that are compiler/toolchain/build noise, not real dependencies.
+/// These should be excluded from vulnerability scanning results.
+const FALSE_POSITIVE_COMPONENTS: &[&str] = &[
+    "gcc",
+    "g++",
+    "clang",
+    "llvm",
+    "rustc",
+    "glibc",
+    "version",
+    "linker_version",
+    "linker-version",
+    "built_with",
+    "compiled_by",
+];
+
+/// Returns true if `name` is a known false-positive component.
+fn is_false_positive_component(name: &str) -> bool {
+    FALSE_POSITIVE_COMPONENTS.iter().any(|fp| name == *fp)
+}
+
 /// Map extracted library short names to their NVD vendor:product pair.
 /// Covers the most common C/C++ libraries found in binaries.
 fn nvd_vendor_product(extracted_name: &str) -> Option<(&'static str, &'static str)> {
@@ -706,6 +727,9 @@ fn find_name_version_pairs(bytes: &[u8], scan_limit: usize) -> Vec<(String, Stri
     let mut out = Vec::new();
     for cap in re.captures_iter(&text) {
         let name = cap.get(1).unwrap().as_str().to_lowercase();
+        if is_false_positive_component(&name) {
+            continue;
+        }
         let ver = cap.get(2).unwrap().as_str().to_string();
         out.push((name, ver));
     }
@@ -883,6 +907,59 @@ mod tests {
         // Budget large enough
         let ver = find_version_near_name(&data, data.len(), "openssl");
         assert_eq!(ver, Some("1.1.1k".to_string()));
+    }
+
+    #[test]
+    fn test_compiler_strings_excluded() {
+        // GCC version string should not produce a component
+        let bytes = b"GCC: (GNU) 12.2.0 (Ubuntu 12.2.0-3ubuntu1)";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        let gcc_pair = pairs.iter().find(|(n, _)| n == "gcc");
+        assert!(gcc_pair.is_none(), "gcc compiler string should be excluded, got {:?}", gcc_pair);
+    }
+
+    #[test]
+    fn test_compiler_toolchain_strings_excluded() {
+        // rustc version string — matches the regex as ("rustc", "1.74.0")
+        let bytes = b"rustc 1.74.0 (79e9716c9 2023-11-13)";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().find(|(n, _)| n == "rustc").is_none(),
+            "rustc should be excluded, got {:?}", pairs);
+
+        // g++ with dash separator
+        let bytes = b"g++-12.2.0 compiled";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().find(|(n, _)| n == "g++").is_none(),
+            "g++ should be excluded, got {:?}", pairs);
+
+        // LLVM with dash separator
+        let bytes = b"LLVM-15.0.7 linked";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().find(|(n, _)| n == "llvm").is_none(),
+            "llvm should be excluded, got {:?}", pairs);
+
+        // "version" as a name (from "clang version 15.0.7")
+        let bytes = b"clang version 15.0.7";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().find(|(n, _)| n == "version").is_none(),
+            "'version' as component name should be excluded, got {:?}", pairs);
+
+        // linker version
+        let bytes = b"linker_version 2.38";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().find(|(n, _)| n == "linker_version").is_none(),
+            "linker_version should be excluded, got {:?}", pairs);
+    }
+
+    #[test]
+    fn test_real_components_not_excluded() {
+        // Legitimate library strings should still be detected
+        let bytes = b"openssl 1.1.1w linked against zlib 1.2.11";
+        let pairs = find_name_version_pairs(bytes, bytes.len());
+        assert!(pairs.iter().any(|(n, v)| n == "openssl" && v == "1.1.1w"),
+            "openssl should be detected, got {:?}", pairs);
+        assert!(pairs.iter().any(|(n, v)| n == "zlib" && v == "1.2.11"),
+            "zlib should be detected, got {:?}", pairs);
     }
 
     #[test]
