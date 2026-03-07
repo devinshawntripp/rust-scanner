@@ -562,6 +562,11 @@ pub(in crate::vuln) fn distro_feed_enrich_findings(findings: &mut Vec<Finding>, 
         }
     }
 
+    // Short-circuit: nothing to do for RPM-only images (CentOS, RHEL, Rocky, etc.)
+    if needed_deb.is_empty() && needed_apk_pkgs.is_empty() {
+        return;
+    }
+
     let ubuntu_enabled = env_bool("SCANNER_UBUNTU_TRACKER_ENRICH", true);
     let debian_enabled = env_bool("SCANNER_DEBIAN_TRACKER_ENRICH", true);
     let alpine_enabled = env_bool("SCANNER_ALPINE_SECDB_ENRICH", true);
