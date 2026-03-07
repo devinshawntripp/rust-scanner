@@ -349,11 +349,28 @@ pub fn build_binary_report(
             }
             Ok(Object::PE(_)) => {
                 if let Ok(pe) = PE::parse(&bytes) {
-                    for imp in pe.imports.iter() {
-                        let dll = imp.dll.to_string().to_lowercase();
-                        if let Some(name) = infer_name_from_lib_without_version(&dll) {
+                    // Collect recognized DLL imports first so we know the count
+                    let dll_names: Vec<(String, String)> = pe
+                        .imports
+                        .iter()
+                        .filter_map(|imp| {
+                            let dll = imp.dll.to_string().to_lowercase();
+                            infer_name_from_lib_without_version(&dll).map(|name| (dll, name))
+                        })
+                        .collect();
+                    let single_import = dll_names.len() == 1;
+
+                    for (dll, name) in &dll_names {
+                        // Try name-aware version search first (looks near the DLL name in bytes)
+                        if let Some(ver) = find_version_near_name(&bytes, text_budget, dll)
+                            .or_else(|| find_version_near_name(&bytes, text_budget, name))
+                        {
+                            seen_pairs.insert((name.clone(), ver));
+                        } else if single_import {
+                            // Only use global version search when there's a single import
+                            // to avoid assigning one version to all DLLs
                             if let Some(ver) = find_version_in_bytes(&bytes, text_budget) {
-                                seen_pairs.insert((name, ver));
+                                seen_pairs.insert((name.clone(), ver));
                             }
                         }
                     }
@@ -632,6 +649,48 @@ fn find_version_in_bytes(bytes: &[u8], scan_limit: usize) -> Option<String> {
         })
 }
 
+/// Extract a version string from a small byte region.
+fn extract_version_from_region(region: &[u8]) -> Option<String> {
+    if region.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(region);
+    Regex::new(r"\bv?(\d+\.\d+(?:\.\d+)?[a-z0-9-]*)\b")
+        .ok()
+        .and_then(|re| {
+            re.captures(&text)
+                .map(|cap| cap.get(1).unwrap().as_str().to_string())
+        })
+}
+
+/// Search for a version string near occurrences of `name` in the binary content.
+/// Looks within a +-512 byte window around each occurrence of the name.
+fn find_version_near_name(bytes: &[u8], budget: usize, name: &str) -> Option<String> {
+    if bytes.is_empty() || name.is_empty() {
+        return None;
+    }
+    let end = bytes.len().min(max(1, budget));
+    let scan = &bytes[..end];
+    let name_lower = name.as_bytes();
+    let window: usize = 512;
+
+    // Slide through the scan region looking for the name (case-insensitive)
+    if name_lower.len() > scan.len() {
+        return None;
+    }
+    for i in 0..=(scan.len() - name_lower.len()) {
+        let candidate = &scan[i..i + name_lower.len()];
+        if candidate.eq_ignore_ascii_case(name_lower) {
+            let region_start = i.saturating_sub(window);
+            let region_end = (i + name_lower.len() + window).min(end);
+            if let Some(ver) = extract_version_from_region(&scan[region_start..region_end]) {
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
 fn find_name_version_pairs(bytes: &[u8], scan_limit: usize) -> Vec<(String, String)> {
     if bytes.is_empty() {
         return Vec::new();
@@ -745,5 +804,106 @@ mod tests {
         assert_eq!(nvd_vendor_product("curl"), Some(("haxx", "curl")));
         assert_eq!(nvd_vendor_product("pq"), Some(("postgresql", "postgresql")));
         assert_eq!(nvd_vendor_product("unknownlib"), None);
+    }
+
+    #[test]
+    fn extract_version_from_region_finds_semver() {
+        let region = b"some junk openssl 1.1.1k more junk";
+        assert_eq!(
+            extract_version_from_region(region),
+            Some("1.1.1k".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_version_from_region_finds_two_part() {
+        let region = b"zlib 1.2";
+        assert_eq!(
+            extract_version_from_region(region),
+            Some("1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_version_from_region_empty() {
+        assert_eq!(extract_version_from_region(b""), None);
+        assert_eq!(extract_version_from_region(b"no version here"), None);
+    }
+
+    #[test]
+    fn find_version_near_name_finds_version_close_to_name() {
+        // Simulate binary content where "zlib" appears near "1.2.11"
+        // and "openssl" appears near "1.1.1k", separated by >1024 bytes of padding
+        let mut data = Vec::new();
+        data.extend_from_slice(b"openssl version 1.1.1k built on ...");
+        data.extend_from_slice(&vec![0u8; 2048]); // large gap
+        data.extend_from_slice(b"zlib compression library v1.2.11");
+
+        let budget = data.len();
+
+        // Should find 1.1.1k near "openssl"
+        let ver = find_version_near_name(&data, budget, "openssl");
+        assert_eq!(ver, Some("1.1.1k".to_string()));
+
+        // Should find 1.2.11 near "zlib"
+        let ver = find_version_near_name(&data, budget, "zlib");
+        assert_eq!(ver, Some("1.2.11".to_string()));
+    }
+
+    #[test]
+    fn find_version_near_name_case_insensitive() {
+        let data = b"OPENSSL version 3.0.2 built";
+        let ver = find_version_near_name(data, data.len(), "openssl");
+        assert_eq!(ver, Some("3.0.2".to_string()));
+    }
+
+    #[test]
+    fn find_version_near_name_returns_none_for_missing_name() {
+        let data = b"zlib compression library v1.2.11";
+        let ver = find_version_near_name(data, data.len(), "openssl");
+        assert_eq!(ver, None);
+    }
+
+    #[test]
+    fn find_version_near_name_empty_inputs() {
+        assert_eq!(find_version_near_name(b"", 100, "openssl"), None);
+        assert_eq!(find_version_near_name(b"openssl 1.0", 10, ""), None);
+    }
+
+    #[test]
+    fn find_version_near_name_respects_budget() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&vec![0u8; 100]);
+        data.extend_from_slice(b"openssl version 1.1.1k");
+
+        // Budget smaller than where "openssl" appears -- should not find it
+        let ver = find_version_near_name(&data, 50, "openssl");
+        assert_eq!(ver, None);
+
+        // Budget large enough
+        let ver = find_version_near_name(&data, data.len(), "openssl");
+        assert_eq!(ver, Some("1.1.1k".to_string()));
+    }
+
+    #[test]
+    fn pe_imports_get_distinct_versions() {
+        // Verify that the name-aware search assigns different versions to
+        // different libraries when those versions appear near the respective names
+        let mut data = Vec::new();
+        data.extend_from_slice(b"openssl.dll version 3.0.8 linked");
+        data.extend_from_slice(&vec![0u8; 2048]);
+        data.extend_from_slice(b"zlib1.dll compression 1.2.13 ok");
+
+        let budget = data.len();
+
+        let ver_ssl = find_version_near_name(&data, budget, "openssl.dll")
+            .or_else(|| find_version_near_name(&data, budget, "openssl"));
+        let ver_z = find_version_near_name(&data, budget, "zlib1.dll")
+            .or_else(|| find_version_near_name(&data, budget, "zlib1"));
+
+        assert_eq!(ver_ssl, Some("3.0.8".to_string()));
+        assert_eq!(ver_z, Some("1.2.13".to_string()));
+        // They must be different -- the old bug would give them the same version
+        assert_ne!(ver_ssl, ver_z);
     }
 }
