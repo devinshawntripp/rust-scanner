@@ -3,6 +3,7 @@ mod cli;
 mod detect;
 mod dpkg;
 mod ecosystem;
+mod enrich;
 mod extract;
 mod image;
 mod rpm;
