@@ -96,13 +96,17 @@ pub(in crate::vuln) fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, p
         std::collections::HashSet::new();
     let mut id_to_json: HashMap<String, Value> = HashMap::new();
     let mut to_fetch: Vec<String> = Vec::new();
+    let mut cached_pg = 0usize;
+    let mut cached_file = 0usize;
 
     let redhat_cve_started = std::time::Instant::now();
     for (idx, cve_id) in ids.iter().enumerate() {
-        progress(
-            "redhat.cve.lookup",
-            &format!("{}/{} {}", idx + 1, total, cve_id),
-        );
+        if (idx + 1) % 50 == 0 || idx + 1 == total {
+            progress(
+                "redhat.cve.lookup",
+                &format!("{}/{}", idx + 1, total),
+            );
+        }
 
         let cache_tag = cache_key(&["redhat_cve", cve_id]);
         let mut json: Option<Value> = None;
@@ -112,7 +116,7 @@ pub(in crate::vuln) fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, p
                 let ttl_dyn_days = compute_dynamic_ttl_days(last_mod, ttl_days);
                 if Utc::now() - last_checked < ChronoDuration::days(ttl_dyn_days) {
                     json = Some(payload);
-                    progress("redhat.cve.cache.pg.hit", cve_id);
+                    cached_pg += 1;
                 }
             }
         }
@@ -127,7 +131,7 @@ pub(in crate::vuln) fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, p
             ) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     json = Some(v);
-                    progress("redhat.cve.cache.hit", cve_id);
+                    cached_file += 1;
                 }
             }
         }
@@ -138,6 +142,10 @@ pub(in crate::vuln) fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, p
             to_fetch.push(cve_id.clone());
         }
     }
+    progress(
+        "redhat.cve.cache_lookup.done",
+        &format!("{} pg_cached, {} file_cached, {} to fetch", cached_pg, cached_file, to_fetch.len()),
+    );
 
     if !to_fetch.is_empty() {
         let fetch_pool = rayon::ThreadPoolBuilder::new()
@@ -245,13 +253,14 @@ pub(in crate::vuln) fn redhat_enrich_cve_findings(findings: &mut Vec<Finding>, p
                 .collect()
         };
 
+        let fetched_count = fetched.len();
         for (cve_id, cve_json, lm) in fetched {
             if let Some(client_pg) = pg.as_mut() {
                 pg_put_redhat_cve(client_pg, &cve_id, &cve_json, lm);
             }
-            progress("redhat.cve.fetch.ok", &cve_id);
             id_to_json.insert(cve_id, cve_json);
         }
+        progress("redhat.cve.fetch.done", &format!("fetched={}", fetched_count));
     }
 
     for cve_id in ids {

@@ -84,11 +84,16 @@ pub(in crate::vuln) fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &
     }
 
     let redhat_started = std::time::Instant::now();
+    let mut cached_pg = 0usize;
+    let mut cached_file = 0usize;
+    let mut fetched_count = 0usize;
     for (idx, id) in ids.into_iter().enumerate() {
-        progress(
-            "redhat.fetch.start",
-            &format!("{}/{} {}", idx + 1, total, id),
-        );
+        if (idx + 1) % 50 == 0 || idx + 1 == total {
+            progress(
+                "redhat.fetch.progress",
+                &format!("{}/{}", idx + 1, total),
+            );
+        }
 
         let cache_tag = cache_key(&["redhat_csaf", &id]);
         let mut json: Option<Value> = None;
@@ -98,7 +103,7 @@ pub(in crate::vuln) fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &
                 let ttl_dyn_days = compute_dynamic_ttl_days(last_mod, ttl_days);
                 if Utc::now() - last_checked < ChronoDuration::days(ttl_dyn_days) {
                     json = Some(payload);
-                    progress("redhat.cache.pg.hit", &id);
+                    cached_pg += 1;
                 }
             }
         }
@@ -113,7 +118,7 @@ pub(in crate::vuln) fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &
             ) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     json = Some(v);
-                    progress("redhat.cache.hit", &id);
+                    cached_file += 1;
                 }
             }
         }
@@ -159,7 +164,7 @@ pub(in crate::vuln) fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &
             let last_mod = parse_redhat_last_modified(&doc_json);
             pg_put_redhat(client_pg, &id, &doc_json, last_mod);
         }
-        progress("redhat.fetch.ok", &id);
+        fetched_count += 1;
 
         let document = &doc_json["document"];
         let description = redhat_note_text(document).or_else(|| {
@@ -232,5 +237,9 @@ pub(in crate::vuln) fn redhat_enrich_findings(findings: &mut Vec<Finding>, pg: &
             }
         }
     }
+    progress(
+        "redhat.fetch.done",
+        &format!("{} pg_cached, {} file_cached, {} fetched", cached_pg, cached_file, fetched_count),
+    );
     progress_timing("redhat.fetch", redhat_started);
 }
