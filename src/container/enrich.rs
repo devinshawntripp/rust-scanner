@@ -38,9 +38,38 @@ pub(super) struct EnrichCtx<'a> {
 /// Run the full enrichment pipeline: OSV → RHEL supplement → OSV enrich → RedHat unfixed →
 /// NVD → Heuristic fallback → OVAL → Dedup → RHEL filter → EPSS/KEV.
 ///
+/// OVAL XML download runs in a background thread while sequential enrichment
+/// (steps 1-6) proceeds, overlapping 2-10s of I/O with 5-30s of processing.
+///
 /// Returns `(findings, heuristic_used)`.
 pub(super) fn run_enrichment_pipeline(ctx: &mut EnrichCtx) -> (Vec<Finding>, bool) {
     let mut heuristic_used = false;
+
+    // Pre-fetch OVAL XML in background: resolve explicit path / env override first,
+    // then spawn download thread if we need to fetch from Red Hat.
+    let oval_explicit = ctx
+        .oval_redhat
+        .take()
+        .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+        .filter(|v| !v.trim().is_empty());
+    let oval_fetch_handle = if oval_explicit.is_none() {
+        let has_rpm = ctx
+            .packages
+            .iter()
+            .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+        if has_rpm {
+            let pkgs_for_oval = ctx.packages.to_vec();
+            let cache_for_oval = crate::vuln::resolve_enrich_cache_dir();
+            progress("container.oval.prefetch.start", "downloading in background");
+            Some(std::thread::spawn(move || {
+                crate::redhat::fetch_redhat_oval(&pkgs_for_oval, cache_for_oval.as_deref())
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // 1. OSV batch query
     crate::progress::enter_stage("osv_query");
@@ -246,25 +275,24 @@ pub(super) fn run_enrichment_pipeline(ctx: &mut EnrichCtx) -> (Vec<Finding>, boo
         );
     }
 
-    // 7. Red Hat OVAL
+    // 7. Red Hat OVAL — use pre-fetched result from background thread
     crate::progress::enter_stage("redhat");
-    let oval_redhat = ctx
-        .oval_redhat
-        .take()
-        .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            let has_rpm = ctx
-                .packages
-                .iter()
-                .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
-            if has_rpm {
-                let cache = crate::vuln::resolve_enrich_cache_dir();
-                crate::redhat::fetch_redhat_oval(ctx.packages, cache.as_deref())
-            } else {
+    let oval_redhat = if let Some(explicit) = oval_explicit {
+        Some(explicit)
+    } else if let Some(handle) = oval_fetch_handle {
+        match handle.join() {
+            Ok(result) => {
+                progress("container.oval.prefetch.done", "joined background fetch");
+                result
+            }
+            Err(_) => {
+                progress("container.oval.prefetch.error", "background thread panicked");
                 None
             }
-        });
+        }
+    } else {
+        None
+    };
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
