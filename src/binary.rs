@@ -362,6 +362,18 @@ pub fn build_binary_report(
                 if let Some(go_ver) = find_go_version(&bytes, text_budget) {
                     seen_pairs.insert(("go".into(), go_ver));
                 }
+                // Extract versions from ELF .comment section
+                for sh in &elf.section_headers {
+                    if elf.shdr_strtab.get_at(sh.sh_name).map_or(false, |n| n == ".comment") {
+                        let offset = sh.sh_offset as usize;
+                        let size = sh.sh_size as usize;
+                        if offset + size <= bytes.len() {
+                            for (name, ver) in parse_elf_comment_section(&bytes[offset..offset + size]) {
+                                seen_pairs.insert((name, ver));
+                            }
+                        }
+                    }
+                }
             }
             Ok(Object::Mach(_)) => {
                 for (name, ver) in find_name_version_pairs(&bytes, text_budget) {
@@ -654,6 +666,32 @@ fn infer_name_from_lib_without_version(lib: &str) -> Option<String> {
     } else {
         Some(name)
     }
+}
+
+/// Parse ELF .comment section bytes for component name+version pairs.
+/// Segments are null-separated. Compiler/toolchain strings are filtered out.
+fn parse_elf_comment_section(data: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(data);
+    let re = match Regex::new(r"(?i)([a-z][a-z0-9_-]+)\s+(\d+\.\d+(?:\.\d+[a-z]?)*)") {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut pairs = Vec::new();
+    for segment in text.split('\0') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            continue;
+        }
+        if let Some(caps) = re.captures(segment) {
+            let name = caps[1].to_lowercase();
+            if is_false_positive_component(&name) {
+                continue;
+            }
+            let ver = caps[2].to_string();
+            pairs.push((name, ver));
+        }
+    }
+    pairs
 }
 
 fn find_version_in_bytes(bytes: &[u8], scan_limit: usize) -> Option<String> {
@@ -960,6 +998,31 @@ mod tests {
             "openssl should be detected, got {:?}", pairs);
         assert!(pairs.iter().any(|(n, v)| n == "zlib" && v == "1.2.11"),
             "zlib should be detected, got {:?}", pairs);
+    }
+
+    #[test]
+    fn test_parse_elf_comment_openssl() {
+        let comment = b"OpenSSL 1.1.1w  10 Sep 2024\0GCC: (GNU) 12.2.0\0";
+        let pairs = parse_elf_comment_section(comment);
+        assert!(pairs.iter().any(|(n, v)| n == "openssl" && v == "1.1.1w"),
+            "should extract openssl from .comment, got {:?}", pairs);
+        // GCC should be excluded as a false positive
+        assert!(pairs.iter().find(|(n, _)| n == "gcc").is_none(),
+            "gcc should be excluded from .comment, got {:?}", pairs);
+    }
+
+    #[test]
+    fn test_parse_elf_comment_zlib() {
+        let comment = b"zlib 1.2.11\0";
+        let pairs = parse_elf_comment_section(comment);
+        assert!(pairs.iter().any(|(n, v)| n == "zlib" && v == "1.2.11"),
+            "should extract zlib from .comment, got {:?}", pairs);
+    }
+
+    #[test]
+    fn test_parse_elf_comment_empty() {
+        assert!(parse_elf_comment_section(b"").is_empty());
+        assert!(parse_elf_comment_section(b"\0\0\0").is_empty());
     }
 
     #[test]
