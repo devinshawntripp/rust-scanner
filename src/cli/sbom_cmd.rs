@@ -59,12 +59,12 @@ pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) {
                 summary
             ));
 
-            let text = if matches!(format, OutputFormat::Json) {
-                serde_json::to_string_pretty(&report_value).unwrap()
-            } else {
-                crate::cli::text_report::render_text_report(&report_value)
+            let text = match format {
+                OutputFormat::Json => serde_json::to_string_pretty(&report_value).unwrap(),
+                OutputFormat::Ndjson => crate::report::value_to_ndjson(&report_value),
+                OutputFormat::Text => crate::cli::text_report::render_text_report(&report_value),
             };
-            println!("{}", text);
+            print!("{}", text);
             utils::write_output_if_needed(&out, &text);
         }
         SbomCommands::Diff {

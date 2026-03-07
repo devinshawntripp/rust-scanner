@@ -66,6 +66,7 @@ struct Cli {
 pub enum OutputFormat {
     Json,
     Text,
+    Ndjson,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -593,12 +594,12 @@ fn main() {
                 progress("scan.done", &format!("file={} findings={}", file, summary));
                 utils::progress_panel_finish(&format!("scan complete findings={}", summary));
 
-                let text = if matches!(format, OutputFormat::Json) {
-                    serde_json::to_string_pretty(&v).unwrap()
-                } else {
-                    crate::cli::text_report::render_text_report(&v)
+                let text = match format {
+                    OutputFormat::Json => serde_json::to_string_pretty(&v).unwrap(),
+                    OutputFormat::Ndjson => crate::report::value_to_ndjson(&v),
+                    OutputFormat::Text => crate::cli::text_report::render_text_report(&v),
                 };
-                println!("{}", text);
+                print!("{}", text);
                 utils::write_output_if_needed(&out, &text);
             } else {
                 progress("scan.error", &format!("file={}", file));
@@ -620,6 +621,19 @@ fn main() {
                     let json = serde_json::to_string_pretty(&report).unwrap();
                     println!("{}", json);
                     utils::write_output_if_needed(&out, &json);
+                }
+            }
+            OutputFormat::Ndjson => {
+                if let Some(report) =
+                    binary::build_binary_report(&path, mode, None, nvd_api_key.clone())
+                {
+                    let mut buf = Vec::new();
+                    report::NdjsonWriter::new(&mut buf)
+                        .write_report(&report)
+                        .unwrap();
+                    let text = String::from_utf8(buf).unwrap();
+                    print!("{}", text);
+                    utils::write_output_if_needed(&out, &text);
                 }
             }
         },

@@ -184,6 +184,41 @@ pub fn scan_source_tarball(
             println!("{}", json);
             write_output_if_needed(&out, &json);
         }
+        OutputFormat::Ndjson => {
+            let cache_dir = crate::vuln::resolve_enrich_cache_dir();
+            crate::vuln::epss_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref(), &epss_breaker_scan);
+            crate::vuln::kev_enrich_findings(&mut findings, &mut pg2, cache_dir.as_deref(), &kev_breaker_scan);
+
+            let scanner = ScannerInfo {
+                name: "scanrook",
+                version: env!("CARGO_PKG_VERSION"),
+            };
+            let target = TargetInfo {
+                target_type: "source".into(),
+                source: tar_path.to_string(),
+                id: None,
+            };
+            let mut report = Report {
+                scanner,
+                target,
+                scan_status: ScanStatus::Complete,
+                inventory_status: InventoryStatus::Complete,
+                inventory_reason: None,
+                sbom: None,
+                findings,
+                files: collect_file_tree_if_enabled(tmp.path()),
+                iso_profile: None,
+                summary: Default::default(),
+            };
+            report.summary = compute_summary(&report.findings);
+            let mut buf = Vec::new();
+            crate::report::NdjsonWriter::new(&mut buf)
+                .write_report(&report)
+                .unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            print!("{}", text);
+            write_output_if_needed(&out, &text);
+        }
     }
 }
 
