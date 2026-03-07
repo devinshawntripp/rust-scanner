@@ -468,7 +468,7 @@ pub fn build_container_report(
     if let Some(oval_path) = oval_redhat.as_deref() {
         progress("container.enrich.redhat.start", oval_path);
         let redhat_started = std::time::Instant::now();
-        match apply_redhat_oval_enrichment(&mut findings_norm, &packages, oval_path) {
+        match apply_redhat_oval_enrichment(&mut findings_norm, &packages, oval_path, pg.as_mut()) {
             Ok((generated, stats)) => {
                 progress_timing("container.enrich.redhat", redhat_started);
                 progress(

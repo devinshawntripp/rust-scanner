@@ -1,6 +1,7 @@
 use crate::container::PackageCoordinate;
 use crate::report::Finding;
 use anyhow::Context;
+use postgres::Client as PgClient;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -153,6 +154,77 @@ fn build_cached_oval_data(
     }
 }
 
+/// Query OVAL data from PostgreSQL (populated by vulndb-pg-import CronJob).
+/// Returns None if no data exists for the given RHEL major version.
+fn query_oval_from_pg(pg: &mut PgClient, rhel_version: u32) -> Option<CachedOvalData> {
+    crate::utils::progress("oval.pg.query.start", &format!("rhel={}", rhel_version));
+    let started = std::time::Instant::now();
+
+    let def_rows = pg
+        .query(
+            "SELECT definition_id, cves, test_refs FROM oval_definitions_cache WHERE rhel_version = $1",
+            &[&(rhel_version as i32)],
+        )
+        .ok()?;
+
+    if def_rows.is_empty() {
+        crate::utils::progress("oval.pg.query.empty", &format!("rhel={}", rhel_version));
+        return None;
+    }
+
+    let definitions: Vec<CachedDefinition> = def_rows
+        .iter()
+        .map(|row| {
+            let cves: Vec<String> = row.get("cves");
+            let test_refs: Vec<String> = row.get("test_refs");
+            CachedDefinition { cves, test_refs }
+        })
+        .collect();
+
+    let tc_rows = pg
+        .query(
+            "SELECT test_ref, package, op, evr FROM oval_test_constraints_cache WHERE rhel_version = $1",
+            &[&(rhel_version as i32)],
+        )
+        .ok()?;
+
+    let mut test_constraints: HashMap<String, Vec<RpmConstraint>> = HashMap::new();
+    for row in &tc_rows {
+        let test_ref: String = row.get("test_ref");
+        let package: String = row.get("package");
+        let op_str: String = row.get("op");
+        let evr: String = row.get("evr");
+        let op = match op_str.as_str() {
+            "LT" => CompareOp::LessThan,
+            "LE" => CompareOp::LessThanOrEqual,
+            "EQ" => CompareOp::Equal,
+            "GE" => CompareOp::GreaterThanOrEqual,
+            "GT" => CompareOp::GreaterThan,
+            _ => CompareOp::LessThan,
+        };
+        test_constraints
+            .entry(test_ref)
+            .or_default()
+            .push(RpmConstraint { package, op, evr });
+    }
+
+    crate::utils::progress_timing("oval.pg.query", started);
+    crate::utils::progress(
+        "oval.pg.query.done",
+        &format!(
+            "rhel={} defs={} constraints={}",
+            rhel_version,
+            definitions.len(),
+            tc_rows.len()
+        ),
+    );
+
+    Some(CachedOvalData {
+        test_constraints,
+        definitions,
+    })
+}
+
 /// Load OVAL data for enrichment using the parsed-data cache, falling back to XML parse.
 fn load_oval_data(oval_path: &str) -> anyhow::Result<CachedOvalData> {
     // Try cache first
@@ -230,12 +302,31 @@ pub fn filter_findings_with_redhat_oval(
 /// Generate new findings AND filter existing ones from RHEL OVAL data in a single parse.
 /// Returns `(generated_count, filter_stats)`. Deduplicates by `(cve_id, package_name)`.
 /// Skips `evaluate_oval_for_packages` (RHEL OVAL class="patch" always evaluates Unknown).
+///
+/// If `pg` is provided, tries PostgreSQL lookup first (populated by vulndb-pg-import CronJob).
+/// Falls back to `oval_path` XML parsing if PG has no data or is unavailable.
 pub fn apply_redhat_oval_enrichment(
     findings: &mut Vec<Finding>,
     packages: &[PackageCoordinate],
     oval_path: &str,
+    pg: Option<&mut PgClient>,
 ) -> anyhow::Result<(usize, OvalFilterStats)> {
-    let cached = load_oval_data(oval_path)?;
+    // Try PG first if available
+    let cached = if let Some(client) = pg {
+        if let Some(rhel_ver) = super::evr::detect_rhel_major_version(packages) {
+            if let Some(pg_cached) = query_oval_from_pg(client, rhel_ver) {
+                crate::utils::progress("oval.source", "pg");
+                pg_cached
+            } else {
+                crate::utils::progress("oval.source", "xml-fallback");
+                load_oval_data(oval_path)?
+            }
+        } else {
+            load_oval_data(oval_path)?
+        }
+    } else {
+        load_oval_data(oval_path)?
+    };
     let package_map = build_rpm_package_map(packages);
 
     // Step 1: generate new findings from OVAL that OSV may have missed
@@ -854,6 +945,52 @@ mod tests {
         let eval_patched = evaluate_oval_for_packages(&root, &tests, &package_map);
         assert!(eval_patched.covered_cves.contains("CVE-2024-0001"), "CVE should still be covered");
         assert!(!eval_patched.vulnerable_cves.contains("CVE-2024-0001"), "patched version should NOT be vulnerable");
+    }
+
+    #[test]
+    fn test_cached_oval_from_pg_maps_correctly() {
+        // Verify that CachedOvalData built from PG-style data works with generate_from_cached_oval
+        let cached = CachedOvalData {
+            test_constraints: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "oval:test:1".to_string(),
+                    vec![RpmConstraint {
+                        package: "openssl".to_string(),
+                        op: CompareOp::LessThan,
+                        evr: "1:1.0.2k-26.el7_9".to_string(),
+                    }],
+                );
+                m
+            },
+            definitions: vec![CachedDefinition {
+                cves: vec!["CVE-2023-0286".to_string()],
+                test_refs: vec!["oval:test:1".to_string()],
+            }],
+        };
+        assert_eq!(cached.definitions.len(), 1);
+        assert_eq!(cached.test_constraints.len(), 1);
+        assert_eq!(cached.definitions[0].cves[0], "CVE-2023-0286");
+
+        // Verify it can generate findings for a vulnerable package
+        let mut package_map = HashMap::new();
+        package_map.insert(
+            "openssl".to_string(),
+            vec!["1:1.0.2k-25.el7_9".to_string()],
+        );
+        let pkgs = vec![PackageCoordinate {
+            ecosystem: "Rocky Linux:9".to_string(),
+            name: "openssl".to_string(),
+            version: "1:1.0.2k-25.el7_9".to_string(),
+            source_name: None,
+        }];
+        let findings = generate_from_cached_oval(&cached, &package_map, &pkgs);
+        assert_eq!(findings.len(), 1, "should generate 1 finding for vulnerable openssl");
+        assert_eq!(findings[0].id, "CVE-2023-0286");
+        assert_eq!(
+            findings[0].package.as_ref().unwrap().name,
+            "openssl"
+        );
     }
 
     #[test]
