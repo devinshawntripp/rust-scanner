@@ -104,6 +104,12 @@ pub enum DbSource {
     Redhat,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum SbomExportFormat {
+    Cyclonedx,
+    Spdx,
+    Syft,
+}
 #[derive(Subcommand)]
 pub(crate) enum SbomCommands {
     /// Import and scan an SBOM (CycloneDX JSON, SPDX JSON, or Syft JSON)
@@ -150,6 +156,18 @@ pub(crate) enum SbomCommands {
         /// Path to current scan report JSON (optional, used for severity checks)
         #[arg(long)]
         report: Option<String>,
+    },
+    /// Export a scan report as a standard SBOM (CycloneDX, SPDX, or Syft JSON)
+    Export {
+        /// Path to the scanner report JSON
+        #[arg(long)]
+        report: String,
+        /// Output SBOM format
+        #[arg(long, value_enum)]
+        sbom_format: SbomExportFormat,
+        /// Output file path
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -729,7 +747,10 @@ fn main() {
             }
         }
         Commands::Sbom { command } => {
-            run_sbom(command, nvd_api_key.clone());
+            if let Err(e) = run_sbom(command, nvd_api_key.clone()) {
+                eprintln!("sbom command failed: {}", e);
+                std::process::exit(1);
+            }
         }
         Commands::Upgrade { check } => {
             if let Err(e) = run_upgrade(check) {

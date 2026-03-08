@@ -684,6 +684,203 @@ fn check_policy_inner(
     }
 }
 
+
+// ─── SBOM Export ──────────────────────────────────────────────────
+
+fn ecosystem_to_purl_type(eco: &str) -> String {
+    match eco.to_lowercase().as_str() {
+        "npm" | "node" => "npm".to_string(),
+        "pypi" | "pip" | "python" => "pypi".to_string(),
+        "cargo" | "rust" | "crates.io" => "cargo".to_string(),
+        "go" | "golang" => "golang".to_string(),
+        "gem" | "ruby" | "rubygems" => "gem".to_string(),
+        "nuget" | "dotnet" => "nuget".to_string(),
+        "maven" | "java" => "maven".to_string(),
+        "deb" | "debian" => "deb".to_string(),
+        "rpm" | "redhat" | "centos" | "fedora" => "rpm".to_string(),
+        "apk" | "alpine" => "apk".to_string(),
+        "composer" | "php" => "composer".to_string(),
+        "hex" | "elixir" | "erlang" => "hex".to_string(),
+        "swift" | "cocoapods" => "swift".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn build_purl(eco: &str, name: &str, version: &str) -> String {
+    let ptype = ecosystem_to_purl_type(eco);
+    format!("pkg:{}/{}@{}", ptype, name, version)
+}
+
+fn export_cyclonedx(
+    packages: &[(String, String, String)],
+    target_name: &str,
+    scanner_version: &str,
+    timestamp: &str,
+) -> serde_json::Value {
+    let components: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|(eco, name, version)| {
+            let purl = build_purl(eco, name, version);
+            serde_json::json!({
+                "type": "library",
+                "name": name,
+                "version": version,
+                "purl": purl,
+                "bom-ref": purl,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "timestamp": timestamp,
+            "tools": [{
+                "vendor": "ScanRook",
+                "name": "scanrook",
+                "version": scanner_version,
+            }],
+            "component": {
+                "type": "application",
+                "name": target_name,
+            },
+        },
+        "components": components,
+        "dependencies": [],
+    })
+}
+
+fn export_spdx(
+    packages: &[(String, String, String)],
+    target_name: &str,
+    scanner_version: &str,
+    timestamp: &str,
+) -> serde_json::Value {
+    let spdx_packages: Vec<serde_json::Value> = packages
+        .iter()
+        .enumerate()
+        .map(|(i, (eco, name, version))| {
+            let purl = build_purl(eco, name, version);
+            serde_json::json!({
+                "SPDXID": format!("SPDXRef-Package-{}", i),
+                "name": name,
+                "versionInfo": version,
+                "downloadLocation": "NOASSERTION",
+                "filesAnalyzed": false,
+                "externalRefs": [{
+                    "referenceCategory": "PACKAGE-MANAGER",
+                    "referenceType": "purl",
+                    "referenceLocator": purl,
+                }],
+            })
+        })
+        .collect();
+
+    let namespace = format!("https://scanrook.io/spdx/{}/{}", target_name, timestamp);
+
+    serde_json::json!({
+        "spdxVersion": "SPDX-2.3",
+        "dataLicense": "CC0-1.0",
+        "SPDXID": "SPDXRef-DOCUMENT",
+        "name": target_name,
+        "documentNamespace": namespace,
+        "creationInfo": {
+            "created": timestamp,
+            "creators": [format!("Tool: scanrook-{}", scanner_version)],
+        },
+        "packages": spdx_packages,
+    })
+}
+
+fn export_syft(
+    packages: &[(String, String, String)],
+    target_name: &str,
+) -> serde_json::Value {
+    let artifacts: Vec<serde_json::Value> = packages
+        .iter()
+        .map(|(eco, name, version)| {
+            let purl = build_purl(eco, name, version);
+            serde_json::json!({
+                "name": name,
+                "version": version,
+                "type": eco,
+                "purl": purl,
+                "language": "",
+                "locations": [],
+                "metadata": null,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "artifacts": artifacts,
+        "source": {
+            "type": "image",
+            "target": target_name,
+        },
+        "schema": {
+            "version": "16.0.0",
+            "url": "https://raw.githubusercontent.com/anchore/syft/main/schema/json/schema-16.0.0.json",
+        },
+    })
+}
+
+pub fn export_report_as_sbom(
+    report: &serde_json::Value,
+    format: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let scanner_version = report
+        .get("scanner")
+        .and_then(|s| s.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(env!("CARGO_PKG_VERSION"));
+
+    let target_name = report
+        .get("target")
+        .and_then(|t| t.get("source"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("unknown");
+
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Extract unique packages from findings
+    let mut seen = std::collections::HashSet::new();
+    let mut packages: Vec<(String, String, String)> = Vec::new();
+
+    if let Some(findings) = report.get("findings").and_then(|f| f.as_array()) {
+        for finding in findings {
+            if let Some(pkg) = finding.get("package") {
+                let name = pkg.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+                let eco = pkg
+                    .get("ecosystem")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or_default();
+                let version = pkg
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                if name.is_empty() || version.is_empty() {
+                    continue;
+                }
+
+                let key = format!("{}:{}:{}", eco, name, version);
+                if seen.insert(key) {
+                    packages.push((eco.to_string(), name.to_string(), version.to_string()));
+                }
+            }
+        }
+    }
+
+    match format {
+        "cyclonedx" => Ok(export_cyclonedx(&packages, target_name, scanner_version, &timestamp)),
+        "spdx" => Ok(export_spdx(&packages, target_name, scanner_version, &timestamp)),
+        "syft" => Ok(export_syft(&packages, target_name)),
+        other => Err(anyhow::anyhow!("unsupported SBOM export format: {}", other)),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -758,5 +955,77 @@ mod tests {
     fn parse_sbom_returns_error_for_missing_file() {
         let result = parse_sbom_packages("/nonexistent/path/sbom.json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_cyclonedx_basic() {
+        let report_json = serde_json::json!({
+            "scanner": {"name": "scanrook", "version": "1.13.0"},
+            "target": {"type": "container", "source": "nginx.tar"},
+            "scan_status": "complete",
+            "inventory_status": "complete",
+            "findings": [],
+            "files": [],
+            "summary": {"total_findings": 0, "critical": 0, "high": 0, "medium": 0, "low": 0},
+        });
+        let result = export_report_as_sbom(&report_json, "cyclonedx").unwrap();
+        assert_eq!(result["bomFormat"], "CycloneDX");
+        assert_eq!(result["specVersion"], "1.5");
+        assert!(result["components"].is_array());
+    }
+
+    #[test]
+    fn test_export_spdx_basic() {
+        let report_json = serde_json::json!({
+            "scanner": {"name": "scanrook", "version": "1.13.0"},
+            "target": {"type": "container", "source": "nginx.tar"},
+            "scan_status": "complete",
+            "inventory_status": "complete",
+            "findings": [],
+            "files": [],
+            "summary": {"total_findings": 0, "critical": 0, "high": 0, "medium": 0, "low": 0},
+        });
+        let result = export_report_as_sbom(&report_json, "spdx").unwrap();
+        assert!(result["spdxVersion"].as_str().unwrap().starts_with("SPDX-"));
+        assert!(result["packages"].is_array());
+    }
+
+    #[test]
+    fn test_export_syft_basic() {
+        let report_json = serde_json::json!({
+            "scanner": {"name": "scanrook", "version": "1.13.0"},
+            "target": {"type": "container", "source": "nginx.tar"},
+            "scan_status": "complete",
+            "inventory_status": "complete",
+            "findings": [],
+            "files": [],
+            "summary": {"total_findings": 0, "critical": 0, "high": 0, "medium": 0, "low": 0},
+        });
+        let result = export_report_as_sbom(&report_json, "syft").unwrap();
+        assert!(result["artifacts"].is_array());
+    }
+
+    #[test]
+    fn test_export_with_packages() {
+        let report_json = serde_json::json!({
+            "scanner": {"name": "scanrook", "version": "1.13.0"},
+            "target": {"type": "container", "source": "nginx.tar"},
+            "scan_status": "complete",
+            "inventory_status": "complete",
+            "findings": [{
+                "id": "CVE-2023-0001",
+                "severity": "high",
+                "package": {"name": "openssl", "ecosystem": "deb", "version": "3.0.7"},
+                "description": "test vuln"
+            }],
+            "files": [],
+            "summary": {"total_findings": 1, "critical": 0, "high": 1, "medium": 0, "low": 0},
+        });
+        let result = export_report_as_sbom(&report_json, "cyclonedx").unwrap();
+        let components = result["components"].as_array().unwrap();
+        assert_eq!(components.len(), 1);
+        assert_eq!(components[0]["name"], "openssl");
+        assert_eq!(components[0]["version"], "3.0.7");
+        assert!(components[0]["purl"].as_str().unwrap().starts_with("pkg:deb/"));
     }
 }

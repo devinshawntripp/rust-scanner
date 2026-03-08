@@ -5,10 +5,12 @@ use crate::utils;
 use crate::utils::progress;
 use crate::OutputFormat;
 use crate::SbomCommands;
+use crate::SbomExportFormat;
+use anyhow::Context;
 
 use super::strip_references_in_findings;
 
-pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) {
+pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) -> anyhow::Result<()> {
     match command {
         SbomCommands::Import {
             file,
@@ -144,5 +146,28 @@ pub fn run_sbom(command: SbomCommands, nvd_api_key: Option<String>) {
                 std::process::exit(1);
             }
         }
+        SbomCommands::Export { report, sbom_format, out } => {
+            let report_data = std::fs::read_to_string(&report)
+                .with_context(|| format!("failed to read report: {}", report))?;
+            let report_json: serde_json::Value = serde_json::from_str(&report_data)
+                .with_context(|| "failed to parse report JSON")?;
+
+            let format_str = match sbom_format {
+                SbomExportFormat::Cyclonedx => "cyclonedx",
+                SbomExportFormat::Spdx => "spdx",
+                SbomExportFormat::Syft => "syft",
+            };
+
+            let sbom = crate::sbom::export_report_as_sbom(&report_json, format_str)?;
+            let output = serde_json::to_string_pretty(&sbom)?;
+
+            if let Some(out_path) = out {
+                std::fs::write(&out_path, &output)?;
+                eprintln!("SBOM ({}) written to {}", format_str, out_path);
+            } else {
+                println!("{}", output);
+            }
+        }
     }
+    Ok(())
 }
