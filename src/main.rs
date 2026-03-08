@@ -110,6 +110,7 @@ pub(crate) enum SbomExportFormat {
     Spdx,
     Syft,
 }
+
 #[derive(Subcommand)]
 pub(crate) enum SbomCommands {
     /// Import and scan an SBOM (CycloneDX JSON, SPDX JSON, or Syft JSON)

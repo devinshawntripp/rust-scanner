@@ -1,4 +1,4 @@
-//! SBOM subcommand handlers: import, diff, and policy check.
+//! SBOM subcommand handlers: import, diff, policy check, and export.
 
 use crate::sbom;
 use crate::utils;
