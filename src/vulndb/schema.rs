@@ -213,6 +213,77 @@ pub fn has_osv_package(conn: &Connection, ecosystem: &str, name: &str) -> bool {
     .is_ok()
 }
 
+/// Check if a package exists under any versioned variant of the given base ecosystem.
+/// E.g., base "Debian" matches "Debian", "Debian:11", "Debian:12", etc.
+/// The vulndb indexes distro packages by versioned ecosystem (Debian:11, Ubuntu:22.04:LTS)
+/// while the OSV batch API uses unversioned ecosystems (Debian, Ubuntu).
+pub fn has_osv_package_any_version(conn: &Connection, base_ecosystem: &str, name: &str) -> bool {
+    let pattern = format!("{}:%", base_ecosystem);
+    conn.query_row(
+        "SELECT 1 FROM osv_packages WHERE (ecosystem = ?1 OR ecosystem LIKE ?3) AND name = ?2 LIMIT 1",
+        params![base_ecosystem, name, pattern],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+/// Query OSV vulnerabilities matching any versioned variant of the base ecosystem.
+/// Returns deduplicated payloads across all versions (e.g., Debian:11 + Debian:12).
+pub fn query_osv_by_package_any_version(conn: &Connection, base_ecosystem: &str, name: &str) -> Vec<serde_json::Value> {
+    let pattern = format!("{}:%", base_ecosystem);
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT p.payload FROM osv_vulns v
+         JOIN osv_payloads p ON v.id = p.id
+         WHERE (v.ecosystem = ?1 OR v.ecosystem LIKE ?3) AND v.name = ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let use_dict = has_dict_compression(conn);
+    let dict = if use_dict {
+        get_dict(conn, "osv_zstd_dict")
+    } else {
+        None
+    };
+
+    let rows = stmt
+        .query_map(params![base_ecosystem, name, pattern], |row| {
+            let payload: Vec<u8> = row.get(0)?;
+            Ok(payload)
+        })
+        .ok();
+
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+
+    // Deduplicate by advisory ID to avoid returning the same advisory twice
+    // when it appears under multiple versioned ecosystems.
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    rows.filter_map(|r| r.ok())
+        .filter_map(|payload| {
+            let json_bytes = if use_dict {
+                if let Some(ref d) = dict {
+                    super::compress::decompress_payload_with_dict(&payload, d)
+                } else {
+                    super::compress::decompress_payload(&payload)
+                }
+            } else {
+                super::compress::decompress_payload(&payload)
+            };
+            json_bytes.and_then(|b| serde_json::from_slice(&b).ok())
+        })
+        .filter(|v: &serde_json::Value| {
+            if let Some(id) = v["id"].as_str() {
+                seen_ids.insert(id.to_string())
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
 /// Look up a single OSV advisory/vulnerability by ID from osv_payloads.
 /// Decompresses the payload blob (using dict if available) and returns parsed JSON.
 /// Used by the enrichment pipeline to avoid HTTP fetches for advisories already in the vulndb.

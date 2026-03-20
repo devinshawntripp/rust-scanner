@@ -108,29 +108,121 @@ pub fn osv_batch_query(
             ),
         );
 
-        // Standalone mode: check SQLite vulndb before API
+        // Standalone mode: check SQLite vulndb per-package, build reduced API batch for misses
         if let Some(ref conn) = vulndb_conn {
-            let mut all_found = true;
+            let mut db_hits = 0usize;
+            let mut api_needed: Vec<(usize, &Value)> = Vec::new();
             for &(orig_idx, ref query) in chunk {
                 let eco = query["package"]["ecosystem"].as_str().unwrap_or_default();
                 let name = query["package"]["name"].as_str().unwrap_or_default();
-                if !crate::vulndb::has_osv_package(conn, eco, name) {
-                    all_found = false;
-                    break;
+                // Try exact match first, then versioned prefix match for distro ecosystems
+                if crate::vulndb::has_osv_package(conn, eco, name) {
+                    let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
+                    results[orig_idx] = serde_json::json!({"vulns": vulns});
+                    db_hits += 1;
+                } else if crate::vulndb::has_osv_package_any_version(conn, eco, name) {
+                    let vulns = crate::vulndb::query_osv_by_package_any_version(conn, eco, name);
+                    results[orig_idx] = serde_json::json!({"vulns": vulns});
+                    db_hits += 1;
+                } else {
+                    api_needed.push((orig_idx, query));
                 }
-                let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
-                results[orig_idx] = serde_json::json!({"vulns": vulns});
             }
-            if all_found {
+            if db_hits > 0 {
                 progress(
                     "osv.query.chunk.vulndb",
                     &format!(
-                        "offset={} size={}",
+                        "offset={} hits={}/{} api_needed={}",
                         chunk.first().map(|(i, _)| i).unwrap_or(&0),
-                        chunk.len()
+                        db_hits,
+                        chunk.len(),
+                        api_needed.len()
                     ),
                 );
-                continue; // skip API call for this chunk
+            }
+            if api_needed.is_empty() {
+                continue; // all packages resolved from DB
+            }
+            // Rebuild a smaller batch body for only the packages not in the DB
+            if !api_needed.is_empty() && api_needed.len() < chunk.len() {
+                let reduced_body = serde_json::json!({
+                    "queries": api_needed.iter().map(|(_, q)| *q).collect::<Vec<&Value>>()
+                });
+                let reduced_bytes = reduced_body.to_string();
+                let reduced_digest = {
+                    use sha2::{Digest as _, Sha256};
+                    format!("{:x}", Sha256::digest(reduced_bytes.as_bytes()))
+                };
+                let reduced_cache_tag = cache_key(&["osv_batch", &reduced_digest]);
+
+                // Try file cache for the reduced batch
+                if let Some(bytes) = cache_get(cache_dir.as_deref(), &reduced_cache_tag) {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                        if let Some(arr) = v["results"].as_array() {
+                            for (idx_in_reduced, item) in arr.iter().enumerate() {
+                                if idx_in_reduced < api_needed.len() {
+                                    results[api_needed[idx_in_reduced].0] = item.clone();
+                                }
+                            }
+                            progress(
+                                "osv.query.chunk.cache+vulndb",
+                                &format!(
+                                    "offset={} db={} cached={}",
+                                    chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                                    db_hits,
+                                    api_needed.len()
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // Network request for the reduced batch
+                if !breaker.is_open() {
+                    let resp = client.post("https://api.osv.dev/v1/querybatch")
+                        .json(&reduced_body)
+                        .send();
+                    match resp {
+                        Ok(r) if r.status().is_success() => {
+                            if let Ok(text) = r.text() {
+                                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                                    if let Some(arr) = v["results"].as_array() {
+                                        for (idx_in_reduced, item) in arr.iter().enumerate() {
+                                            if idx_in_reduced < api_needed.len() {
+                                                results[api_needed[idx_in_reduced].0] = item.clone();
+                                            }
+                                        }
+                                        cache_put(cache_dir.as_deref(), &reduced_cache_tag, v.to_string().as_bytes());
+                                        breaker.record_success();
+                                        progress(
+                                            "osv.query.chunk.done",
+                                            &format!(
+                                                "offset={} db={} api={}",
+                                                chunk.first().map(|(i, _)| i).unwrap_or(&0),
+                                                db_hits,
+                                                api_needed.len()
+                                            ),
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            breaker.record_failure();
+                        }
+                        Ok(r) => {
+                            let _ = r.text();
+                            breaker.record_failure();
+                        }
+                        Err(_) => {
+                            breaker.record_failure();
+                        }
+                    }
+                    if breaker.is_open() {
+                        continue;
+                    }
+                }
+                // If reduced batch also failed, fall through to the original full-chunk logic below
             }
         }
 
