@@ -78,7 +78,10 @@ pub fn osv_batch_query(
         .unwrap_or(60);
     let client = build_http_client(osv_timeout_secs);
 
-    // Standalone mode: open vulndb once for SQLite lookups across all chunks
+    // ── Phase 0: Resolve as many packages as possible from LOCAL sources ──
+    // No batching, no chunking — local lookups are fast and shouldn't be
+    // artificially throttled.  Only packages that miss locally go to the API.
+
     let vulndb_conn = if !crate::vuln::cluster_mode() {
         crate::vulndb::open_vulndb()
     } else {
@@ -88,8 +91,78 @@ pub fn osv_batch_query(
         progress("osv.vulndb.open", &format!("path={}", crate::vulndb::vulndb_path().display()));
     }
 
-    for chunk in indexed.chunks(chunk_size) {
-        // Prepare body for this chunk
+    let mut db_hits = 0usize;
+    let mut api_needed: Vec<(usize, Value)> = Vec::new();
+
+    // Standalone mode: resolve against SQLite vulndb (all at once, no chunking)
+    if let Some(ref conn) = vulndb_conn {
+        let phase_db_started = std::time::Instant::now();
+        for (orig_idx, query) in &indexed {
+            let eco = query["package"]["ecosystem"].as_str().unwrap_or_default();
+            let name = query["package"]["name"].as_str().unwrap_or_default();
+            if crate::vulndb::has_osv_package(conn, eco, name) {
+                let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
+                results[*orig_idx] = serde_json::json!({"vulns": vulns});
+                db_hits += 1;
+            } else if crate::vulndb::has_osv_package_any_version(conn, eco, name) {
+                let vulns = crate::vulndb::query_osv_by_package_any_version(conn, eco, name);
+                results[*orig_idx] = serde_json::json!({"vulns": vulns});
+                db_hits += 1;
+            } else {
+                api_needed.push((*orig_idx, query.clone()));
+            }
+        }
+        progress(
+            "osv.query.vulndb.prepass",
+            &format!(
+                "total={} db_hits={} api_needed={} elapsed={:?}",
+                indexed.len(),
+                db_hits,
+                api_needed.len(),
+                phase_db_started.elapsed()
+            ),
+        );
+    }
+
+    // Cluster mode: check per-package file cache as a pre-pass, collect remaining
+    if vulndb_conn.is_none() {
+        let mut file_cache_hits = 0usize;
+        for (orig_idx, query) in &indexed {
+            let single_cache = cache_key(&["osv_one", &query.to_string()]);
+            if let Some(bytes) = cache_get(cache_dir.as_deref(), &single_cache) {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    results[*orig_idx] = v;
+                    file_cache_hits += 1;
+                    continue;
+                }
+            }
+            api_needed.push((*orig_idx, query.clone()));
+        }
+        if file_cache_hits > 0 {
+            progress(
+                "osv.query.cache.prepass",
+                &format!(
+                    "total={} cache_hits={} api_needed={}",
+                    indexed.len(),
+                    file_cache_hits,
+                    api_needed.len()
+                ),
+            );
+        }
+    }
+
+    // If everything was resolved locally, skip the entire chunk/API pipeline
+    if api_needed.is_empty() {
+        progress(
+            "osv.query.local.complete",
+            &format!("all {} packages resolved from local sources", indexed.len()),
+        );
+        return serde_json::Value::Array(results);
+    }
+
+    // ── Phase 1: Chunk only the API-needed packages for network calls ──
+
+    for chunk in api_needed.chunks(chunk_size) {
         let body =
             serde_json::json!({ "queries": chunk.iter().map(|(_, q)| q).collect::<Vec<&Value>>() });
         let body_bytes = body.to_string();
@@ -108,125 +181,7 @@ pub fn osv_batch_query(
             ),
         );
 
-        // Standalone mode: check SQLite vulndb per-package, build reduced API batch for misses
-        if let Some(ref conn) = vulndb_conn {
-            let mut db_hits = 0usize;
-            let mut api_needed: Vec<(usize, &Value)> = Vec::new();
-            for &(orig_idx, ref query) in chunk {
-                let eco = query["package"]["ecosystem"].as_str().unwrap_or_default();
-                let name = query["package"]["name"].as_str().unwrap_or_default();
-                // Try exact match first, then versioned prefix match for distro ecosystems
-                if crate::vulndb::has_osv_package(conn, eco, name) {
-                    let vulns = crate::vulndb::query_osv_by_package(conn, eco, name);
-                    results[orig_idx] = serde_json::json!({"vulns": vulns});
-                    db_hits += 1;
-                } else if crate::vulndb::has_osv_package_any_version(conn, eco, name) {
-                    let vulns = crate::vulndb::query_osv_by_package_any_version(conn, eco, name);
-                    results[orig_idx] = serde_json::json!({"vulns": vulns});
-                    db_hits += 1;
-                } else {
-                    api_needed.push((orig_idx, query));
-                }
-            }
-            if db_hits > 0 {
-                progress(
-                    "osv.query.chunk.vulndb",
-                    &format!(
-                        "offset={} hits={}/{} api_needed={}",
-                        chunk.first().map(|(i, _)| i).unwrap_or(&0),
-                        db_hits,
-                        chunk.len(),
-                        api_needed.len()
-                    ),
-                );
-            }
-            if api_needed.is_empty() {
-                continue; // all packages resolved from DB
-            }
-            // Rebuild a smaller batch body for only the packages not in the DB
-            if !api_needed.is_empty() && api_needed.len() < chunk.len() {
-                let reduced_body = serde_json::json!({
-                    "queries": api_needed.iter().map(|(_, q)| *q).collect::<Vec<&Value>>()
-                });
-                let reduced_bytes = reduced_body.to_string();
-                let reduced_digest = {
-                    use sha2::{Digest as _, Sha256};
-                    format!("{:x}", Sha256::digest(reduced_bytes.as_bytes()))
-                };
-                let reduced_cache_tag = cache_key(&["osv_batch", &reduced_digest]);
-
-                // Try file cache for the reduced batch
-                if let Some(bytes) = cache_get(cache_dir.as_deref(), &reduced_cache_tag) {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        if let Some(arr) = v["results"].as_array() {
-                            for (idx_in_reduced, item) in arr.iter().enumerate() {
-                                if idx_in_reduced < api_needed.len() {
-                                    results[api_needed[idx_in_reduced].0] = item.clone();
-                                }
-                            }
-                            progress(
-                                "osv.query.chunk.cache+vulndb",
-                                &format!(
-                                    "offset={} db={} cached={}",
-                                    chunk.first().map(|(i, _)| i).unwrap_or(&0),
-                                    db_hits,
-                                    api_needed.len()
-                                ),
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                // Network request for the reduced batch
-                if !breaker.is_open() {
-                    let resp = client.post("https://api.osv.dev/v1/querybatch")
-                        .json(&reduced_body)
-                        .send();
-                    match resp {
-                        Ok(r) if r.status().is_success() => {
-                            if let Ok(text) = r.text() {
-                                if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(arr) = v["results"].as_array() {
-                                        for (idx_in_reduced, item) in arr.iter().enumerate() {
-                                            if idx_in_reduced < api_needed.len() {
-                                                results[api_needed[idx_in_reduced].0] = item.clone();
-                                            }
-                                        }
-                                        cache_put(cache_dir.as_deref(), &reduced_cache_tag, v.to_string().as_bytes());
-                                        breaker.record_success();
-                                        progress(
-                                            "osv.query.chunk.done",
-                                            &format!(
-                                                "offset={} db={} api={}",
-                                                chunk.first().map(|(i, _)| i).unwrap_or(&0),
-                                                db_hits,
-                                                api_needed.len()
-                                            ),
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            breaker.record_failure();
-                        }
-                        Ok(r) => {
-                            let _ = r.text();
-                            breaker.record_failure();
-                        }
-                        Err(_) => {
-                            breaker.record_failure();
-                        }
-                    }
-                    if breaker.is_open() {
-                        continue;
-                    }
-                }
-                // If reduced batch also failed, fall through to the original full-chunk logic below
-            }
-        }
-
-        // Cluster mode: check PG chunk cache BEFORE the retry loop (outside attempt counting)
+        // Cluster mode: check PG chunk cache BEFORE the retry loop
         if crate::vuln::cluster_mode() {
             if let Some(c) = pg.as_mut() {
                 let ttl = crate::vuln::pg::compute_jittered_ttl_days(30, 7);
@@ -250,7 +205,6 @@ pub fn osv_batch_query(
         let mut attempt = 0;
         let mut done = false;
         while attempt < retries && !done {
-            // Check circuit breaker before each attempt
             if breaker.is_open() {
                 progress(
                     "osv.batch.chunk.skip",
@@ -263,14 +217,15 @@ pub fn osv_batch_query(
                 break;
             }
             attempt += 1;
-            // In standalone mode: try file cache for this chunk first
+            // Standalone mode: try file cache for this chunk first
             if !crate::vuln::cluster_mode() {
                 if let Some(bytes) = cache_get(cache_dir.as_deref(), &cache_tag) {
                     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                         if let Some(arr) = v["results"].as_array() {
                             for (idx_in_chunk, item) in arr.iter().enumerate() {
-                                let orig_idx = chunk[idx_in_chunk].0;
-                                results[orig_idx] = item.clone();
+                                if idx_in_chunk < chunk.len() {
+                                    results[chunk[idx_in_chunk].0] = item.clone();
+                                }
                             }
                             progress(
                                 "osv.query.chunk.cache",
@@ -311,16 +266,15 @@ pub fn osv_batch_query(
                             break;
                         }
                     } else {
-                        // Capture raw body first so we can log it on failure
                         match r.text() {
                             Ok(text) => match serde_json::from_str::<Value>(&text) {
                                 Ok(v) => {
                                     if let Some(arr) = v["results"].as_array() {
                                         for (idx_in_chunk, item) in arr.iter().enumerate() {
-                                            let orig_idx = chunk[idx_in_chunk].0;
-                                            results[orig_idx] = item.clone();
+                                            if idx_in_chunk < chunk.len() {
+                                                results[chunk[idx_in_chunk].0] = item.clone();
+                                            }
                                         }
-                                        // Write back to appropriate cache based on mode
                                         if crate::vuln::cluster_mode() {
                                             if let Some(c) = pg.as_mut() {
                                                 crate::vuln::pg::pg_put_osv_batch_chunk(
@@ -355,12 +309,12 @@ pub fn osv_batch_query(
                                             .unwrap_or_default();
                                         let preview = text.chars().take(200).collect::<String>();
                                         progress(
-                                                "osv.query.error",
-                                                &format!(
-                                                    "chunk_parse offset={} attempt={} keys={:?} body={}",
-                                                    offset, attempt, keys, preview
-                                                ),
-                                            );
+                                            "osv.query.error",
+                                            &format!(
+                                                "chunk_parse offset={} attempt={} keys={:?} body={}",
+                                                offset, attempt, keys, preview
+                                            ),
+                                        );
                                         breaker.record_failure();
                                         if breaker.is_open() {
                                             break;
@@ -429,68 +383,67 @@ pub fn osv_batch_query(
                     ),
                 );
             } else {
-            for (orig_idx, q) in chunk {
-                // Check circuit breaker before each per-package attempt
-                if breaker.is_open() {
-                    progress(
-                        "osv.query.pkg.skip",
-                        &format!("circuit_open source={} idx={}", breaker.source_name(), orig_idx),
-                    );
-                    break;
-                }
-                let mut attempt_p = 0;
-                let single_cache = cache_key(&["osv_one", &q.to_string()]);
-                loop {
-                    attempt_p += 1;
-                    if let Some(bytes) = cache_get(cache_dir.as_deref(), &single_cache) {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                            results[*orig_idx] = v;
-                            break;
-                        }
+                for (orig_idx, q) in chunk {
+                    if breaker.is_open() {
+                        progress(
+                            "osv.query.pkg.skip",
+                            &format!("circuit_open source={} idx={}", breaker.source_name(), orig_idx),
+                        );
+                        break;
                     }
-                    progress(
-                        "osv.query.pkg.start",
-                        &format!("idx={} attempt={}", orig_idx, attempt_p),
-                    );
-                    let resp = client.post("https://api.osv.dev/v1/query").json(&q).send();
-                    match resp {
-                        Ok(r) => match r.json::<Value>() {
-                            Ok(v) => {
-                                cache_put(
-                                    cache_dir.as_deref(),
-                                    &single_cache,
-                                    v.to_string().as_bytes(),
-                                );
+                    let mut attempt_p = 0;
+                    let single_cache = cache_key(&["osv_one", &q.to_string()]);
+                    loop {
+                        attempt_p += 1;
+                        if let Some(bytes) = cache_get(cache_dir.as_deref(), &single_cache) {
+                            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                                 results[*orig_idx] = v;
-                                breaker.record_success();
-                                progress(
-                                    "osv.query.pkg.ok",
-                                    &format!("idx={} attempts={}", orig_idx, attempt_p),
-                                );
                                 break;
                             }
+                        }
+                        progress(
+                            "osv.query.pkg.start",
+                            &format!("idx={} attempt={}", orig_idx, attempt_p),
+                        );
+                        let resp = client.post("https://api.osv.dev/v1/query").json(&q).send();
+                        match resp {
+                            Ok(r) => match r.json::<Value>() {
+                                Ok(v) => {
+                                    cache_put(
+                                        cache_dir.as_deref(),
+                                        &single_cache,
+                                        v.to_string().as_bytes(),
+                                    );
+                                    results[*orig_idx] = v;
+                                    breaker.record_success();
+                                    progress(
+                                        "osv.query.pkg.ok",
+                                        &format!("idx={} attempts={}", orig_idx, attempt_p),
+                                    );
+                                    break;
+                                }
+                                Err(e) => {
+                                    progress(
+                                        "osv.query.pkg.error",
+                                        &format!("idx={} json err={}", orig_idx, e),
+                                    );
+                                    breaker.record_failure();
+                                }
+                            },
                             Err(e) => {
                                 progress(
                                     "osv.query.pkg.error",
-                                    &format!("idx={} json err={}", orig_idx, e),
+                                    &format!("idx={} http err={}", orig_idx, e),
                                 );
                                 breaker.record_failure();
                             }
-                        },
-                        Err(e) => {
-                            progress(
-                                "osv.query.pkg.error",
-                                &format!("idx={} http err={}", orig_idx, e),
-                            );
-                            breaker.record_failure();
                         }
+                        if attempt_p >= retries || breaker.is_open() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt_p as u64));
                     }
-                    if attempt_p >= retries || breaker.is_open() {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(backoff_ms_base * attempt_p as u64));
                 }
-            }
             }
             progress(
                 "osv.query.chunk.fallback",

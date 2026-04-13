@@ -459,9 +459,27 @@ pub fn osv_enrich_findings(
     }
     progress_timing("osv.enrich.pg_cache_store", phase_pg_store_started);
 
+    // Capture source counts before consuming the maps
+    let count_vulndb = vulndb_hits.len();
+    let count_pg = pg_cache_hits.len();
+    let count_network = fetched.len();
+
     // Phase 4: Build combined payloads map (vulndb + PG hits + freshly fetched)
     let all_payloads: std::collections::HashMap<String, Value> =
         vulndb_hits.into_iter().chain(pg_cache_hits).chain(fetched).collect();
+
+    // Log source breakdown so users can tell what came from local DB vs network
+    progress(
+        "osv.enrich.summary",
+        &format!(
+            "total={} vulndb={} pg_cache={} network={} skipped_cve={}",
+            all_payloads.len(),
+            count_vulndb,
+            count_pg,
+            count_network,
+            skipped_cve_fetch
+        ),
+    );
 
     // Phase 5: Apply payloads to findings sequentially
     // (advisory->CVE upgrades require sequential mutation of the shared findings vec)
@@ -473,12 +491,12 @@ pub fn osv_enrich_findings(
     let total_apply = ids_to_apply.len();
     for (idx, id) in ids_to_apply.into_iter().enumerate() {
         progress(
-            "osv.fetch.start",
+            "osv.apply.start",
             &format!("{}/{} {}", idx + 1, total_apply, id),
         );
         if let Some(json) = all_payloads.get(&id) {
             osv_apply_payload_to_findings(&id, json, findings, pg);
-            progress("osv.fetch.ok", &id);
+            progress("osv.apply.ok", &id);
         }
     }
     progress_timing("osv.enrich.apply", phase_apply_started);
