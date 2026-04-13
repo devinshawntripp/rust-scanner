@@ -124,8 +124,11 @@ pub fn osv_batch_query(
         );
     }
 
-    // Cluster mode: check per-package file cache as a pre-pass, collect remaining
-    if vulndb_conn.is_none() {
+    // Standalone mode without vulndb: check per-package file cache as a pre-pass.
+    // In cluster mode, PostgreSQL is the local source — the PG chunk cache is
+    // checked per-chunk inside the batch loop below (it's keyed by chunk digest,
+    // so per-package pre-resolution isn't possible without a separate table).
+    if vulndb_conn.is_none() && !crate::vuln::cluster_mode() {
         let mut file_cache_hits = 0usize;
         for (orig_idx, query) in &indexed {
             let single_cache = cache_key(&["osv_one", &query.to_string()]);
@@ -148,6 +151,14 @@ pub fn osv_batch_query(
                     api_needed.len()
                 ),
             );
+        }
+    }
+
+    // Cluster mode: all packages go to api_needed; PG chunk cache is checked
+    // per-chunk in the batch loop below.
+    if vulndb_conn.is_none() && crate::vuln::cluster_mode() {
+        for (orig_idx, query) in &indexed {
+            api_needed.push((*orig_idx, query.clone()));
         }
     }
 
