@@ -5,6 +5,7 @@ mod cli;
 mod container;
 mod iso;
 mod license;
+mod plan;
 mod progress;
 mod redhat;
 mod report;
@@ -519,6 +520,21 @@ fn main() {
         );
     }
 
+    // Fetch plan and apply enrichment gates for scan commands.
+    // Skip plan enforcement in cluster mode (worker always has full access).
+    let user_plan = if !vuln::cluster_mode() {
+        let p = plan::get_plan();
+        if matches!(
+            &cli.command,
+            Commands::Scan { .. } | Commands::Container { .. } | Commands::Sbom { .. }
+        ) {
+            plan::apply_plan_enrichment_gates(&p);
+        }
+        Some(p)
+    } else {
+        None
+    };
+
     match cli.command {
         Commands::Scan {
             file,
@@ -529,6 +545,18 @@ fn main() {
             mode,
             oval_redhat,
         } => {
+            // Gate output format by plan tier
+            if let Some(ref p) = user_plan {
+                let fmt_name = match &format {
+                    OutputFormat::Json => "json",
+                    OutputFormat::Ndjson => "ndjson",
+                    OutputFormat::Text => "text",
+                };
+                if let Err(msg) = plan::check_output_format(p, fmt_name) {
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
+                }
+            }
             // Keep default scans responsive:
             // - refs=true: full enrichment (OSV + NVD)
             // - refs=false: keep OSV enrichment and enable NVD only when API key is available
@@ -631,7 +659,20 @@ fn main() {
             format,
             out,
             mode,
-        } => match format {
+        } => {
+            // Gate output format by plan tier
+            if let Some(ref p) = user_plan {
+                let fmt_name = match &format {
+                    OutputFormat::Json => "json",
+                    OutputFormat::Ndjson => "ndjson",
+                    OutputFormat::Text => "text",
+                };
+                if let Err(msg) = plan::check_output_format(p, fmt_name) {
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
+                }
+            }
+            match format {
             OutputFormat::Text => binary::scan_binary(&path),
             OutputFormat::Json => {
                 if let Some(report) =
@@ -655,7 +696,7 @@ fn main() {
                     utils::write_output_if_needed(&out, &text);
                 }
             }
-        },
+        }},
         Commands::Container {
             tar,
             mode,
@@ -664,6 +705,18 @@ fn main() {
             sbom,
             oval_redhat,
         } => {
+            // Gate output format by plan tier
+            if let Some(ref p) = user_plan {
+                let fmt_name = match &format {
+                    OutputFormat::Json => "json",
+                    OutputFormat::Ndjson => "ndjson",
+                    OutputFormat::Text => "text",
+                };
+                if let Err(msg) = plan::check_output_format(p, fmt_name) {
+                    eprintln!("{}", msg);
+                    std::process::exit(1);
+                }
+            }
             container::scan_container(
                 &tar,
                 mode,
@@ -697,6 +750,8 @@ fn main() {
                     eprintln!("login failed: {}", e);
                     std::process::exit(1);
                 }
+                // Refresh plan cache after successful login
+                plan::refresh_plan_cache();
             }
             AuthCommands::Logout => {
                 if let Err(e) = usercli::logout() {

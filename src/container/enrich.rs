@@ -47,12 +47,18 @@ pub(super) fn run_enrichment_pipeline(ctx: &mut EnrichCtx) -> (Vec<Finding>, boo
 
     // Pre-fetch OVAL XML in background: resolve explicit path / env override first,
     // then spawn download thread if we need to fetch from Red Hat.
-    let oval_explicit = ctx
-        .oval_redhat
-        .take()
-        .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-        .filter(|v| !v.trim().is_empty());
-    let oval_fetch_handle = if oval_explicit.is_none() {
+    let oval_disabled = std::env::var("SCANNER_OVAL_ENRICH")
+        .map(|v| matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(false);
+    let oval_explicit = if oval_disabled {
+        None
+    } else {
+        ctx.oval_redhat
+            .take()
+            .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+            .filter(|v| !v.trim().is_empty())
+    };
+    let oval_fetch_handle = if oval_explicit.is_none() && !oval_disabled {
         let has_rpm = ctx
             .packages
             .iter()

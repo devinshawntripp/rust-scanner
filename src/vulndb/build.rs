@@ -462,12 +462,24 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
         .build()?;
 
     // Determine API base URL (default: scanrook.io, overridable for dev)
-    let api_base =
-        std::env::var("SCANROOK_API_BASE").unwrap_or_else(|_| "https://scanrook.io".to_string());
+    let cfg = crate::usercli::load_config();
+    let api_base = std::env::var("SCANROOK_API_BASE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| cfg.api_base.clone().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "https://scanrook.io".to_string());
+    let api_key = std::env::var("SCANROOK_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| cfg.api_key.clone().filter(|v| !v.trim().is_empty()));
     let meta_url = format!("{}/api/db/latest", api_base);
 
     progress("vulndb.fetch.check", &format!("querying {}", meta_url));
-    let resp = client.get(&meta_url).send()?;
+    let mut req = client.get(&meta_url);
+    if let Some(ref key) = api_key {
+        req = req.header("authorization", format!("Bearer {}", key));
+    }
+    let resp = req.send()?;
     if !resp.status().is_success() {
         anyhow::bail!(
             "failed to query vulndb metadata from {}: HTTP {}",
@@ -485,6 +497,20 @@ pub fn fetch_db(force: bool) -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     let asset_size = meta.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    // Display tier info from the API response
+    let tier = meta
+        .get("tier")
+        .and_then(|v| v.as_str())
+        .unwrap_or("free");
+    progress("vulndb.fetch.tier", &format!("tier={}", tier));
+    if tier == "free" {
+        println!(
+            "Free tier: OSV + basic NVD. Upgrade at https://scanrook.io/pricing for full enrichment."
+        );
+    } else {
+        println!("vulndb tier: {}", tier);
+    }
 
     // Skip download if local DB matches the remote build date
     if !force {

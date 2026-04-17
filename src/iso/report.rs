@@ -220,20 +220,27 @@ pub fn build_iso_report(
             retag_findings(&mut findings_norm, tier, source, Some(&note));
         }
 
-        let oval_redhat = oval_redhat
-            .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| {
-                let has_rpm = packages
-                    .iter()
-                    .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
-                if has_rpm {
-                    let cache = crate::vuln::resolve_enrich_cache_dir();
-                    crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
-                } else {
-                    None
-                }
-            });
+        let oval_disabled = std::env::var("SCANNER_OVAL_ENRICH")
+            .map(|v| matches!(v.to_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .unwrap_or(false);
+        let oval_redhat = if oval_disabled {
+            None
+        } else {
+            oval_redhat
+                .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| {
+                    let has_rpm = packages
+                        .iter()
+                        .any(|p| crate::redhat::is_rpm_ecosystem(&p.ecosystem));
+                    if has_rpm {
+                        let cache = crate::vuln::resolve_enrich_cache_dir();
+                        crate::redhat::fetch_redhat_oval(&packages, cache.as_deref())
+                    } else {
+                        None
+                    }
+                })
+        };
         crate::progress::enter_stage("redhat");
         if let Some(oval_path) = oval_redhat.as_deref() {
             progress("iso.enrich.redhat.start", oval_path);
