@@ -4,6 +4,7 @@ mod cache;
 mod cli;
 mod container;
 mod iso;
+mod k8s;
 mod license;
 mod plan;
 mod progress;
@@ -21,6 +22,7 @@ use crate::cli::{
 };
 use crate::utils::progress;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
@@ -324,6 +326,30 @@ enum Commands {
         /// Only check for updates without installing
         #[arg(long, default_value_t = false)]
         check: bool,
+    },
+    /// Scan all container images running in a Kubernetes cluster
+    K8s {
+        /// Path to kubeconfig file (default: ~/.kube/config or KUBECONFIG env)
+        #[arg(long)]
+        kubeconfig: Option<String>,
+        /// Kubernetes context to use
+        #[arg(long)]
+        context: Option<String>,
+        /// Namespace to scan (default: all namespaces)
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Output file for JSON format
+        #[arg(long)]
+        out: Option<String>,
+        /// Scan mode
+        #[arg(long, default_value = "light")]
+        mode: String,
+        /// Only list images without scanning
+        #[arg(long)]
+        list_only: bool,
     },
 }
 
@@ -812,6 +838,230 @@ fn main() {
             if let Err(e) = run_upgrade(check) {
                 eprintln!("upgrade failed: {}", e);
                 std::process::exit(1);
+            }
+        }
+        Commands::K8s {
+            kubeconfig,
+            context,
+            namespace,
+            format,
+            out,
+            mode,
+            list_only,
+        } => {
+            progress("k8s.discover.start", "Connecting to cluster...");
+
+            let workloads = k8s::discover_workloads(
+                kubeconfig.as_deref(),
+                context.as_deref(),
+                namespace.as_deref(),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
+
+            let images = k8s::unique_images(&workloads);
+
+            progress(
+                "k8s.discover.done",
+                &format!(
+                    "Found {} workloads with {} unique images",
+                    workloads.len(),
+                    images.len()
+                ),
+            );
+
+            // Print workload summary
+            for w in &workloads {
+                for c in &w.containers {
+                    println!("{}/{} {} -> {}", w.namespace, w.name, c.name, c.image);
+                }
+            }
+
+            if list_only {
+                if format == "json" {
+                    let json = serde_json::json!({
+                        "workloads": workloads,
+                        "unique_images": images,
+                    });
+                    if let Some(path) = &out {
+                        std::fs::write(path, serde_json::to_string_pretty(&json).unwrap())
+                            .unwrap();
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                    }
+                }
+                return;
+            }
+
+            // Scan each unique image
+            let scan_mode = if mode == "deep" {
+                ScanMode::Deep
+            } else {
+                ScanMode::Light
+            };
+            let mut image_results: Vec<k8s::ImageScanResult> = Vec::new();
+            let temp_dir = tempfile::tempdir().unwrap();
+            let total_workloads = workloads.len();
+            let total_images = images.len();
+
+            for (idx, image) in images.iter().enumerate() {
+                progress(
+                    "k8s.scan.start",
+                    &format!("{}/{} {}", idx + 1, total_images, image),
+                );
+
+                let tar_path = temp_dir.path().join(format!("image-{}.tar", idx));
+                let tar_str = tar_path.to_string_lossy().to_string();
+
+                match k8s::pull_and_save_image(image, &tar_str) {
+                    Ok(()) => {
+                        let report = build_scan_report_value(
+                            &tar_str,
+                            scan_mode.clone(),
+                            None,
+                            nvd_api_key.clone(),
+                            None,
+                        );
+
+                        if let Some(r) = report {
+                            let findings =
+                                r["findings"].as_array().map(|a| a.len()).unwrap_or(0);
+                            let summary = &r["summary"];
+                            let sc = &summary["severity_counts"];
+
+                            let using_workloads: Vec<String> = workloads
+                                .iter()
+                                .filter(|w| w.containers.iter().any(|c| c.image == *image))
+                                .map(|w| format!("{}/{}", w.namespace, w.name))
+                                .collect();
+
+                            image_results.push(k8s::ImageScanResult {
+                                image: image.clone(),
+                                workloads: using_workloads,
+                                total_findings: findings,
+                                critical: sc["Critical"].as_u64().unwrap_or(0) as usize,
+                                high: sc["High"].as_u64().unwrap_or(0) as usize,
+                                medium: sc["Medium"].as_u64().unwrap_or(0) as usize,
+                                low: sc["Low"].as_u64().unwrap_or(0) as usize,
+                                scan_error: None,
+                            });
+
+                            progress(
+                                "k8s.scan.done",
+                                &format!("{} findings={}", image, findings),
+                            );
+                        } else {
+                            image_results.push(k8s::ImageScanResult {
+                                image: image.clone(),
+                                workloads: vec![],
+                                total_findings: 0,
+                                critical: 0,
+                                high: 0,
+                                medium: 0,
+                                low: 0,
+                                scan_error: Some("Scan produced no report".to_string()),
+                            });
+                        }
+
+                        // Clean up tar to save disk
+                        let _ = std::fs::remove_file(&tar_path);
+                    }
+                    Err(e) => {
+                        progress("k8s.scan.error", &format!("{}: {}", image, e));
+                        image_results.push(k8s::ImageScanResult {
+                            image: image.clone(),
+                            workloads: vec![],
+                            total_findings: 0,
+                            critical: 0,
+                            high: 0,
+                            medium: 0,
+                            low: 0,
+                            scan_error: Some(e),
+                        });
+                    }
+                }
+            }
+
+            // Build summary
+            let total_findings: usize =
+                image_results.iter().map(|r| r.total_findings).sum();
+            let total_critical: usize = image_results.iter().map(|r| r.critical).sum();
+            let total_high: usize = image_results.iter().map(|r| r.high).sum();
+            let images_with_critical: Vec<String> = image_results
+                .iter()
+                .filter(|r| r.critical > 0)
+                .map(|r| r.image.clone())
+                .collect();
+
+            let namespaces_scanned: Vec<String> = workloads
+                .iter()
+                .map(|w| w.namespace.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            let cluster_report = k8s::ClusterScanReport {
+                cluster_context: context.unwrap_or_else(|| "default".to_string()),
+                namespaces_scanned,
+                workloads,
+                unique_images: images,
+                image_reports: image_results,
+                summary: k8s::ClusterSummary {
+                    total_workloads,
+                    total_images,
+                    total_findings,
+                    critical: total_critical,
+                    high: total_high,
+                    images_with_critical,
+                },
+            };
+
+            // Output
+            if format == "json" {
+                let json = serde_json::to_string_pretty(&cluster_report).unwrap();
+                if let Some(path) = &out {
+                    std::fs::write(path, &json).unwrap();
+                    progress("k8s.report", &format!("Saved to {}", path));
+                } else {
+                    println!("{}", json);
+                }
+            } else {
+                println!("\n=== Cluster Scan Summary ===");
+                println!("Workloads: {}", cluster_report.summary.total_workloads);
+                println!("Unique images: {}", cluster_report.summary.total_images);
+                println!(
+                    "Total findings: {}",
+                    cluster_report.summary.total_findings
+                );
+                println!("  Critical: {}", cluster_report.summary.critical);
+                println!("  High: {}", cluster_report.summary.high);
+                if !cluster_report.summary.images_with_critical.is_empty() {
+                    println!("\nImages with CRITICAL findings:");
+                    for img in &cluster_report.summary.images_with_critical {
+                        println!("  - {}", img);
+                    }
+                }
+                println!("\nPer-image results:");
+                for r in &cluster_report.image_reports {
+                    if let Some(err) = &r.scan_error {
+                        println!("  {} -- ERROR: {}", r.image, err);
+                    } else {
+                        println!(
+                            "  {} -- {} findings (C:{} H:{} M:{} L:{})",
+                            r.image,
+                            r.total_findings,
+                            r.critical,
+                            r.high,
+                            r.medium,
+                            r.low
+                        );
+                        for w in &r.workloads {
+                            println!("    used by: {}", w);
+                        }
+                    }
+                }
             }
         }
     }
