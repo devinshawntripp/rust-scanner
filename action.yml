@@ -1,5 +1,5 @@
 name: "ScanRook Scan"
-description: "Install ScanRook and scan a local artifact (tar/iso/bin) in CI."
+description: "Install ScanRook and scan a local artifact (tar/iso/bin) or Docker image in CI."
 author: "ScanRook"
 branding:
   icon: "shield"
@@ -7,7 +7,12 @@ branding:
 inputs:
   artifact_path:
     description: "Path to artifact to scan."
-    required: true
+    required: false
+    default: ""
+  image:
+    description: "Docker image to scan (alternative to artifact_path). Will be pulled and saved as tar."
+    required: false
+    default: ""
   mode:
     description: "Scan mode: light or deep."
     required: false
@@ -36,10 +41,42 @@ inputs:
     description: "Optional ScanRook API key for cloud enrichment."
     required: false
     default: ""
+  fail_on_critical:
+    description: "Fail the action if critical severity findings exceed this count. Set to -1 to disable."
+    required: false
+    default: "0"
+  fail_on_high:
+    description: "Fail the action if high severity findings exceed this count. Set to -1 to disable."
+    required: false
+    default: "-1"
+  fail_on_total:
+    description: "Fail the action if total findings exceed this count. Set to -1 to disable."
+    required: false
+    default: "-1"
+  comment_on_pr:
+    description: "Post scan summary as PR comment (true|false). Requires GITHUB_TOKEN."
+    required: false
+    default: "true"
+  github_token:
+    description: "GitHub token for posting PR comments. Defaults to github.token."
+    required: false
+    default: "${{ github.token }}"
 outputs:
   report_path:
     description: "Path to generated report when format=json."
     value: ${{ steps.scan.outputs.report_path }}
+  critical_count:
+    description: "Number of critical findings."
+    value: ${{ steps.policy.outputs.critical }}
+  high_count:
+    description: "Number of high findings."
+    value: ${{ steps.policy.outputs.high }}
+  total_count:
+    description: "Number of total findings."
+    value: ${{ steps.policy.outputs.total }}
+  policy_failed:
+    description: "Whether the policy gate failed (0 or 1)."
+    value: ${{ steps.policy.outputs.failed }}
 runs:
   using: "composite"
   steps:
@@ -50,6 +87,26 @@ runs:
         export SCANROOK_VERSION="${{ inputs.version }}"
         curl -fsSL https://scanrook.sh/install | bash
         scanrook --version
+
+    - name: Pull and save Docker image
+      if: inputs.image != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "Pulling ${{ inputs.image }}..."
+        docker pull "${{ inputs.image }}"
+        ARTIFACT_PATH="${{ runner.temp }}/scanrook-image.tar"
+        docker save "${{ inputs.image }}" -o "${ARTIFACT_PATH}"
+        echo "SCANROOK_ARTIFACT=${ARTIFACT_PATH}" >> "${GITHUB_ENV}"
+
+    - name: Validate inputs
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -z "${{ inputs.artifact_path }}" ]] && [[ -z "${{ inputs.image }}" ]]; then
+          echo "::error::Either artifact_path or image must be provided."
+          exit 1
+        fi
 
     - name: Execute scan
       id: scan
@@ -65,8 +122,13 @@ runs:
       run: |
         set -euo pipefail
 
+        # Use Docker image artifact if set, otherwise use artifact_path input
+        if [[ -n "${SCANROOK_ARTIFACT:-}" ]]; then
+          INPUT_ARTIFACT="${SCANROOK_ARTIFACT}"
+        fi
+
         if [[ ! -f "${INPUT_ARTIFACT}" ]]; then
-          echo "artifact_path not found: ${INPUT_ARTIFACT}" >&2
+          echo "artifact not found: ${INPUT_ARTIFACT}" >&2
           exit 1
         fi
 
@@ -93,3 +155,148 @@ runs:
         else
           echo "report_path=" >> "${GITHUB_OUTPUT}"
         fi
+
+    - name: Policy gate
+      id: policy
+      if: inputs.format == 'json'
+      shell: bash
+      env:
+        FAIL_CRITICAL: ${{ inputs.fail_on_critical }}
+        FAIL_HIGH: ${{ inputs.fail_on_high }}
+        FAIL_TOTAL: ${{ inputs.fail_on_total }}
+      run: |
+        set -euo pipefail
+        REPORT="${{ steps.scan.outputs.report_path }}"
+        if [[ ! -f "${REPORT}" ]]; then
+          echo "No report file found, skipping policy gate"
+          exit 0
+        fi
+
+        # Extract severity counts using jq (available on GitHub runners)
+        CRITICAL=$(jq '[.findings[] | select(.severity == "Critical")] | length' "${REPORT}" 2>/dev/null || echo "0")
+        HIGH=$(jq '[.findings[] | select(.severity == "High")] | length' "${REPORT}" 2>/dev/null || echo "0")
+        MEDIUM=$(jq '[.findings[] | select(.severity == "Medium")] | length' "${REPORT}" 2>/dev/null || echo "0")
+        LOW=$(jq '[.findings[] | select(.severity == "Low")] | length' "${REPORT}" 2>/dev/null || echo "0")
+        TOTAL=$(jq '.findings | length' "${REPORT}" 2>/dev/null || echo "0")
+
+        echo "## ScanRook Policy Gate" >> "${GITHUB_STEP_SUMMARY}"
+        echo "" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| Severity | Count | Threshold | Status |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "|----------|-------|-----------|--------|" >> "${GITHUB_STEP_SUMMARY}"
+
+        FAILED=0
+
+        if [[ "${FAIL_CRITICAL}" != "-1" ]] && [[ "${CRITICAL}" -gt "${FAIL_CRITICAL}" ]]; then
+          echo "| Critical | ${CRITICAL} | ${FAIL_CRITICAL} | FAIL |" >> "${GITHUB_STEP_SUMMARY}"
+          FAILED=1
+        else
+          echo "| Critical | ${CRITICAL} | ${FAIL_CRITICAL:-disabled} | PASS |" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+
+        if [[ "${FAIL_HIGH}" != "-1" ]] && [[ "${HIGH}" -gt "${FAIL_HIGH}" ]]; then
+          echo "| High | ${HIGH} | ${FAIL_HIGH} | FAIL |" >> "${GITHUB_STEP_SUMMARY}"
+          FAILED=1
+        else
+          echo "| High | ${HIGH} | ${FAIL_HIGH:-disabled} | PASS |" >> "${GITHUB_STEP_SUMMARY}"
+        fi
+
+        echo "| Medium | ${MEDIUM} | — | — |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| Low | ${LOW} | — | — |" >> "${GITHUB_STEP_SUMMARY}"
+        echo "| **Total** | **${TOTAL}** | ${FAIL_TOTAL:-disabled} | — |" >> "${GITHUB_STEP_SUMMARY}"
+
+        if [[ "${FAIL_TOTAL}" != "-1" ]] && [[ "${TOTAL}" -gt "${FAIL_TOTAL}" ]]; then
+          FAILED=1
+        fi
+
+        # Export counts for PR comment step
+        echo "critical=${CRITICAL}" >> "${GITHUB_OUTPUT}"
+        echo "high=${HIGH}" >> "${GITHUB_OUTPUT}"
+        echo "medium=${MEDIUM}" >> "${GITHUB_OUTPUT}"
+        echo "low=${LOW}" >> "${GITHUB_OUTPUT}"
+        echo "total=${TOTAL}" >> "${GITHUB_OUTPUT}"
+        echo "failed=${FAILED}" >> "${GITHUB_OUTPUT}"
+
+        if [[ "${FAILED}" == "1" ]]; then
+          echo "::error::ScanRook policy gate failed. See step summary for details."
+          exit 1
+        fi
+
+    - name: Post PR comment
+      if: inputs.comment_on_pr == 'true' && github.event_name == 'pull_request' && always()
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GH_REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        REPORT="${{ steps.scan.outputs.report_path }}"
+
+        CRITICAL="${{ steps.policy.outputs.critical }}"
+        HIGH="${{ steps.policy.outputs.high }}"
+        MEDIUM="${{ steps.policy.outputs.medium }}"
+        LOW="${{ steps.policy.outputs.low }}"
+        TOTAL="${{ steps.policy.outputs.total }}"
+        GATE="${{ steps.policy.outputs.failed }}"
+
+        # Default to 0 if policy step was skipped
+        CRITICAL="${CRITICAL:-0}"
+        HIGH="${HIGH:-0}"
+        MEDIUM="${MEDIUM:-0}"
+        LOW="${LOW:-0}"
+        TOTAL="${TOTAL:-0}"
+        GATE="${GATE:-0}"
+
+        if [[ "${GATE}" == "1" ]]; then
+          STATUS_ICON="🔴"
+          STATUS_TEXT="**FAILED** — policy thresholds exceeded"
+        elif [[ "${TOTAL}" == "0" ]]; then
+          STATUS_ICON="🟢"
+          STATUS_TEXT="**PASSED** — no vulnerabilities found"
+        else
+          STATUS_ICON="🟡"
+          STATUS_TEXT="**PASSED** — ${TOTAL} findings within thresholds"
+        fi
+
+        TARGET="${{ inputs.artifact_path }}"
+        if [[ -z "${TARGET}" ]]; then
+          TARGET="${{ inputs.image }}"
+        fi
+
+        SCANNER_VER=$(scanrook --version 2>/dev/null | head -1 || echo 'unknown')
+
+        # Build comment body
+        COMMENT="## ${STATUS_ICON} ScanRook Scan Results
+
+        ${STATUS_TEXT}
+
+        | Severity | Count |
+        |----------|-------|
+        | Critical | ${CRITICAL} |
+        | High | ${HIGH} |
+        | Medium | ${MEDIUM} |
+        | Low | ${LOW} |
+        | **Total** | **${TOTAL}** |
+
+        <details>
+        <summary>Scan details</summary>
+
+        - **Target:** \`${TARGET}\`
+        - **Mode:** ${{ inputs.mode }}
+        - **Scanner:** ScanRook ${SCANNER_VER}
+
+        </details>
+
+        ---
+        *Scanned by [ScanRook](https://scanrook.io) — [View full report](https://scanrook.io/docs/ci)*"
+
+        # Remove leading whitespace from heredoc-style indentation
+        COMMENT=$(echo "${COMMENT}" | sed 's/^        //')
+
+        # Delete previous ScanRook comment if exists, then post new one
+        EXISTING=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --jq '.[] | select(.body | contains("ScanRook Scan Results")) | .id' 2>/dev/null | head -1)
+        if [[ -n "${EXISTING}" ]]; then
+          gh api -X DELETE "repos/${GH_REPO}/issues/comments/${EXISTING}" 2>/dev/null || true
+        fi
+
+        gh pr comment "${PR_NUMBER}" --repo "${GH_REPO}" --body "${COMMENT}"
