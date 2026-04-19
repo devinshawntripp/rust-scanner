@@ -73,10 +73,10 @@ pub fn enrich_findings_with_nvd(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default_ms);
-    let _ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
+    let base_ttl_days: i64 = std::env::var("SCANNER_NVD_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(7);
+        .unwrap_or(90);
 
     // Fetch details per unique CVE with caching and rate limiting
     let mut id_to_json: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -98,8 +98,17 @@ pub fn enrich_findings_with_nvd(
     for (idx, id) in unique_ids.into_iter().enumerate() {
         let mut served_from_cache = false;
         if let Some(client) = pg.as_mut() {
-            if let Some((payload, last_checked_at, _nvd_last_modified)) = pg_get_cve(client, &id) {
-                let ttl_dyn_days = compute_jittered_ttl_days(30, 7);
+            if let Some((payload, last_checked_at, nvd_last_modified)) = pg_get_cve(client, &id) {
+                // Age-aware TTL: old CVEs (last modified >2 years ago) get a longer
+                // cache TTL since they rarely change. Recent CVEs use the base TTL.
+                let age_factor = if let Some(lm) = nvd_last_modified {
+                    let age_days = (Utc::now() - lm).num_days();
+                    if age_days > 730 { 3 } else if age_days > 365 { 2 } else { 1 }
+                } else {
+                    1
+                };
+                let effective_ttl = base_ttl_days * age_factor;
+                let ttl_dyn_days = compute_jittered_ttl_days(effective_ttl, 7);
                 if Utc::now() - last_checked_at < ChronoDuration::days(ttl_dyn_days) {
                     id_to_json.insert(id.clone(), payload);
                     progress("nvd.cache.pg.hit", &id);
