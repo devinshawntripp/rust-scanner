@@ -414,15 +414,8 @@ pub fn osv_enrich_findings(
         let mut pg_hit = false;
         if let Some(client_pg) = pg.as_mut() {
             if let Some((payload, last_checked, _last_mod)) = pg_get_osv(client_pg, id) {
-                // In cluster mode, trust PG cache unconditionally — the import
-                // CronJob keeps it current. In standalone mode, use 90-day TTL.
-                let fresh = if crate::vuln::cluster_mode() {
-                    true
-                } else {
-                    let ttl_days = compute_jittered_ttl_days(90, 7);
-                    Utc::now() - last_checked < ChronoDuration::days(ttl_days)
-                };
-                if fresh {
+                let ttl_days = compute_jittered_ttl_days(90, 7);
+                if Utc::now() - last_checked < ChronoDuration::days(ttl_days) {
                     pg_cache_hits.insert(id.clone(), payload);
                     pg_hit = true;
                 }
