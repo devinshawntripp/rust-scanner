@@ -16,6 +16,7 @@ fn best_redhat_fixed_release_prefers_matching_el_stream() {
         name: "mariadb".into(),
         ecosystem: "redhat".into(),
         version: "3:10.3.25-1.module+el8.10.0+1234".into(),
+        license: None,
     };
     let all = vec![
         RedHatFixedRelease {
@@ -40,6 +41,7 @@ fn best_redhat_fixed_release_rejects_cross_stream_only_match() {
         name: "bind-license".into(),
         ecosystem: "redhat".into(),
         version: "32:9.11.4-26.P2.el7".into(),
+        license: None,
     };
     let all = vec![RedHatFixedRelease {
         advisory: Some("RHSA-2023:7177".into()),
@@ -109,6 +111,7 @@ fn mk_finding(id: &str, pkg_name: &str, fixed: Option<bool>) -> Finding {
             name: pkg_name.to_string(),
             ecosystem: "redhat".to_string(),
             version: "1:1.2.3-1.el8".to_string(),
+        license: None,
         }),
         confidence_tier: ConfidenceTier::ConfirmedInstalled,
         evidence_source: EvidenceSource::InstalledDb,
@@ -198,6 +201,7 @@ fn detect_debian_release_from_package_versions() {
         name: "libc6".into(),
         version: "2.36-9+deb12u9".into(),
         source_name: None,
+        license: None,
     }];
     assert_eq!(
         debian_legacy::detect_debian_release(&pkgs),
@@ -209,6 +213,7 @@ fn detect_debian_release_from_package_versions() {
         name: "bash".into(),
         version: "5.1-2+deb11u1".into(),
         source_name: None,
+        license: None,
     }];
     assert_eq!(
         debian_legacy::detect_debian_release(&pkgs_11),

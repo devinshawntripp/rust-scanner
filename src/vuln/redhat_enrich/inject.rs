@@ -145,6 +145,7 @@ pub fn redhat_inject_unfixed_cves(
                             name: pkg.name.clone(),
                             ecosystem: pkg.ecosystem.clone(),
                             version: pkg.version.clone(),
+                license: None,
                         }),
                         confidence_tier: ConfidenceTier::ConfirmedInstalled,
                         evidence_source: EvidenceSource::InstalledDb,
@@ -525,6 +526,7 @@ pub fn redhat_inject_unfixed_cves(
                 name: installed_name.clone(),
                 ecosystem: installed_ecosystem.clone(),
                 version: installed_version.clone(),
+                license: None,
             };
 
             // Find the best matching package_state for this package and RHEL version.

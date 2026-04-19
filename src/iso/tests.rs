@@ -53,12 +53,14 @@ fn test_dedupe_packages() {
             name: "bash".into(),
             version: "5.1-1".into(),
             source_name: None,
+            license: None,
         },
         PackageCoordinate {
             ecosystem: "redhat".into(),
             name: "bash".into(),
             version: "5.1-1".into(),
             source_name: None,
+            license: None,
         },
     ];
     let out = dedupe_packages(input);
@@ -85,6 +87,7 @@ fn repodata_findings_get_softer_accuracy_note() {
             name: "bash".into(),
             ecosystem: "redhat".into(),
             version: "5.1.8-6.el9".into(),
+            license: None,
         }),
         confidence_tier: ConfidenceTier::ConfirmedInstalled,
         evidence_source: EvidenceSource::InstalledDb,
@@ -134,6 +137,7 @@ fn heuristic_findings_keep_harsh_accuracy_note() {
             name: "bash".into(),
             ecosystem: "redhat".into(),
             version: "5.1.8".into(),
+            license: None,
         }),
         confidence_tier: ConfidenceTier::ConfirmedInstalled,
         evidence_source: EvidenceSource::InstalledDb,

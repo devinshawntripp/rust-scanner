@@ -198,6 +198,7 @@ pub(super) fn parse_primary_packages(primary_xml: &[u8]) -> Vec<PackageCoordinat
             name,
             version: full_ver,
             source_name: None,
+            license: None,
         });
     }
     packages

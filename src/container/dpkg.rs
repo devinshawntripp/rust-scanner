@@ -46,6 +46,7 @@ fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<Packag
                     name: n,
                     version: v,
                     source_name,
+                    license: None,
                 });
             }
         } else {
@@ -90,6 +91,7 @@ fn parse_dpkg_status_inner(contents: &str, ecosystem: &str, out: &mut Vec<Packag
                 name: n,
                 version: v,
                 source_name,
+                license: None,
             });
         }
     }

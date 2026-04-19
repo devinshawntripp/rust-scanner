@@ -105,6 +105,7 @@ pub(super) fn run_enrichment_pipeline(ctx: &mut EnrichCtx) -> (Vec<Finding>, boo
                 name: p.name.clone(),
                 version: p.version.clone(),
                 source_name: None,
+                license: None,
             })
             .collect();
         if !rhel_supp_pkgs.is_empty() {

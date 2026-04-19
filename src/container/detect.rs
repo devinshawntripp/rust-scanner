@@ -17,9 +17,19 @@ pub(super) fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
     // Debian/Ubuntu: /var/lib/dpkg/status
     let dpkg_status = rootfs.join("var/lib/dpkg/status");
     if dpkg_status.exists() {
+        let dpkg_start_idx = packages.len();
         if let Ok(s) = fs::read_to_string(&dpkg_status) {
             let dpkg_eco = detect_dpkg_ecosystem(rootfs);
             parse_dpkg_status_with_ecosystem(&s, &dpkg_eco, &mut packages);
+        }
+        // Extract license info from copyright files for dpkg packages
+        for pkg in &mut packages[dpkg_start_idx..] {
+            let copyright_path = rootfs.join(format!("usr/share/doc/{}/copyright", pkg.name));
+            if let Ok(content) = fs::read_to_string(&copyright_path) {
+                if let Some(license) = parse_debian_copyright_license(&content) {
+                    pkg.license = Some(license);
+                }
+            }
         }
     }
 
@@ -52,12 +62,13 @@ pub(super) fn detect_os_packages(rootfs: &Path) -> Vec<PackageCoordinate> {
                         &format!("ecosystem={} packages={}", rpm_ecosystem, list.len()),
                     );
                 }
-                for (name, version, source_name) in list {
+                for (name, version, source_name, license) in list {
                     packages.push(PackageCoordinate {
                         ecosystem: rpm_ecosystem.clone(),
                         name,
                         version,
                         source_name,
+                        license,
                     });
                 }
             }
@@ -173,6 +184,7 @@ pub(super) fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate
                         name: "stdlib".into(),
                         version: go_ver,
                         source_name: None,
+                        license: None,
                     });
                 }
             }
@@ -187,6 +199,7 @@ pub(super) fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate
                         name: mod_path,
                         version: mod_ver,
                         source_name: None,
+                        license: None,
                     });
                 }
             }
@@ -194,4 +207,45 @@ pub(super) fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate
     }
 
     packages
+}
+
+/// Extract the primary license from a Debian copyright file.
+/// Tries DEP-5 machine-readable format first, then falls back to heuristic matching.
+fn parse_debian_copyright_license(content: &str) -> Option<String> {
+    // DEP-5 format has "License: <spdx>" lines
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("License:") {
+            let license = rest.trim();
+            if !license.is_empty() {
+                return Some(license.to_string());
+            }
+        }
+    }
+
+    // Fallback: look for common license names in the first 500 chars
+    let header = &content[..content.len().min(500)];
+    let upper = header.to_uppercase();
+    if upper.contains("MIT LICENSE") || upper.contains("MIT LICENCE") {
+        return Some("MIT".to_string());
+    }
+    if upper.contains("APACHE LICENSE") && upper.contains("2.0") {
+        return Some("Apache-2.0".to_string());
+    }
+    if upper.contains("GNU GENERAL PUBLIC LICENSE") {
+        if upper.contains("VERSION 3") {
+            return Some("GPL-3.0".to_string());
+        }
+        if upper.contains("VERSION 2") {
+            return Some("GPL-2.0".to_string());
+        }
+    }
+    if upper.contains("BSD") && (upper.contains("2-CLAUSE") || upper.contains("SIMPLIFIED")) {
+        return Some("BSD-2-Clause".to_string());
+    }
+    if upper.contains("BSD") && upper.contains("3-CLAUSE") {
+        return Some("BSD-3-Clause".to_string());
+    }
+
+    None
 }

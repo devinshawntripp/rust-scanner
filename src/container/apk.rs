@@ -14,6 +14,7 @@ pub(super) fn parse_apk_installed_with_ecosystem(
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut origin: Option<String> = None;
+    let mut license: Option<String> = None;
     for line in contents.lines() {
         if line.starts_with("P:") {
             name = Some(line[2..].trim().to_string());
@@ -22,6 +23,8 @@ pub(super) fn parse_apk_installed_with_ecosystem(
         } else if line.starts_with("o:") {
             // Origin package name — OSV Alpine indexes by origin, not binary subpackage.
             origin = Some(line[2..].trim().to_string());
+        } else if line.starts_with("L:") {
+            license = Some(line[2..].trim().to_string());
         } else if line.is_empty() {
             if let (Some(n), Some(v)) = (name.take(), version.take()) {
                 let src = origin.take();
@@ -31,9 +34,11 @@ pub(super) fn parse_apk_installed_with_ecosystem(
                     name: n,
                     version: v,
                     source_name,
+                    license: license.take(),
                 });
             } else {
                 origin.take();
+                license.take();
             }
         }
     }
@@ -45,6 +50,7 @@ pub(super) fn parse_apk_installed_with_ecosystem(
             name: n,
             version: v,
             source_name,
+            license: license.take(),
         });
     }
 }

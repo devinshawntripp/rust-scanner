@@ -132,9 +132,26 @@ fn parse_node_package_json(
             let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
             let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("").trim();
             if !name.is_empty() && !version.is_empty() {
-                push_if_new(pkgs, seen, "npm", name, version);
+                let license = extract_npm_license(&val);
+                super::push_if_new_with_license(pkgs, seen, "npm", name, version, license);
             }
         }
+    }
+}
+
+/// Extract license from a package.json value. Handles both string and object forms.
+fn extract_npm_license(pkg_json: &serde_json::Value) -> Option<String> {
+    match pkg_json.get("license") {
+        Some(serde_json::Value::String(s)) => {
+            if s.is_empty() { None } else { Some(s.clone()) }
+        }
+        Some(serde_json::Value::Object(obj)) => {
+            obj.get("type")
+                .and_then(|t| t.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        }
+        _ => None,
     }
 }
 

@@ -236,6 +236,7 @@ pub fn build_sbom_diff(baseline: &str, current: &str) -> anyhow::Result<SbomDiff
                 name: name.clone(),
                 version: ver.clone(),
                 source_name: None,
+                license: None,
             }),
             Some(old) if old != ver => changed.push(ChangedPackage {
                 ecosystem: eco.clone(),
@@ -254,6 +255,7 @@ pub fn build_sbom_diff(baseline: &str, current: &str) -> anyhow::Result<SbomDiff
                 name: name.clone(),
                 version: ver.clone(),
                 source_name: None,
+                license: None,
             });
         }
     }
@@ -326,6 +328,7 @@ fn package_from_component(component: &Value) -> Option<PackageCoordinate> {
                 name,
                 version,
                 source_name: None,
+                license: None,
             });
         }
     }
@@ -347,6 +350,7 @@ fn package_from_component(component: &Value) -> Option<PackageCoordinate> {
         name: name.to_string(),
         version: version.to_string(),
         source_name: None,
+                license: None,
     })
 }
 
@@ -381,6 +385,7 @@ fn package_from_spdx(pkg: &Value) -> Option<PackageCoordinate> {
                             name,
                             version,
                             source_name: None,
+                license: None,
                         });
                     }
                 }
@@ -408,6 +413,7 @@ fn package_from_spdx(pkg: &Value) -> Option<PackageCoordinate> {
         name: name.to_string(),
         version: version.to_string(),
         source_name: None,
+                license: None,
     })
 }
 
@@ -425,6 +431,7 @@ fn parse_syft_packages(doc: &Value) -> Vec<PackageCoordinate> {
                     name,
                     version,
                     source_name: None,
+                license: None,
                 });
                 continue;
             }
@@ -455,6 +462,7 @@ fn parse_syft_packages(doc: &Value) -> Vec<PackageCoordinate> {
             name: name.to_string(),
             version: version.to_string(),
             source_name: None,
+                license: None,
         });
     }
 

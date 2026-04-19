@@ -11,6 +11,8 @@ const RPM_TAG_RELEASE: u32 = 1002;
 const RPM_TAG_EPOCH: u32 = 1003;
 /// RPM tag 1044: SOURCERPM — filename of the source RPM (e.g. "openssl-3.0.7-27.el9.src.rpm")
 const RPM_TAG_SOURCERPM: u32 = 1044;
+/// RPM tag 1014: LICENSE — SPDX license identifier
+const RPM_TAG_LICENSE: u32 = 1014;
 /// RPM tag type: STRING
 const RPM_TYPE_STRING: u32 = 6;
 /// RPM tag type: INT32
@@ -19,7 +21,7 @@ const RPM_TYPE_INT32: u32 = 4;
 /// Detect RPM packages using native parsing (SQLite + BerkeleyDB), falling back to rpm CLI.
 pub(super) fn detect_rpm_packages_native(
     rootfs: &Path,
-) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
     let db_candidates = [
         rootfs.join("var/lib/rpm/rpmdb.sqlite"),
         rootfs.join("usr/lib/sysimage/rpm/rpmdb.sqlite"),
@@ -98,7 +100,7 @@ pub(super) fn detect_rpm_packages_native(
 }
 
 /// Parse RPM packages from a SQLite rpmdb.
-pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
     use rusqlite::Connection;
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut stmt = conn.prepare("SELECT hnum, blob FROM Packages")?;
@@ -113,15 +115,15 @@ pub fn parse_rpm_sqlite(path: &Path) -> anyhow::Result<Vec<(String, String, Opti
             Ok(b) => b,
             Err(_) => continue,
         };
-        if let Some((name, version, source_name)) = parse_rpm_header_blob(&blob) {
-            results.push((name, version, source_name));
+        if let Some((name, version, source_name, license)) = parse_rpm_header_blob(&blob) {
+            results.push((name, version, source_name, license));
         }
     }
     Ok(results)
 }
 
 /// Parse RPM packages from a BerkeleyDB hash-format Packages file.
-pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
     let data = fs::read(path)?;
     if data.len() < 512 {
         return Err(anyhow::anyhow!("file too small for BerkeleyDB"));
@@ -150,7 +152,7 @@ pub fn parse_rpm_bdb(path: &Path) -> anyhow::Result<Vec<(String, String, Option<
 }
 
 /// Scan BerkeleyDB data for RPM header blobs by looking for the RPM header magic.
-fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
     let mut results = Vec::new();
     let rpm_magic: [u8; 4] = [0x8e, 0xad, 0xe8, 0x01];
 
@@ -159,8 +161,8 @@ fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String, Option
     while offset + 16 < data.len() {
         if data[offset..offset + 4] == rpm_magic {
             // Found an RPM header; try to parse it
-            if let Some((name, version, source_name)) = parse_rpm_header_blob(&data[offset..]) {
-                results.push((name, version, source_name));
+            if let Some((name, version, source_name, license)) = parse_rpm_header_blob(&data[offset..]) {
+                results.push((name, version, source_name, license));
             }
         }
         offset += 1;
@@ -186,8 +188,8 @@ fn parse_rpm_bdb_scan(data: &[u8]) -> anyhow::Result<Vec<(String, String, Option
 ///   Bytes 4-7: type (big-endian u32)
 ///   Bytes 8-11: offset into data section (big-endian u32)
 ///   Bytes 12-15: count (big-endian u32)
-/// Returns (name, version, source_name) where source_name is derived from SOURCERPM tag.
-pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Option<String>)> {
+/// Returns (name, version, source_name, license) where source_name is derived from SOURCERPM tag.
+pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Option<String>, Option<String>)> {
     if blob.len() < 16 {
         return None;
     }
@@ -227,6 +229,7 @@ pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Opti
     let mut release: Option<String> = None;
     let mut epoch: Option<u32> = None;
     let mut source_rpm: Option<String> = None;
+    let mut license: Option<String> = None;
 
     for i in 0..nindex {
         let e = entries_start + i * 16;
@@ -242,6 +245,7 @@ pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Opti
 
         match tag {
             RPM_TAG_NAME | RPM_TAG_VERSION | RPM_TAG_RELEASE | RPM_TAG_SOURCERPM
+            | RPM_TAG_LICENSE
                 if ttype == RPM_TYPE_STRING =>
             {
                 if abs_offset < blob.len() {
@@ -255,6 +259,7 @@ pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Opti
                             RPM_TAG_VERSION => version = Some(s.to_string()),
                             RPM_TAG_RELEASE => release = Some(s.to_string()),
                             RPM_TAG_SOURCERPM => source_rpm = Some(s.to_string()),
+                            RPM_TAG_LICENSE => license = Some(s.to_string()),
                             _ => {}
                         }
                     }
@@ -325,13 +330,13 @@ pub(super) fn parse_rpm_header_blob(blob: &[u8]) -> Option<(String, String, Opti
             .flatten()
     });
 
-    Some((n, full_version, source_name))
+    Some((n, full_version, source_name, license))
 }
 
 /// Fallback: detect RPM packages using the system rpm CLI.
 pub(super) fn detect_rpm_packages_cli(
     rootfs: &Path,
-) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
+) -> anyhow::Result<Vec<(String, String, Option<String>, Option<String>)>> {
     use std::process::Command;
     let dbpaths = [
         rootfs.join("var/lib/rpm"),
@@ -349,7 +354,7 @@ pub(super) fn detect_rpm_packages_cli(
             .arg("--dbpath")
             .arg(dbpath)
             .arg("--qf")
-            .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE} %{SOURCERPM}\n")
+            .arg("%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE} %{SOURCERPM} %{LICENSE}\n")
             .output();
 
         match output {
@@ -378,7 +383,14 @@ pub(super) fn detect_rpm_packages_cli(
                                 .map(|i| stripped[..i].to_string())
                                 .filter(|s| s != name)
                         };
-                        results.push((name.to_string(), ver.to_string(), source_name));
+                        // Remaining parts (after SOURCERPM) are the license field
+                        let license_str: String = parts.collect::<Vec<&str>>().join(" ");
+                        let license = if license_str.is_empty() || license_str == "(none)" {
+                            None
+                        } else {
+                            Some(license_str)
+                        };
+                        results.push((name.to_string(), ver.to_string(), source_name, license));
                     }
                 }
                 if !results.is_empty() {
@@ -494,7 +506,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("bash".to_string(), "5.1.8-6.el9".to_string(), None))
+            Some(("bash".to_string(), "5.1.8-6.el9".to_string(), None, None))
         );
     }
 
@@ -504,7 +516,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("openssl".to_string(), "1:3.0.7-20.el9".to_string(), None))
+            Some(("openssl".to_string(), "1:3.0.7-20.el9".to_string(), None, None))
         );
     }
 
@@ -514,7 +526,7 @@ mod tests {
         let result = parse_rpm_header_blob(&blob);
         assert_eq!(
             result,
-            Some(("glibc".to_string(), "2.34-60.el9".to_string(), None))
+            Some(("glibc".to_string(), "2.34-60.el9".to_string(), None, None))
         );
     }
 

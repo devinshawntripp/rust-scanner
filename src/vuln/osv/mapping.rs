@@ -106,6 +106,7 @@ pub fn map_osv_results_to_findings(
                     name: pkg.name.clone(),
                     ecosystem: pkg.ecosystem.clone(),
                     version: pkg.version.clone(),
+                    license: pkg.license.clone(),
                 });
                 let evidence = vec![EvidenceItem {
                     evidence_type: "file".into(),

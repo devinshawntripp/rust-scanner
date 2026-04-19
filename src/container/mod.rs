@@ -25,4 +25,7 @@ pub struct PackageCoordinate {
     /// OSV's Debian ecosystem indexes by source name, not binary name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_name: Option<String>,
+    /// SPDX license identifier extracted from the package manager database.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 }

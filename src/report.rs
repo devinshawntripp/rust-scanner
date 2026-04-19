@@ -88,6 +88,8 @@ pub struct PackageInfo {
     pub name: String,
     pub ecosystem: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

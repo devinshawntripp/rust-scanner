@@ -16,7 +16,8 @@ pub(super) fn parse_npm_lockfile(path: &Path, pkgs: &mut Vec<PackageCoordinate>,
             if key.is_empty() { continue; }
             let name = key.strip_prefix("node_modules/").unwrap_or(key).to_string();
             let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            push_if_new(pkgs, seen, "npm", &name, &version);
+            let license = val.get("license").and_then(|l| l.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+            super::push_if_new_with_license(pkgs, seen, "npm", &name, &version, license);
         }
     } else if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
         parse_npm_v1_deps(deps, pkgs, seen);
@@ -149,6 +150,7 @@ pub(super) fn parse_dist_info_metadata(path: &Path, pkgs: &mut Vec<PackageCoordi
     let text = match fs::read_to_string(path) { Ok(t) => t, Err(_) => return };
     let mut name = String::new();
     let mut version = String::new();
+    let mut license: Option<String> = None;
     for line in text.lines() {
         if line.is_empty() || line.starts_with(' ') {
             if !line.starts_with(' ') { break; }
@@ -156,8 +158,16 @@ pub(super) fn parse_dist_info_metadata(path: &Path, pkgs: &mut Vec<PackageCoordi
         }
         if let Some(rest) = line.strip_prefix("Name: ") { name = rest.trim().to_string(); }
         else if let Some(rest) = line.strip_prefix("Version: ") { version = rest.trim().to_string(); }
+        else if license.is_none() {
+            if let Some(rest) = line.strip_prefix("License: ") {
+                let l = rest.trim();
+                if !l.is_empty() && l != "UNKNOWN" {
+                    license = Some(l.to_string());
+                }
+            }
+        }
     }
-    push_if_new(pkgs, seen, "PyPI", &name, &version);
+    super::push_if_new_with_license(pkgs, seen, "PyPI", &name, &version, license);
 }
 
 // --- Ruby ---

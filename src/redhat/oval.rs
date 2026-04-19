@@ -443,6 +443,7 @@ fn generate_from_cached_oval(
                             name: constraint.package.clone(),
                             ecosystem: ecosystem.clone(),
                             version: installed_version.clone(),
+                            license: None,
                         }),
                         confidence_tier: ConfidenceTier::ConfirmedInstalled,
                         evidence_source: EvidenceSource::InstalledDb,
@@ -983,6 +984,7 @@ mod tests {
             name: "openssl".to_string(),
             version: "1:1.0.2k-25.el7_9".to_string(),
             source_name: None,
+            license: None,
         }];
         let findings = generate_from_cached_oval(&cached, &package_map, &pkgs);
         assert_eq!(findings.len(), 1, "should generate 1 finding for vulnerable openssl");

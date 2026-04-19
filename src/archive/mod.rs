@@ -24,6 +24,17 @@ pub(crate) fn push_if_new(
     name: &str,
     version: &str,
 ) {
+    push_if_new_with_license(packages, seen, ecosystem, name, version, None);
+}
+
+pub(crate) fn push_if_new_with_license(
+    packages: &mut Vec<PackageCoordinate>,
+    seen: &mut HashSet<String>,
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+    license: Option<String>,
+) {
     if name.is_empty() || version.is_empty() {
         return;
     }
@@ -34,6 +45,7 @@ pub(crate) fn push_if_new(
             name: name.to_string(),
             version: version.to_string(),
             source_name: None,
+            license,
         });
     }
 }

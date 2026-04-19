@@ -522,6 +522,7 @@ mod dedup_tests {
                     name: pkg_name.to_string(),
                     ecosystem: "redhat".to_string(),
                     version: pkg_ver.to_string(),
+                    license: None,
                 })
             },
             confidence_tier: ConfidenceTier::ConfirmedInstalled,
@@ -548,6 +549,7 @@ mod dedup_tests {
             name: name.to_string(),
             version: ver.to_string(),
             source_name: None,
+            license: None,
         }
     }
 

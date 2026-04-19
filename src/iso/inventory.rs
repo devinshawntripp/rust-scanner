@@ -148,6 +148,7 @@ fn packages_from_runtime_rpmdb_entries(
                     name,
                     version,
                     source_name: None,
+                    license: None,
                 })
                 .collect());
         }
@@ -246,6 +247,7 @@ fn query_packages_from_extracted_root(root: &Path) -> anyhow::Result<Vec<Package
                         name,
                         version,
                         source_name: None,
+                        license: None,
                     })
                     .collect());
             }
@@ -267,7 +269,7 @@ fn query_rpm_db(dbpath: &Path) -> anyhow::Result<Vec<(String, String)>> {
     if sqlite_path.exists() {
         match crate::container::parse_rpm_sqlite(&sqlite_path) {
             Ok(pkgs) if !pkgs.is_empty() => {
-                return Ok(pkgs.into_iter().map(|(n, v, _)| (n, v)).collect());
+                return Ok(pkgs.into_iter().map(|(n, v, _, _)| (n, v)).collect());
             }
             Ok(_) => {}
             Err(e) => {
@@ -285,7 +287,7 @@ fn query_rpm_db(dbpath: &Path) -> anyhow::Result<Vec<(String, String)>> {
         if bdb_path.exists() {
             match crate::container::parse_rpm_bdb(&bdb_path) {
                 Ok(pkgs) if !pkgs.is_empty() => {
-                    return Ok(pkgs.into_iter().map(|(n, v, _)| (n, v)).collect());
+                    return Ok(pkgs.into_iter().map(|(n, v, _, _)| (n, v)).collect());
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -341,6 +343,7 @@ pub(super) fn packages_from_rpm_entries(entries: &[String]) -> Vec<PackageCoordi
                 name,
                 version,
                 source_name: None,
+                license: None,
             });
         }
     }

@@ -494,6 +494,7 @@ pub fn build_binary_report(
                     name: path.clone(),
                     version: ver.clone(),
                     source_name: None,
+                    license: None,
                 })
                 .collect();
             let osv_results = osv_batch_query(&coords, &mut pg, &osv_breaker);

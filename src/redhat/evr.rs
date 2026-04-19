@@ -318,12 +318,12 @@ mod tests {
     #[test]
     fn test_detect_rhel_major_version_from_packages() {
         let pkgs = vec![
-            PackageCoordinate { ecosystem: "rocky".into(), name: "bash".into(), version: "5.1.8-6.el9".into(), source_name: None },
+            PackageCoordinate { ecosystem: "rocky".into(), name: "bash".into(), version: "5.1.8-6.el9".into(), source_name: None, license: None },
         ];
         assert_eq!(detect_rhel_major_version(&pkgs), Some(9));
 
         let pkgs8 = vec![
-            PackageCoordinate { ecosystem: "redhat".into(), name: "openssl".into(), version: "1:1.1.1k-9.el8_8".into(), source_name: None },
+            PackageCoordinate { ecosystem: "redhat".into(), name: "openssl".into(), version: "1:1.1.1k-9.el8_8".into(), source_name: None, license: None },
         ];
         assert_eq!(detect_rhel_major_version(&pkgs8), Some(8));
     }

@@ -495,6 +495,7 @@ pub fn run_db(
                         name: "seed".into(),
                         version: format!("0-0.el{}", v),
                         source_name: None,
+                        license: None,
                     }];
                     match redhat::fetch_redhat_oval(&pkgs, Some(&cache_dir)) {
                         Some(path) => {
@@ -562,18 +563,21 @@ pub fn run_db(
                         name: "openssl".into(),
                         version: "3.0.0".into(),
                         source_name: None,
+                        license: None,
                     },
                     container::PackageCoordinate {
                         ecosystem: "npm".into(),
                         name: "lodash".into(),
                         version: "4.17.0".into(),
                         source_name: None,
+                        license: None,
                     },
                     container::PackageCoordinate {
                         ecosystem: "PyPI".into(),
                         name: "requests".into(),
                         version: "2.25.0".into(),
                         source_name: None,
+                        license: None,
                     },
                 ];
                 let osv_seed_breaker = vuln::global_breaker("osv");
