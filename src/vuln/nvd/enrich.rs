@@ -99,21 +99,30 @@ pub fn enrich_findings_with_nvd(
         let mut served_from_cache = false;
         if let Some(client) = pg.as_mut() {
             if let Some((payload, last_checked_at, nvd_last_modified)) = pg_get_cve(client, &id) {
-                // Age-aware TTL: old CVEs (last modified >2 years ago) get a longer
-                // cache TTL since they rarely change. Recent CVEs use the base TTL.
-                let age_factor = if let Some(lm) = nvd_last_modified {
-                    let age_days = (Utc::now() - lm).num_days();
-                    if age_days > 730 { 3 } else if age_days > 365 { 2 } else { 1 }
-                } else {
-                    1
-                };
-                let effective_ttl = base_ttl_days * age_factor;
-                let ttl_dyn_days = compute_jittered_ttl_days(effective_ttl, 7);
-                if Utc::now() - last_checked_at < ChronoDuration::days(ttl_dyn_days) {
+                // In cluster mode, trust the PG cache unconditionally — the
+                // vulndb-pg-import CronJob (every 6h) keeps it current via
+                // incremental NVD API fetches. No per-CVE TTL needed.
+                if crate::vuln::cluster_mode() {
                     id_to_json.insert(id.clone(), payload);
                     progress("nvd.cache.pg.hit", &id);
                     served_from_cache = true;
                     cached_count += 1;
+                } else {
+                    // Standalone mode: age-aware TTL for file-cache populated data.
+                    let age_factor = if let Some(lm) = nvd_last_modified {
+                        let age_days = (Utc::now() - lm).num_days();
+                        if age_days > 730 { 3 } else if age_days > 365 { 2 } else { 1 }
+                    } else {
+                        1
+                    };
+                    let effective_ttl = base_ttl_days * age_factor;
+                    let ttl_dyn_days = compute_jittered_ttl_days(effective_ttl, 7);
+                    if Utc::now() - last_checked_at < ChronoDuration::days(ttl_dyn_days) {
+                        id_to_json.insert(id.clone(), payload);
+                        progress("nvd.cache.pg.hit", &id);
+                        served_from_cache = true;
+                        cached_count += 1;
+                    }
                 }
             }
         }

@@ -195,7 +195,10 @@ pub fn osv_batch_query(
         // Cluster mode: check PG chunk cache BEFORE the retry loop
         if crate::vuln::cluster_mode() {
             if let Some(c) = pg.as_mut() {
-                let ttl = crate::vuln::pg::compute_jittered_ttl_days(30, 7);
+                // Cluster mode: import CronJob refreshes PG every 6h, so use
+                // a generous TTL. The chunk cache keyed by query digest is valid
+                // as long as the underlying OSV data hasn't changed.
+                let ttl = crate::vuln::pg::compute_jittered_ttl_days(90, 14);
                 if let Some(cached) = crate::vuln::pg::pg_get_osv_batch_chunk(c, &body_digest, ttl) {
                     if let Some(arr) = cached["results"].as_array() {
                         for (idx_in_chunk, item) in arr.iter().enumerate() {
