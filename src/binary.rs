@@ -590,6 +590,7 @@ pub fn build_binary_report(
         inventory_status: InventoryStatus::Complete,
         inventory_reason: None,
         sbom: None,
+        packages: vec![],
         findings,
         files: vec![FileEntry {
             path: Path::new(path)

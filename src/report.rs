@@ -174,6 +174,10 @@ pub struct Report {
     pub inventory_reason: Option<String>,
     pub sbom: Option<SbomInfo>,
     pub findings: Vec<Finding>,
+    /// Full package inventory — all detected packages regardless of vulnerability status.
+    /// Used by the license analysis feature to show complete dependency information.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<PackageInfo>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<FileEntry>,
     pub summary: Summary,

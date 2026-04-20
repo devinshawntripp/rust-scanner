@@ -337,6 +337,7 @@ pub fn build_iso_report(
         inventory_status,
         inventory_reason,
         sbom: None,
+        packages: vec![],
         findings: findings_norm,
         files,
         summary: Default::default(),

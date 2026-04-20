@@ -199,6 +199,7 @@ pub fn build_archive_report(
         },
         inventory_reason: None,
         sbom: None,
+        packages: vec![],
         findings,
         files: Vec::new(),
         iso_profile: None,

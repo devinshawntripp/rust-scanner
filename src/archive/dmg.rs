@@ -374,6 +374,7 @@ pub fn build_dmg_report(path: &str, mode: ScanMode, nvd_api_key: Option<String>)
         },
         inventory_reason: None,
         sbom: None,
+        packages: vec![],
         findings,
         files: Vec::new(),
         iso_profile: None,

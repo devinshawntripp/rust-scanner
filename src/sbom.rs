@@ -150,6 +150,7 @@ pub fn build_sbom_report(
             format: parsed.format,
             path: path.into(),
         }),
+        packages: vec![],
         findings,
         files: Vec::new(),
         iso_profile: None,

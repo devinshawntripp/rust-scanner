@@ -361,6 +361,17 @@ pub fn build_container_report(
     crate::progress::enter_stage("report");
     let (scan_status, inventory_status, inventory_reason) =
         report_state_for_inventory(packages.len(), &mode, heuristic_used);
+    // Convert full package inventory to PackageInfo for the report
+    let all_packages: Vec<crate::report::PackageInfo> = packages
+        .iter()
+        .map(|p| crate::report::PackageInfo {
+            name: p.name.clone(),
+            ecosystem: p.ecosystem.clone(),
+            version: p.version.clone(),
+            license: p.license.clone(),
+        })
+        .collect();
+
     let mut report = Report {
         scanner,
         target,
@@ -369,8 +380,9 @@ pub fn build_container_report(
         inventory_reason,
         sbom: sbom_info,
         findings: findings_norm,
+        packages: all_packages,
         files: collect_file_tree_if_enabled(&rootfs),
-            iso_profile: None,
+        iso_profile: None,
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
