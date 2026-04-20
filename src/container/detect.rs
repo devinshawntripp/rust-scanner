@@ -211,7 +211,7 @@ pub(super) fn scan_go_binaries_in_rootfs(rootfs: &Path) -> Vec<PackageCoordinate
 
 /// Extract the primary license from a Debian copyright file.
 /// Tries DEP-5 machine-readable format first, then falls back to heuristic matching.
-fn parse_debian_copyright_license(content: &str) -> Option<String> {
+pub(crate) fn parse_debian_copyright_license(content: &str) -> Option<String> {
     // DEP-5 format has "License: <spdx>" lines
     for line in content.lines() {
         let trimmed = line.trim();

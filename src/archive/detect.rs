@@ -50,6 +50,22 @@ pub fn detect_app_packages(root: &Path) -> Vec<PackageCoordinate> {
             "METADATA" => {
                 if path_contains_dist_info(path) {
                     parse_dist_info_metadata(path, &mut packages, &mut seen);
+                    // Also check for LICENSE file in the same .dist-info directory
+                    if let Some(dist_dir) = path.parent() {
+                        for license_name in &["LICENSE", "LICENSE.txt", "LICENSE.md", "COPYING"] {
+                            let license_path = dist_dir.join(license_name);
+                            if license_path.exists() {
+                                if let Some(license) = detect_license_from_file(&license_path) {
+                                    if let Some(last) = packages.last_mut() {
+                                        if last.license.is_none() {
+                                            last.license = Some(license);
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -94,6 +110,9 @@ pub fn detect_app_packages(root: &Path) -> Vec<PackageCoordinate> {
         }
     }
 
+    // Deep license scan: check LICENSE/COPYING files for packages missing license info
+    scan_license_files(root, &mut packages, &mut seen);
+
     packages
 }
 
@@ -116,16 +135,8 @@ fn parse_node_package_json(
     pkgs: &mut Vec<PackageCoordinate>,
     seen: &mut HashSet<String>,
 ) {
-    // Avoid double-counting nested node_modules (node_modules/foo/node_modules/bar)
-    // by only processing the shallowest package.json for each package name.
-    // We skip paths where node_modules appears more than once in the ancestry.
-    let node_modules_count = path
-        .components()
-        .filter(|c| c.as_os_str() == "node_modules")
-        .count();
-    if node_modules_count > 1 {
-        return; // nested node_modules — skip to avoid duplicates
-    }
+    // The `seen` HashSet deduplicates by name+version, so we scan all
+    // node_modules depths including nested ones.
 
     if let Ok(text) = fs::read_to_string(path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -500,4 +511,159 @@ fn detect_pkg_installers(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deep license file scanning
+// ---------------------------------------------------------------------------
+
+/// Scan for LICENSE, COPYING, NOTICE files and try to identify the license.
+/// This catches packages that don't declare their license in metadata.
+fn scan_license_files(
+    root: &Path,
+    pkgs: &mut Vec<PackageCoordinate>,
+    _seen: &mut HashSet<String>,
+) {
+    for entry in WalkDir::new(root)
+        .max_depth(12)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let fname = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_uppercase(),
+            None => continue,
+        };
+
+        // Only process license text files
+        if !matches!(
+            fname.as_str(),
+            "LICENSE"
+                | "LICENSE.TXT"
+                | "LICENSE.MD"
+                | "LICENCE"
+                | "LICENCE.TXT"
+                | "LICENCE.MD"
+                | "COPYING"
+                | "COPYING.TXT"
+                | "NOTICE"
+                | "NOTICE.TXT"
+        ) {
+            continue;
+        }
+
+        // Try to determine which package this belongs to
+        if let Some(parent) = path.parent() {
+            // If inside node_modules/foo/LICENSE, the package is "foo"
+            if let Some(pkg_name) = get_node_modules_package_name(parent) {
+                if let Some(license) = detect_license_from_file(path) {
+                    // Update existing package's license if unknown
+                    for pkg in pkgs.iter_mut() {
+                        if pkg.ecosystem == "npm" && pkg.name == pkg_name && pkg.license.is_none() {
+                            pkg.license = Some(license.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Given a directory path, extract the package name if it's inside node_modules.
+/// Handles scoped packages like @scope/name.
+fn get_node_modules_package_name(dir: &Path) -> Option<String> {
+    let components: Vec<_> = dir.components().collect();
+    // Find the last node_modules segment and get the next component
+    for (i, c) in components.iter().enumerate() {
+        if c.as_os_str() == "node_modules" && i + 1 < components.len() {
+            let pkg = components[i + 1].as_os_str().to_string_lossy().to_string();
+            // Handle scoped packages: node_modules/@scope/name
+            if pkg.starts_with('@') && i + 2 < components.len() {
+                let scope_name = components[i + 2].as_os_str().to_string_lossy().to_string();
+                return Some(format!("{}/{}", pkg, scope_name));
+            }
+            return Some(pkg);
+        }
+    }
+    None
+}
+
+/// Detect the license from a LICENSE/COPYING/NOTICE file by reading its content.
+fn detect_license_from_file(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    // Try Debian copyright format first (handles DEP-5 and common patterns)
+    crate::container::parse_debian_copyright_license(&content)
+        .or_else(|| detect_license_from_text(&content))
+}
+
+/// Heuristic license detection from raw license text.
+fn detect_license_from_text(text: &str) -> Option<String> {
+    let upper = text.to_uppercase();
+    let first_500 = &upper[..upper.len().min(500)];
+
+    // SPDX identifier in header
+    if let Some(pos) = upper.find("SPDX-LICENSE-IDENTIFIER:") {
+        let rest = &upper[pos + 24..];
+        let end = rest.find('\n').unwrap_or(rest.len());
+        let id = rest[..end].trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+
+    // Common license text patterns
+    if first_500.contains("MIT LICENSE")
+        || first_500.contains("PERMISSION IS HEREBY GRANTED, FREE OF CHARGE")
+    {
+        return Some("MIT".to_string());
+    }
+    if first_500.contains("APACHE LICENSE") && first_500.contains("VERSION 2.0") {
+        return Some("Apache-2.0".to_string());
+    }
+    if first_500.contains("ISC LICENSE")
+        || (first_500.contains("ISC") && first_500.contains("PERMISSION TO USE"))
+    {
+        return Some("ISC".to_string());
+    }
+    if first_500.contains("BSD 2-CLAUSE") || first_500.contains("SIMPLIFIED BSD") {
+        return Some("BSD-2-Clause".to_string());
+    }
+    if first_500.contains("BSD 3-CLAUSE")
+        || first_500.contains("NEW BSD")
+        || first_500.contains("MODIFIED BSD")
+    {
+        return Some("BSD-3-Clause".to_string());
+    }
+    if upper.contains("GNU GENERAL PUBLIC LICENSE") {
+        if upper.contains("VERSION 3") {
+            return Some("GPL-3.0".to_string());
+        }
+        if upper.contains("VERSION 2") {
+            return Some("GPL-2.0".to_string());
+        }
+        return Some("GPL".to_string());
+    }
+    if upper.contains("GNU LESSER GENERAL PUBLIC") {
+        return Some("LGPL".to_string());
+    }
+    if upper.contains("MOZILLA PUBLIC LICENSE") && upper.contains("2.0") {
+        return Some("MPL-2.0".to_string());
+    }
+    if first_500.contains("UNLICENSE")
+        || first_500.contains("THIS IS FREE AND UNENCUMBERED")
+    {
+        return Some("Unlicense".to_string());
+    }
+    if first_500.contains("CC0") || first_500.contains("CREATIVE COMMONS ZERO") {
+        return Some("CC0-1.0".to_string());
+    }
+    if first_500.contains("0BSD") || first_500.contains("ZERO-CLAUSE BSD") {
+        return Some("0BSD".to_string());
+    }
+
+    None
 }

@@ -15,6 +15,7 @@ pub use image::pull_and_save_image;
 pub use rpm::{parse_rpm_bdb, parse_rpm_sqlite};
 pub use scan::build_container_report;
 pub use source::{build_source_report, scan_source_tarball};
+pub(crate) use detect::parse_debian_copyright_license;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, Hash)]
 pub struct PackageCoordinate {
