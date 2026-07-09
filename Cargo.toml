@@ -1,6 +1,6 @@
 [package]
 name = "scanrook"
-version = "1.17.2"
+version = "1.18.0"
 edition = "2021"
 
 [dependencies]
@@ -36,6 +36,9 @@ zstd = "0.13"
 plist = "1.8"
 dmgwiz = { version = "1.1", default-features = false }
 apple-flat-package = "0.20"
+# CBOM: pure-Rust X.509 certificate parsing + PEM block splitting
+x509-parser = "0.16"
+pem = "3"
 
 [features]
 default = []

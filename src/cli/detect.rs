@@ -10,6 +10,8 @@ pub fn build_scan_report_value(
     yara: Option<String>,
     nvd_api_key: Option<String>,
     oval_redhat: Option<String>,
+    cbom: bool,
+    cbom_out: Option<String>,
 ) -> Option<Value> {
     // Early exit for non-existent files
     if !std::path::Path::new(file).exists() {
@@ -40,6 +42,8 @@ pub fn build_scan_report_value(
             nvd_api_key.clone(),
             yara.clone(),
             oval_redhat.clone(),
+            cbom,
+            cbom_out,
         ) {
             return serde_json::to_value(r).ok();
         }
@@ -255,6 +259,8 @@ mod tests {
             ScanMode::Light,
             None,
             None,
+            None,
+            false,
             None,
         );
         assert!(result.is_none());

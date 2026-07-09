@@ -202,7 +202,7 @@ fn run_scan_warm(
 ) -> anyhow::Result<()> {
     std::env::remove_var("SCANNER_SKIP_CACHE");
     let started = Instant::now();
-    let report = build_scan_report_value(file, mode, yara, nvd_api_key, None)
+    let report = build_scan_report_value(file, mode, yara, nvd_api_key, None, false, None)
         .ok_or_else(|| anyhow::anyhow!("scan warm-up failed to produce report"))?;
     let findings = report
         .get("findings")

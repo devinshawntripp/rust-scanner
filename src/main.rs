@@ -1,6 +1,7 @@
 mod archive;
 mod binary;
 mod cache;
+mod cbom;
 mod cli;
 mod container;
 mod iso;
@@ -200,6 +201,12 @@ enum Commands {
         /// Path to Red Hat OVAL XML for fixed checks in RPM/container scans
         #[arg(long)]
         oval_redhat: Option<String>,
+        /// Emit a CycloneDX 1.6 CBOM section (crypto libraries, certificates, keys)
+        #[arg(long, default_value_t = false)]
+        cbom: bool,
+        /// Also write a standalone CycloneDX 1.6 CBOM document to this path
+        #[arg(long)]
+        cbom_out: Option<String>,
     },
     /// Scan a binary file
     Bin {
@@ -247,6 +254,12 @@ enum Commands {
         /// Path to Red Hat OVAL XML for fixed checks
         #[arg(long)]
         oval_redhat: Option<String>,
+        /// Emit a CycloneDX 1.6 CBOM section (crypto libraries, certificates, keys)
+        #[arg(long, default_value_t = false)]
+        cbom: bool,
+        /// Also write a standalone CycloneDX 1.6 CBOM document to this path
+        #[arg(long)]
+        cbom_out: Option<String>,
     },
     /// Detect license in a file
     License {
@@ -570,6 +583,8 @@ fn main() {
             refs,
             mode,
             oval_redhat,
+            cbom,
+            cbom_out,
         } => {
             // Gate output format by plan tier
             if let Some(ref p) = user_plan {
@@ -651,6 +666,8 @@ fn main() {
                 oval_redhat
                     .or_else(|| std::env::var("SCANNER_OVAL_REDHAT").ok())
                     .filter(|v| !v.trim().is_empty()),
+                cbom,
+                cbom_out,
             );
 
             if let Some(mut v) = report_json {
@@ -730,6 +747,8 @@ fn main() {
             out,
             sbom,
             oval_redhat,
+            cbom,
+            cbom_out,
         } => {
             // Gate output format by plan tier
             if let Some(ref p) = user_plan {
@@ -753,6 +772,8 @@ fn main() {
                 sbom,
                 nvd_api_key.clone(),
                 oval_redhat,
+                cbom,
+                cbom_out,
             );
         }
         Commands::Source { tar, format, out } => {
@@ -922,6 +943,8 @@ fn main() {
                             scan_mode.clone(),
                             None,
                             nvd_api_key.clone(),
+                            None,
+                            false,
                             None,
                         );
 

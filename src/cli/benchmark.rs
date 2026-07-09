@@ -32,7 +32,7 @@ pub fn run_benchmark(file: &str, out_dir: &str, profile: BenchmarkProfile) -> an
     } else {
         std::env::remove_var("SCANNER_SKIP_CACHE");
     }
-    let report = build_scan_report_value(file, ScanMode::Light, None, None, None)
+    let report = build_scan_report_value(file, ScanMode::Light, None, None, None, false, None)
         .ok_or_else(|| anyhow::anyhow!("scanrook benchmark run failed"))?;
     std::fs::write(&sr_out, serde_json::to_string_pretty(&report)?)?;
     match prev_skip {
