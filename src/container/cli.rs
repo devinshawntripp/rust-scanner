@@ -31,6 +31,7 @@ use super::scan::{
     include_file_tree, report_state_for_inventory, IMAGE_HEURISTIC_NOTE,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn scan_container(
     tar_path: &str,
     mode: ScanMode,
@@ -41,6 +42,8 @@ pub fn scan_container(
     sbom: bool,
     nvd_api_key: Option<String>,
     oval_redhat: Option<String>,
+    cbom: bool,
+    cbom_out: Option<String>,
 ) {
     let tmp = match tempdir() {
         Ok(td) => td,
@@ -260,6 +263,16 @@ pub fn scan_container(
             let (scan_status, inventory_status, inventory_reason) =
                 report_state_for_inventory(packages.len(), &mode, heuristic_used);
 
+            // CBOM: crypto bill of materials (collected only when --cbom is set).
+            let cbom_section = if cbom {
+                let dynlibs = crate::cbom::gather_elf_dynlibs(&rootfs);
+                let s = crate::cbom::collect_cbom(&rootfs, &packages, &dynlibs, &findings_norm);
+                findings_norm.extend(crate::cbom::cbom_findings(&s));
+                Some(s)
+            } else {
+                None
+            };
+
             let mut report = Report {
                 scanner,
                 target,
@@ -271,9 +284,21 @@ pub fn scan_container(
         findings: findings_norm,
                 files: collect_file_tree_if_enabled(&rootfs),
                 iso_profile: None,
+                cbom: cbom_section,
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);
+            if let Some(ref cb) = report.cbom {
+                report.summary.cbom_crypto_libs = Some(cb.summary.crypto_libs);
+                report.summary.cbom_certs = Some(cb.summary.certificates);
+                report.summary.cbom_expired_certs = Some(cb.summary.expired_certs);
+                report.summary.cbom_private_keys = Some(cb.summary.private_keys);
+                if let Some(ref p) = cbom_out {
+                    if let Ok(txt) = serde_json::to_string_pretty(&crate::cbom::to_cyclonedx(cb)) {
+                        let _ = std::fs::write(p, txt);
+                    }
+                }
+            }
 
             let all_breakers: [&crate::vuln::CircuitBreaker; 4] =
                 [&osv_breaker, &nvd_breaker, &epss_breaker, &kev_breaker];

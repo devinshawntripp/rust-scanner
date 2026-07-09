@@ -154,6 +154,7 @@ pub fn build_sbom_report(
         findings,
         files: Vec::new(),
         iso_profile: None,
+        cbom: None,
         summary,
     })
 }

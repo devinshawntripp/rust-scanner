@@ -163,6 +163,15 @@ pub struct Summary {
     /// User-facing warnings (e.g. circuit breaker trips). Absent from JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// CBOM roll-up counts — additive, present only when `--cbom` was passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbom_crypto_libs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbom_certs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbom_expired_certs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cbom_private_keys: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -183,6 +192,9 @@ pub struct Report {
     pub summary: Summary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iso_profile: Option<IsoProfile>,
+    /// Cryptography Bill of Materials — present only when `--cbom` was passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cbom: Option<crate::cbom::CbomSection>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -464,6 +476,10 @@ impl<W: Write> NdjsonWriter<W> {
             heuristic_medium: sc.heuristic_medium,
             heuristic_low: sc.heuristic_low,
             warnings: extra.warnings.clone(),
+            cbom_crypto_libs: None,
+            cbom_certs: None,
+            cbom_expired_certs: None,
+            cbom_private_keys: None,
         };
         let line = serde_json::json!({
             "type": "summary",
@@ -685,6 +701,7 @@ mod tests {
                 ConfidenceTier::ConfirmedInstalled,
             )]),
             iso_profile: None,
+            cbom: None,
         };
         let mut buf = Vec::new();
         NdjsonWriter::new(&mut buf).write_report(&report).unwrap();

@@ -342,6 +342,7 @@ pub fn build_iso_report(
         files,
         summary: Default::default(),
         iso_profile,
+        cbom: None,
     };
     report.summary = compute_summary(&report.findings);
 

@@ -85,6 +85,7 @@ pub fn build_source_report(tar_path: &str, nvd_api_key: Option<String>) -> Optio
         findings,
         files: collect_file_tree_if_enabled(tmp.path()),
         iso_profile: None,
+        cbom: None,
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);
@@ -179,6 +180,7 @@ pub fn scan_source_tarball(
                 findings,
                 files: collect_file_tree_if_enabled(tmp.path()),
         iso_profile: None,
+        cbom: None,
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);
@@ -211,6 +213,7 @@ pub fn scan_source_tarball(
                 findings,
                 files: collect_file_tree_if_enabled(tmp.path()),
                 iso_profile: None,
+                cbom: None,
                 summary: Default::default(),
             };
             report.summary = compute_summary(&report.findings);

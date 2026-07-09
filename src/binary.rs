@@ -609,6 +609,7 @@ pub fn build_binary_report(
             parent_path: None,
         }],
         iso_profile: None,
+        cbom: None,
         summary: Default::default(),
     };
     report.summary = compute_summary(&report.findings);

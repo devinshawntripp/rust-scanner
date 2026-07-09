@@ -203,6 +203,7 @@ pub fn build_archive_report(
         findings,
         files: Vec::new(),
         iso_profile: None,
+        cbom: None,
         summary,
     })
 }
