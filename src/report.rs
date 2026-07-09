@@ -694,6 +694,7 @@ mod tests {
                 "MEDIUM",
                 ConfidenceTier::ConfirmedInstalled,
             )],
+            packages: vec![],
             files: vec![],
             summary: compute_summary(&[mk_finding(
                 "CVE-2024-0001",
