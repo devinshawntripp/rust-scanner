@@ -109,6 +109,8 @@ All benchmarks run on the same machine with the same images — no scanner-speci
 scanrook scan --file ./image.tar --format json --out report.json
 scanrook scan --file ./image.tar --mode deep --progress --log-format text --log-level info
 scanrook scan --file ./image.tar --mode deep --progress --log-format json --log-level debug
+scanrook scan --file ./image.tar --format json --cbom --out report.json
+scanrook container --tar ./image.tar --format json --cbom --cbom-out cbom.cdx.json
 scanrook benchmark --file ./image.tar --out-dir ./benchmark-out --profile warm
 scanrook diff --ours ./scanrook.json --against ./trivy.json --out ./diff.json
 scanrook db sources
@@ -128,6 +130,15 @@ scanrook config set telemetry.opt_in true
 ```
 
 Compatibility note: `scanner` remains as a temporary alias and prints a deprecation warning.
+
+### CBOM (Cryptography Bill of Materials)
+
+Pass `--cbom` on `scan` or `container` to embed a CycloneDX 1.6 Cryptography Bill of
+Materials in the report JSON under the top-level `cbom` key: crypto libraries,
+X.509 certificates, private-key material, and best-effort TLS/SSH protocol hints.
+Add `--cbom-out <PATH>` to additionally write a standalone CycloneDX 1.6 document.
+Certificates are flagged for expiry, SHA-1 signatures, and weak RSA/EC keys;
+discovered private-key material also raises a HIGH severity finding.
 
 ## Data Sources
 
