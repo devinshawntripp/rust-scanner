@@ -5,21 +5,13 @@ use crate::container::extract::{
     extract_tar, merge_layers_docker_save, merge_layers_oci_layout,
     try_detect_os_packages_from_layout,
 };
-use crate::container::PackageCoordinate;
-use crate::redhat::apply_redhat_oval_enrichment;
 use crate::report::{
-    compute_summary, retag_findings, ConfidenceTier, EvidenceSource, InventoryStatus, Report,
-    SbomInfo, ScanStatus, ScannerInfo, TargetInfo,
+    compute_summary, InventoryStatus, Report, SbomInfo, ScanStatus, ScannerInfo, TargetInfo,
 };
-use crate::utils::parse_name_version_from_filename;
+#[cfg(feature = "yara")]
+use crate::report::{ConfidenceTier, EvidenceSource};
 use crate::utils::{progress, progress_timing, run_syft_generate_sbom};
-use super::source::detect_busybox_version_in_tree;
-use crate::vuln::{
-    enrich_findings_with_nvd, map_osv_results_to_findings, nvd_cpe_findings, nvd_keyword_findings,
-    nvd_keyword_findings_name, osv_batch_query, redhat_inject_unfixed_cves,
-};
 use crate::ScanMode;
-use std::collections::HashSet;
 use std::path::Path;
 use tempfile::tempdir;
 #[cfg(feature = "yara")]
@@ -254,6 +246,7 @@ pub fn build_container_report(
     let epss_breaker = crate::vuln::global_breaker("epss");
     let kev_breaker = crate::vuln::global_breaker("kev");
 
+    #[allow(unused_mut)]
     let (mut findings_norm, heuristic_used) = {
         let mut ectx = super::enrich::EnrichCtx {
             packages: &packages,
@@ -361,7 +354,6 @@ pub fn build_container_report(
         progress("container.sbom.done", "ok");
     }
 
-    crate::progress::enter_stage("report");
     let (scan_status, inventory_status, inventory_reason) =
         report_state_for_inventory(packages.len(), &mode, heuristic_used);
     // Convert full package inventory to PackageInfo for the report
@@ -487,7 +479,9 @@ pub(crate) fn dedup_findings_by_cve_package(findings: &mut Vec<crate::report::Fi
 /// Detects the RHEL major version from the installed package list by inspecting
 /// `.elN` suffixes in package version strings. Returns the most common major version found,
 /// or None if no RPM packages are present or no el-tag is detected.
-fn detect_rhel_major_from_packages(packages: &[crate::container::PackageCoordinate]) -> Option<u32> {
+fn detect_rhel_major_from_packages(
+    packages: &[crate::container::PackageCoordinate],
+) -> Option<u32> {
     use std::collections::HashMap;
     let mut counts: HashMap<u32, usize> = HashMap::new();
     for pkg in packages {
@@ -501,7 +495,10 @@ fn detect_rhel_major_from_packages(packages: &[crate::container::PackageCoordina
             }
         }
     }
-    counts.into_iter().max_by_key(|&(_, count)| count).map(|(v, _)| v)
+    counts
+        .into_iter()
+        .max_by_key(|&(_, count)| count)
+        .map(|(v, _)| v)
 }
 
 /// Removes findings whose package version string references a different RHEL major version
@@ -550,7 +547,13 @@ mod dedup_tests {
     use super::*;
     use crate::report::{ConfidenceTier, CvssInfo, EvidenceSource, Finding, PackageInfo};
 
-    fn make_finding(id: &str, pkg_name: &str, pkg_ver: &str, cvss: Option<f32>, fixed_in: Option<&str>) -> Finding {
+    fn make_finding(
+        id: &str,
+        pkg_name: &str,
+        pkg_ver: &str,
+        cvss: Option<f32>,
+        fixed_in: Option<&str>,
+    ) -> Finding {
         Finding {
             id: id.to_string(),
             source_ids: Vec::new(),
@@ -571,7 +574,10 @@ mod dedup_tests {
             fixed_in: fixed_in.map(|s| s.to_string()),
             recommendation: None,
             severity: None,
-            cvss: cvss.map(|s| CvssInfo { base: s, vector: "CVSS:3.1/AV:N".to_string() }),
+            cvss: cvss.map(|s| CvssInfo {
+                base: s,
+                vector: "CVSS:3.1/AV:N".to_string(),
+            }),
             description: None,
             evidence: Vec::new(),
             references: Vec::new(),
@@ -601,11 +607,19 @@ mod dedup_tests {
             make_finding("CVE-2024-1234", "glibc", "2.34-60.el9", None, None),
         ];
         dedup_findings_by_cve_package(&mut findings);
-        assert_eq!(findings.len(), 2, "should collapse openssl dups but keep glibc");
-        let openssl_f = findings.iter().find(|f| {
-            f.package.as_ref().map(|p| p.name.as_str()) == Some("openssl")
-        }).expect("openssl finding must remain");
-        assert!(openssl_f.cvss.is_some(), "should keep the finding with CVSS score");
+        assert_eq!(
+            findings.len(),
+            2,
+            "should collapse openssl dups but keep glibc"
+        );
+        let openssl_f = findings
+            .iter()
+            .find(|f| f.package.as_ref().map(|p| p.name.as_str()) == Some("openssl"))
+            .expect("openssl finding must remain");
+        assert!(
+            openssl_f.cvss.is_some(),
+            "should keep the finding with CVSS score"
+        );
     }
 
     /// RHEL-03: different packages with the same CVE are both preserved
@@ -616,7 +630,11 @@ mod dedup_tests {
             make_finding("CVE-2024-5678", "openssl-devel", "3.0.7-24.el9", None, None),
         ];
         dedup_findings_by_cve_package(&mut findings);
-        assert_eq!(findings.len(), 2, "different packages must both be preserved");
+        assert_eq!(
+            findings.len(),
+            2,
+            "different packages must both be preserved"
+        );
     }
 
     /// RHEL-03: unfixed CVE appearing from multiple sources deduplicates to one per package,
@@ -625,11 +643,21 @@ mod dedup_tests {
     fn test_dedup_unfixed_cves_once_per_package() {
         let mut findings = vec![
             make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, None),
-            make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, Some("7.76.1-27.el9")),
+            make_finding(
+                "CVE-2024-9999",
+                "curl",
+                "7.76.1-26.el9",
+                None,
+                Some("7.76.1-27.el9"),
+            ),
             make_finding("CVE-2024-9999", "curl", "7.76.1-26.el9", None, None),
         ];
         dedup_findings_by_cve_package(&mut findings);
-        assert_eq!(findings.len(), 1, "three dups for same CVE+package should become one");
+        assert_eq!(
+            findings.len(),
+            1,
+            "three dups for same CVE+package should become one"
+        );
         assert!(
             findings[0].fixed_in.is_some(),
             "the surviving finding should be the one with fixed_in set"
@@ -652,11 +680,14 @@ mod dedup_tests {
             make_pkg("bash", "5.1.8-6.el9"),
         ];
         filter_findings_by_rhel_version(&mut findings, &packages);
-        assert_eq!(findings.len(), 1, "RHEL 7 finding should be removed in RHEL 9 context");
+        assert_eq!(
+            findings.len(),
+            1,
+            "RHEL 7 finding should be removed in RHEL 9 context"
+        );
         assert_eq!(
             findings[0].id, "CVE-2023-2222",
             "only the RHEL 9 finding should remain"
         );
     }
 }
-
