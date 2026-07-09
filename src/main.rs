@@ -1,6 +1,7 @@
 mod archive;
 mod binary;
 mod cache;
+mod cbom;
 mod cli;
 mod container;
 mod iso;
