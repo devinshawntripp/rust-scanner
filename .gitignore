@@ -34,3 +34,7 @@ CLAUDE.md
 # Build artifacts
 scanrook-linux-amd64
 blobs/
+
+# Ignore macOS cloud-sync conflict copies
+*\ [2-9].*
+*\ [2-9]
